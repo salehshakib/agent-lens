@@ -64,6 +64,7 @@ function commandArguments(raw: string | undefined, cwd: string | undefined, argv
   const command = redacted(raw);
   return {
     command,
+    argv: command === raw ? argv : undefined,
     argumentKey: command && command === raw
       ? toolArgumentKey("shell", argv ? { argv, cwd } : { command, cwd }, cwd)
       : undefined,
@@ -79,7 +80,7 @@ function commandOutput(item: Record<string, unknown>): string | undefined {
   return stdout ?? stderr ?? safeText(item.aggregated_output) ?? safeText(item.formatted_output);
 }
 
-function commandFiles(value: unknown): FileEvidence[] {
+function commandFiles(value: unknown, succeeded: boolean): FileEvidence[] {
   if (!Array.isArray(value)) return [];
   const files: FileEvidence[] = [];
   for (const command of value) {
@@ -87,7 +88,7 @@ function commandFiles(value: unknown): FileEvidence[] {
     const path = safePath(entry?.path);
     if (!path) continue;
     if (entry?.type === "read" || entry?.type === "search" || entry?.type === "list_files") {
-      files.push({ kind: "mention", path });
+      files.push(entry.type === "read" && succeeded ? { kind: "read", path, status: "inferred" } : { kind: "mention", path });
     }
   }
   return files;
@@ -106,12 +107,13 @@ export function completedTool(base: EventBase, callId: string, item: Record<stri
       (Array.isArray(item.parsed_cmd) && item.parsed_cmd.some((entry) => isRestricted(record(entry)?.path)));
     const cwd = safePath(item.cwd);
     const exitCode = Number.isSafeInteger(item.exit_code) ? item.exit_code as number : undefined;
+    const status = resultStatus(item.status, exitCode);
     return toolPair({ ...base, cwd }, callId, {
       name: "Command",
-      ...(restricted ? { restricted } : { ...commandArguments(raw, cwd, argv), files: commandFiles(item.parsed_cmd) }),
+      ...(restricted ? { restricted } : { ...commandArguments(raw, cwd, argv), files: commandFiles(item.parsed_cmd, status === "success") }),
     }, {
       text: restricted ? undefined : commandOutput(item), exitCode, durationMs,
-      status: resultStatus(item.status, exitCode),
+      status,
     });
   }
   if (item.type === "FileChange") {

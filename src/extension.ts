@@ -6,13 +6,26 @@ import type { Provider } from './host/adapters/types';
 import { RootObservation } from './host/discovery/observation';
 import { configureRoots } from './host/discovery/roots';
 import type { RootConfiguration } from './host/discovery/roots';
+import { registerFileActions } from './host/files/actions';
+import { claudeTaskRoot } from './host/sessions/delegation';
+import { SessionStore } from './host/sessions/store';
 import { SourcesView } from './host/views/sources';
 import type { SourceStatus } from './shared/sources';
 
-export function activate(context: ExtensionContext): void {
+export function activate(context: ExtensionContext): SessionStore {
   let configuration = new Map<Provider, RootConfiguration>();
   let observers = new Map<Provider, RootObservation[]>();
   let visible = false;
+  let modelUpdate: NodeJS.Timeout | undefined;
+  const taskRoot = claudeTaskRoot(process.env.LOCALAPPDATA);
+  const store = new SessionStore(taskRoot);
+
+  function updateModel(): void {
+    modelUpdate ??= setTimeout(() => {
+      modelUpdate = undefined;
+      void store.sessions().catch(() => undefined);
+    }, 100);
+  }
 
   function status(): SourceStatus[] {
     return adapters.map(adapter => {
@@ -46,6 +59,9 @@ export function activate(context: ExtensionContext): void {
       for (const observer of roots) observer.dispose();
     }
     observers.clear();
+    clearTimeout(modelUpdate);
+    modelUpdate = undefined;
+    store.clear();
   }
   function refreshConfiguration() {
     const settings = workspace.getConfiguration('agentLens').inspect<unknown>('agents');
@@ -53,13 +69,27 @@ export function activate(context: ExtensionContext): void {
     disposeObservers();
     configuration = next;
     observers = new Map([...next].map(([id, config]) => [id, config.roots.map(root => {
-      const observer = new RootObservation(root, { onChange: () => view.update() });
+      const observer = new RootObservation(root, {
+        onChange: () => {
+          store.setCatalog(root.key, root.adapter, observer.catalog);
+          updateModel();
+          view.update();
+        },
+        onBatch: batch => {
+          store.ingest(batch);
+          updateModel();
+        },
+      });
       observer.setVisible(visible);
       observer.start();
       return observer;
     })]));
     view.update();
   }
+  registerFileActions(context, id => store.file(id), () => [
+    ...[...configuration.values()].flatMap(config => config.roots.map(root => root.boundary)),
+    ...(taskRoot ? [taskRoot] : []),
+  ]);
   context.subscriptions.push(
     window.registerWebviewViewProvider('agentLens.sessions', view),
     workspace.onDidChangeConfiguration(event => {
@@ -68,4 +98,5 @@ export function activate(context: ExtensionContext): void {
     { dispose: disposeObservers },
   );
   refreshConfiguration();
+  return store;
 }

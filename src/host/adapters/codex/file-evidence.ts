@@ -1,28 +1,8 @@
-import { containsSensitivePath, record, safePath, safeText } from "../../privacy/projection";
+import { record, safePath } from "../../privacy/projection";
+import { recordedSidesPatch, safeFileText } from "../../files/diff";
 import type { FileEvidence } from "../types";
 
 type FileStatus = FileEvidence["status"];
-
-function safePatch(value: unknown): string | undefined {
-  return typeof value === "string" && !containsSensitivePath(value) ? safeText(value) : undefined;
-}
-
-function wholeFilePatch(content: unknown, kind: "add" | "delete"): string | undefined {
-  // The shared text projection discards blank prose, but a blank file can still contain changed lines.
-  const text = safePatch(content) ??
-    (typeof content === "string" && /^[ \r\n\t]+$/.test(content) ? content.replace(/\r\n?/g, "\n") : undefined);
-  if (!text) return undefined;
-  const eofNewline = text.endsWith("\n");
-  const body = eofNewline ? text.slice(0, -1) : text;
-  const adding = kind === "add";
-  let lines = 0;
-  const prefixed = body.replace(/(^|\n)/g, (lineStart) => {
-    lines += 1;
-    return lineStart + (adding ? "+" : "-");
-  });
-  const range = adding ? "0,0 +1," + lines : "1," + lines + " +0,0";
-  return "@@ -" + range + " @@\n" + prefixed + (eofNewline ? "" : "\n\\ No newline at end of file");
-}
 
 export function recordedFiles(value: unknown, status: FileStatus): FileEvidence[] {
   const changes = record(value);
@@ -33,11 +13,15 @@ export function recordedFiles(value: unknown, status: FileStatus): FileEvidence[
     const item = record(change);
     if (!path || !item) continue;
     if (item.type === "add" || item.type === "delete") {
-      files.push({ path, kind: item.type, status, patch: wholeFilePatch(item.content, item.type) });
+      const text = safeFileText(item.content);
+      const before = text === undefined ? undefined : item.type === "delete" ? text : "";
+      const after = text === undefined ? undefined : item.type === "add" ? text : "";
+      const patch = before !== undefined && after !== undefined ? recordedSidesPatch(before, after) : undefined;
+      files.push({ path, kind: item.type, status, patch, before, after });
     } else if (item.type === "update") {
       const destination = safePath(item.move_path);
       if (item.move_path != null && !destination) continue;
-      const patch = safePatch(item.unified_diff);
+      const patch = safeFileText(item.unified_diff);
       files.push({
         path, kind: destination ? "move" : "edit", destination, status,
         patch: patch && /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: |$)/m.test(patch) ? patch : undefined,
@@ -67,7 +51,7 @@ export function proposedFiles(value: string): FileEvidence[] {
     const destination = safePath(move?.[1]);
     if (move && !destination) continue;
     const kind = header[1] === "Add" ? "add" : header[1] === "Delete" ? "delete" : destination ? "move" : "edit";
-    files.push({ path, kind, destination, status: "pending", patch: safePatch(following.slice(move?.[0].length ?? 0)) });
+    files.push({ path, kind, destination, status: "pending", patch: safeFileText(following.slice(move?.[0].length ?? 0)) });
   }
   return files;
 }

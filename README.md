@@ -1,6 +1,6 @@
 # Agent Lens
 
-A local VS Code extension for observing coding agents. The Phase A build discovers eligible Claude Code and Codex transcripts and reports source coverage in the Agent Lens Activity Bar.
+A local VS Code extension for observing coding agents. The Activity Bar reports local source coverage. The host models sessions, turns, agent ancestry, file activity and token observations for Claude Code and Codex.
 
 **Build plan:** [docs/plan](docs/plan/README.md)
 
@@ -44,4 +44,4 @@ When preparing the external `codex-first` launcher for M1 delegation linking, up
 2. Capture the verified thread UUID from the first `thread.started.thread_id` event for a `--json` launch or from the native Codex startup header before the launcher redirects or discards either stream. On resume, require the startup UUID to match the exact requested thread.
 3. Print `AGENT_LENS_CODEX_SESSION=<UUID>` on its own line to the tracked Bash task's stdout as soon as the ID is verified, even when full output goes to a different log.
 
-Phase A extracts exact startup evidence from recorded result stdout. Phase B correlates it with the launching task, approved rollout, cwd and launch interval, including the exact resumed turn. Codex rollouts are discoverable independently of this setup.
+Agent Lens accepts the exact marker, a matching structured startup event from a JSON launch, or a complete native startup header. It can read the beginning of an attributed Claude task output when the transcript records its approved path. It verifies the working directory and launch interval against the corresponding rollout and links a resume to its exact turn. When provenance is missing or conflicting, the Codex thread remains standalone. Verify the marker in a disposable Git Bash launch before relying on nesting in your regular workflow.
