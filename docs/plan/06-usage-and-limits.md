@@ -28,6 +28,16 @@ Claude sends the relay <code>rate_limits.five_hour</code> and <code>rate_limits.
 
 **Presentation and alerts.** The adapter declares its supported quota windows and emits normalized limit samples. The sidebar and status bar show 5h and 7d for each active Claude and Codex profile. The same gauges support other durations and skip adapters without limits. Usage detail shows profile, reset local time, relative time, reporting age, window identity and stale/missing reasons. Missing windows display a dash with an accessible explanation. An elapsed reset expires the snapshot until a new observation arrives. Trigger optional notifications for active profiles at configurable crossings, initially 80% and 95%, once per adapter/profile/account generation/bucket/window/reset/threshold. Deduplicate across VS Code windows when possible. Suppress historical or stale observations, avoid two alerts for a single jump through both thresholds, and include an Open usage action.
 
+## Context fill levels
+
+Context fill gets two warning levels on top of the percentage: **High** from 70% (amber) and **Critical** from 90% (red) by default. Both thresholds are user settings (<code>agentLens.context.warnPercent</code>, <code>agentLens.context.criticalPercent</code>), validated so warning stays below critical. Levels apply only where a percentage is shown: the Claude relay's <code>context_window.used_percentage</code> for its main session, and the approximate last-request Codex fill for its thread. A Claude subagent or any lane without a known capacity shows its recorded input tokens without a level. Codex levels are labeled approximate, the same as their percentage.
+
+- **Where it shows.** The context gauge in the session header, the Usage detail summary, each Agent map card that has a percentage, and the sidebar session row when the level is High or Critical. The color always comes with a text label (High, Critical) and an accessible description, so the level never depends on color alone. Theme the colors through VS Code warning and error tokens.
+- **When it updates.** Recompute on each new context sample for that scope. A stale or missing sample removes the level and shows the normal stale or unavailable state. A drop below the threshold, for example after compaction, clears the level right away.
+- **Alerts.** An optional notification for crossing into High or Critical, off by default. Notify once per session, lane, level and compaction epoch. A jump straight past both thresholds gives one Critical alert. Suppress samples from historical discovery and deduplicate across VS Code windows where feasible, the same way as the quota alerts above. Context alerts and quota alerts stay separate, because one is about a single conversation and the other about the account.
+
+Context levels are counted in the run statistics view (Later) as threshold crossings per session.
+
 ---
 
 [← 5](05-subagents-and-files.md) · [Plan index](README.md) · [7 →](07-architecture.md)

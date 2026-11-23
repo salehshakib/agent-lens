@@ -6,10 +6,11 @@ Agent Lens is a VS Code extension for watching and chatting with coding agents. 
 
 | Milestone | Scope |
 | --- | --- |
-| **M1** — View everything | Claude Code sessions, messages, subagents, files, Codex runs, Agent map, tokens, context fill, 5-hour / weekly limits, read-only account status |
+| **M1** — View everything | Claude Code sessions, messages, subagents, files, Codex runs, Agent map, tokens, context fill with High/Critical levels, 5-hour / weekly limits, run signals (Possible loop, Done without checks), Open parent, read-only account status |
 | **M2** — Chat with Claude Code | Chat, background runs, approvals, model/effort picker, targeted Stop, Claude sign-in / profiles |
 | **M3** — Codex control | Start, follow-up, verified Stop, Codex chat where supported, Codex sign-in / profiles |
 | **M4** — Gemini CLI | Third adapter through the same contract |
+| **Later** — Run statistics | Stats tab: tool and command failure rates, loop counts, Done without checks share, context pressure, stops |
 
 Decisions and the remaining open question are in [15. Milestones](15-milestones.md#decisions).
 
