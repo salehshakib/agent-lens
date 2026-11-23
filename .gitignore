@@ -1,0 +1,5 @@
+.npm-cache/
+node_modules/
+dist/
+*.vsix
+test/fixtures/.phase-a-*/

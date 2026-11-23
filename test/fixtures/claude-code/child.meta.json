@@ -1,0 +1,12 @@
+{
+  "agentType": "reviewer",
+  "description": "Synthetic child verifier",
+  "toolUseId": "synthetic-spawn",
+  "spawnDepth": 2,
+  "model": "fixture-model",
+  "effort": "medium",
+  "finished": true,
+  "stoppedByUser": true,
+  "requestShape": "IGNORE-CHILD-REQUEST",
+  "requestNonInteractive": "IGNORE-CHILD-ARGUMENTS"
+}

@@ -1,0 +1,12 @@
+{
+  "sessionId": "10000000-0000-4000-8000-000000000001",
+  "pid": 2468,
+  "procStart": 1893578400000,
+  "pidDomain": "native",
+  "version": "2.1.330",
+  "status": "idle",
+  "statusUpdatedAt": 1893578405000,
+  "cwd": "X:\\fixtures\\synthetic-export",
+  "entrypoint": "cli",
+  "peerSocket": "IGNORE-PRESENCE-SOCKET"
+}
