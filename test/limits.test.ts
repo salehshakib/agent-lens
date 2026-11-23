@@ -1,7 +1,7 @@
 import { deepEqual, equal, ok } from 'node:assert/strict';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { parseRateLimitLine, probeSamples, profileEnv } from '../src/host/limits/claude-probe';
+import { parseRateLimitLine, probeArgs, probeSamples, profileEnv, UsageReport } from '../src/host/limits/claude-probe';
 import { limitSamples, parseSnapshot, projectStatusLine, relayContext, sessionToken } from '../src/host/limits/claude-relay';
 import type { RelaySnapshot } from '../src/host/limits/claude-relay';
 import { buildGauges, compactGauges, latestSamples } from '../src/host/limits/model';
@@ -152,6 +152,97 @@ test('the Claude probe rejects utilization outside 0–1 without dropping a vali
   }
 });
 
+const usageAt = Date.parse('2026-11-23T13:00:00Z');
+const usageText = `You are currently using your subscription to power your Claude Code usage
+
+Current session: 21% used · resets Nov 23, 8:50pm (Asia/Dhaka)
+Current week (all models): 73% used · resets Nov 27, 7am (Asia/Dhaka)
+
+What's contributing to your usage?
+Approximate · sessions on this machine only · shares overlap
+
+Last 24h · 1130 requests · 36 sessions
+  39%  Synthetic session title`;
+const usageWindows = {
+  fiveHour: { usedPercent: 21, resetsAt: Date.parse('2026-11-23T14:50:00Z') },
+  sevenDay: { usedPercent: 73, resetsAt: Date.parse('2026-11-27T01:00:00Z') },
+};
+const unrecognizedUsage = { ok: false, message: 'Claude Code usage report format was not recognized.' };
+
+function usageResult(text: string, at = usageAt) {
+  const report = new UsageReport();
+  report.read(JSON.stringify({ type: 'result', result: text, num_turns: 0 }), at);
+  return report.finish(at);
+}
+
+test('the refresh probe passes the literal /usage command and parses the 5-hour and weekly report', () => {
+  deepEqual(probeArgs, [
+    '-p', '/usage', '--output-format', 'stream-json', '--verbose', '--model', 'haiku',
+    '--tools', '', '--no-session-persistence', '--setting-sources', 'project', '--strict-mcp-config',
+  ]);
+  deepEqual(usageResult(usageText), { ok: true, windows: usageWindows, at: usageAt });
+});
+
+test('the usage report prefers result text and falls back to synthetic assistant text', () => {
+  const report = new UsageReport();
+  report.read(JSON.stringify({
+    type: 'assistant',
+    message: { model: '<synthetic>', content: [{ type: 'text', text: usageText }] },
+  }), usageAt);
+  report.read(JSON.stringify({ type: 'result', result: 'Unrecognized' }), usageAt);
+  deepEqual(report.finish(usageAt), { ok: true, windows: usageWindows, at: usageAt });
+  report.read(JSON.stringify({ type: 'result', result: usageText.replace('21%', '22%') }), usageAt);
+  deepEqual(report.finish(usageAt), {
+    ok: true,
+    windows: { ...usageWindows, fiveHour: { ...usageWindows.fiveHour, usedPercent: 22 } },
+    at: usageAt,
+  });
+});
+
+test('time-only resets use the local calendar date in the reported IANA zone', () => {
+  const at = Date.parse('2026-11-23T03:00:00Z');
+  const text = [
+    'Current session: 21% used · resets 8pm (America/Los_Angeles)',
+    'Current week (all models): 73% used · resets Nov 27, 7:15am (America/Los_Angeles)',
+  ].join('\n');
+  deepEqual(usageResult(text, at), {
+    ok: true, at, windows: {
+      fiveHour: { usedPercent: 21, resetsAt: Date.parse('2026-11-23T04:00:00Z') },
+      sevenDay: { usedPercent: 73, resetsAt: Date.parse('2026-11-27T15:15:00Z') },
+    },
+  });
+});
+
+test('the usage report selects the upcoming year for a reset after New Year', () => {
+  const at = Date.parse('2026-12-30T13:00:00Z');
+  const text = usageText.replace('Nov 23', 'Dec 30').replace('Nov 27', 'Jan 2');
+  deepEqual(usageResult(text, at), {
+    ok: true, at, windows: {
+      fiveHour: { usedPercent: 21, resetsAt: Date.parse('2026-12-30T14:50:00Z') },
+      sevenDay: { usedPercent: 73, resetsAt: Date.parse('2027-01-02T01:00:00Z') },
+    },
+  });
+});
+
+test('the usage report accepts percentages from 0 to 100 and rejects out-of-range values', () => {
+  deepEqual(usageResult(usageText.replace('21%', '0%').replace('73%', '100%')), {
+    ok: true, at: usageAt, windows: {
+      fiveHour: { ...usageWindows.fiveHour, usedPercent: 0 },
+      sevenDay: { ...usageWindows.sevenDay, usedPercent: 100 },
+    },
+  });
+  for (const percent of [-1, 101]) {
+    deepEqual(usageResult(usageText.replace('21%', percent + '%')), unrecognizedUsage);
+  }
+});
+
+test('unrecognized usage output returns a format error even with a rate-limit event', () => {
+  const report = new UsageReport();
+  report.read(JSON.stringify(rateLimitEvent), usageAt);
+  report.read(JSON.stringify({ type: 'result', result: 'Unrecognized' }), usageAt);
+  deepEqual(report.finish(usageAt), unrecognizedUsage);
+});
+
 test('probe samples map available windows to the requested Claude profile', () => {
   const fiveHour = { usedPercent: 16, resetsAt: now + minute };
   const sevenDay = { usedPercent: 72, resetsAt: now + 60 * minute };
@@ -182,5 +273,5 @@ test('the refresh gate reports availability, progress and retryable errors', () 
   deepEqual(refreshGate({ ...ready, error: 'No limit data.' }), { enabled: true, reason: 'Last refresh failed: No limit data.' });
   const gate = refreshGate(ready);
   equal(gate.enabled, true);
-  ok(gate.reason.includes('Haiku'));
+  ok(gate.reason.includes('/usage'));
 });
