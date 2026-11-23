@@ -1,5 +1,33 @@
 body { max-width: 1100px; margin: 0 auto; padding-top: 0; }
 
+body.chat-open { block-size: 100dvh; overflow: hidden; }
+.chat-open #root { display: flex; flex-direction: column; block-size: 100%; min-block-size: 0; }
+.chat-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px 16px;
+  padding: 10px 0;
+  border-block-end: 1px solid var(--vscode-widget-border, var(--vscode-editorGroup-border, transparent));
+}
+.chat-heading { min-inline-size: 0; overflow-wrap: anywhere; }
+.chat-heading h1, .chat-heading p { margin: 0; }
+.chat-views { position: relative; }
+.chat-views summary { padding: 3px 6px; cursor: pointer; }
+.chat-view-options {
+  position: absolute;
+  inset-inline-end: 0;
+  z-index: 5;
+  display: grid;
+  min-inline-size: max-content;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--vscode-widget-border, var(--vscode-editorGroup-border, currentColor));
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+}
+.chat-view-options button { text-align: start; }
+
 .session-head {
   padding: 10px 0 6px;
   background: var(--vscode-editor-background);

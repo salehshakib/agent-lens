@@ -1,8 +1,9 @@
 import { isHostMessage } from '../shared/protocol';
-import type { PanelModel, PanelTab } from '../shared/protocol';
+import type { ChatView, PanelModel, PanelTab } from '../shared/protocol';
 import { formatDuration } from '../shared/format';
 import { api, badge, button, el, preserve, signalBadge } from './dom';
 import { mapTab } from './panel/agents';
+import { ChatPane } from './panel/chat';
 import { filesTab } from './panel/files';
 import { applyFocus, applyRestore, arrive, canGoBack, departed, goBack, goTo, parentAction } from './panel/nav';
 import type { Arrival } from './panel/nav';
@@ -16,13 +17,27 @@ const root = document.getElementById('root');
 if (!root) throw new Error('Missing root');
 const ui = loadUi();
 let model: PanelModel | undefined;
+const chatPane = new ChatPane(request => api.postMessage(request), position => {
+  ui.chatPosition = position;
+  saveUi(ui);
+}, ui.chatPosition);
+let peerBack = false;
+let inspectionScroll = 0;
 
 const tabs: readonly (readonly [PanelTab, string])[] = [
-  ['timeline', 'Timeline'], ['map', 'Agent map'], ['files', 'Files'], ['usage', 'Usage'], ['tasks', 'Background tasks'],
+  ['chat', 'Chat'], ['timeline', 'Timeline'], ['map', 'Agent map'], ['files', 'Files'], ['usage', 'Usage'], ['tasks', 'Background tasks'],
 ];
 
 /** How the next draw lands, set when a panel message arrives and used once. */
 let arrival: Arrival | undefined;
+
+function backButton(): HTMLElement | undefined {
+  if (!peerBack && !canGoBack(ui)) return undefined;
+  return button('Back', () => {
+    if (peerBack) api.postMessage({ type: 'panelBack' });
+    else goBack(ui, draw);
+  }, { attrs: { 'data-key': 'back', title: 'Back to the previous place' } });
+}
 
 function breadcrumb(session: SessionModel): HTMLElement | undefined {
   if (session.breadcrumb.length < 3) return undefined;
@@ -54,16 +69,45 @@ function header(session: SessionModel): HTMLElement {
     session.elapsedMs === undefined ? undefined : 'elapsed ' + formatDuration(session.elapsedMs),
     session.agentCount + (session.agentCount === 1 ? ' agent' : ' agents'), session.contextText, session.usageText];
   const parent = parentAction(session.id, '', session.parent, 'session');
+  const back = backButton();
   return el('header', { cls: 'session-head' },
-    canGoBack(ui) || parent ? el('div', { cls: 'actions head-actions' },
-      canGoBack(ui) ? button('Back', () => goBack(ui, draw), { attrs: { 'data-key': 'back', title: 'Back to the previous place' } }) : undefined,
-      parent) : undefined,
+    back || parent ? el('div', { cls: 'actions head-actions' }, back, parent) : undefined,
     breadcrumb(session),
     el('h1', {}, session.title, ' ', badge(session.status, session.tone)),
     el('p', { cls: 'facts muted', text: facts.filter(Boolean).join(' · ') }),
     signalSummary(session),
     session.privateMode ? el('p', { cls: 'notice', text: 'Private display mode is on. Prompts, commands, output and diffs are hidden.' }) : undefined,
     session.note ? el('p', { cls: 'notice', text: session.note }) : undefined);
+}
+
+const chatHeader = el('header', { cls: 'chat-header' });
+let chatHeaderKey: string | undefined;
+
+function drawChat(chat: ChatView, session?: SessionModel): void {
+  if (!root) return;
+  const headerKey = JSON.stringify([chat.title, chat.provider, chat.project, chat.profile, session?.id, session?.parent, peerBack, ui.history.length]);
+  const entering = !chatPane.element.isConnected;
+  if (entering) {
+    inspectionScroll = document.scrollingElement?.scrollTop ?? 0;
+    document.body.classList.add('chat-open');
+    root.replaceChildren(chatHeader, chatPane.element);
+  }
+  if (headerKey !== chatHeaderKey) {
+    chatHeaderKey = headerKey;
+    const views = session ? el('details', { cls: 'chat-views' },
+      el('summary', { text: 'Views', attrs: { 'data-key': 'chat-views' } }),
+      el('div', { cls: 'chat-view-options' }, ...tabs.slice(1).map(([id, label]) => button(label, () => {
+        views!.open = false;
+        select(id);
+      })))) : undefined;
+    preserve(chatHeader, () => chatHeader.replaceChildren(
+      el('div', { cls: 'chat-heading' }, el('h1', { text: chat.title }),
+        el('p', { cls: 'muted', text: [chat.project, chat.provider, chat.profile].filter(Boolean).join(' · ') })),
+      el('div', { cls: 'actions' }, backButton(),
+        session ? parentAction(session.id, '', session.parent, 'chat') : undefined, views)));
+  }
+  chatPane.update(chat);
+  if (entering) chatPane.show();
 }
 
 function tabBar(session: SessionModel): HTMLElement {
@@ -109,26 +153,31 @@ function body(session: SessionModel): HTMLElement {
 function draw(): void {
   if (!model || !root) return;
   const current = model;
+  const session = current.mode === 'chat' || current.mode === 'session' ? current.session : undefined;
+  if (session && arrival) {
+    if (arrival.restore) applyRestore(ui, arrival.restore);
+    else if (arrival.focus) applyFocus(ui, arrival.focus.lane, arrival.focus.row);
+    arrival = undefined;
+    saveUi(ui);
+  }
+  if (current.mode === 'chat' && (ui.tab === 'chat' || !session)) {
+    drawChat(current.chat, session);
+    return;
+  }
+  const wasChat = chatPane.element.isConnected;
+  if (wasChat) {
+    chatPane.hide();
+    document.body.classList.remove('chat-open');
+  }
+  if (current.mode === 'chat' && current.chat.privateMode) chatPane.update(current.chat);
   preserve(root, () => {
     if (!root) return;
     switch (current.mode) {
+      case 'chat':
       case 'session': {
-        const landed = arrival;
-        arrival = undefined;
-        if (ui.session !== current.session.id) {
-          ui.session = current.session.id;
-          ui.lane = '';
-          ui.kind = '';
-          ui.agent = undefined;
-          ui.expanded = [];
-          // A session opened from the sidebar starts a new trail. A navigation keeps it.
-          if (!landed) ui.history = [];
-        }
-        if (landed?.restore) applyRestore(ui, landed.restore);
-        else if (landed?.focus) applyFocus(ui, landed.focus.lane, landed.focus.row);
-        saveUi(ui);
-        root.replaceChildren(header(current.session), tabBar(current.session),
-          el('div', { cls: 'tabpanel', attrs: { role: 'tabpanel', id: 'tabpanel', 'aria-labelledby': 'tab-' + ui.tab } }, body(current.session)));
+        if (!session) break;
+        root.replaceChildren(header(session), tabBar(session),
+          el('div', { cls: 'tabpanel', attrs: { role: 'tabpanel', id: 'tabpanel', 'aria-labelledby': 'tab-' + ui.tab } }, body(session)));
         break;
       }
       case 'usage': root.replaceChildren(usagePage(current.usage, ui)); break;
@@ -136,21 +185,38 @@ function draw(): void {
       case 'empty': root.replaceChildren(el('p', { cls: 'empty', text: current.message })); break;
     }
   });
+  if (wasChat && document.scrollingElement) document.scrollingElement.scrollTop = inspectionScroll;
 }
 
 window.addEventListener('message', event => {
   const message: unknown = event.data;
   if (!isHostMessage(message) || message.type !== 'panel') return;
-  if (message.tab && message.model.mode === 'session') {
-    ui.tab = message.tab;
-    saveUi(ui);
-  }
-  if (message.model.mode === 'session') arrival = arrive(ui, message.model.session.id, message.focus, model?.mode === 'session');
-  else {
+  const next = message.model;
+  peerBack = message.back === true;
+  if (next.mode === 'chat' || next.mode === 'session') {
+    const id = next.mode === 'chat' ? next.id : next.session.id;
+    const focus = message.focus;
+    if (id && (next.mode === 'session' || next.session)) {
+      arrival = focus && peerBack ? { focus } : arrive(ui, id, focus, model?.mode === 'chat' || model?.mode === 'session');
+    }
+    if (id !== ui.session) {
+      ui.session = id;
+      ui.lane = '';
+      ui.kind = '';
+      ui.agent = undefined;
+      ui.expanded = [];
+      if (!arrival) ui.history = [];
+    }
+    if (message.tab) ui.tab = message.tab;
+    if (next.mode === 'chat') ui.chatKey = next.chat.key;
+    ui.view = undefined;
+  } else {
     departed();
     arrival = undefined;
+    ui.view = next.mode === 'usage' || next.mode === 'tasks' ? next.mode : undefined;
   }
-  model = message.model;
+  saveUi(ui);
+  model = next;
   draw();
 });
 

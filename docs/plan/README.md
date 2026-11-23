@@ -38,3 +38,4 @@ Decisions and the remaining open question are in [15. Milestones](15-milestones.
 
 - [M1 implementation](m1-implementation.md)
 - [M2 implementation phases](m2-implementation.md)
+- [M2 compatibility evidence](m2-compatibility.md)

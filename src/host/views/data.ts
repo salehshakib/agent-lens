@@ -1,4 +1,7 @@
+import { basename } from 'node:path';
 import type { Provider } from '../adapters/types';
+import type { ChatScope } from '../chat/types';
+import type { ChatPresentation } from '../chat/session';
 import { safeText } from '../privacy/projection';
 import { profileKey } from '../accounts/profiles';
 import { buildAccounts, profileOptions } from '../accounts/view';
@@ -11,7 +14,8 @@ import type { Session } from '../sessions/types';
 import type { Thresholds } from './signal-models';
 import type { UsageTotal } from '../usage/ledger';
 import type {
-  Filters, GaugeView, PanelModel, ParentInfo, RelayView, SidebarModel, SourceView, UsageFilters, UsageModel,
+  ChatRow, ChatView, Filters, GaugeView, PanelModel, ParentInfo, RelayView, SessionRow, SidebarModel, SourceView,
+  UsageFilters, UsageModel,
 } from '../../shared/protocol';
 import {
   buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, namesFor, providerLabels,
@@ -44,6 +48,7 @@ export interface LensDeps {
   refresh(): RefreshGate;
   /** Context level thresholds from settings. The defaults apply when absent. */
   thresholds?(): Thresholds;
+  canContinue?(session: Session): boolean;
 }
 
 /** Builds every view model from host state. It holds only paging state, never provider data. */
@@ -103,6 +108,16 @@ export class LensData {
       profileLabels: new Map(profiles.map(profile => [profileKey(profile.provider, profile.id), profile.label])),
     });
     const { adapters, projects } = filterOptions(sessions);
+    if (this.deps.canContinue) {
+      const eligible = new Set(sessions.filter(this.deps.canContinue).map(session => session.id));
+      function mark(rows: SessionRow[]): void {
+        for (const row of rows) {
+          if (eligible.has(row.id)) row.continueChat = true;
+          mark(row.children);
+        }
+      }
+      for (const project of tree) for (const group of project.groups) mark(group.rows);
+    }
     return {
       gauges: this.views(this.gauges().main), liveCount: this.liveCount(sessions),
       backgroundCount: buildTasks(sessions, privateMode).filter(task => task.status === 'Live' || task.status === 'Waiting').length,
@@ -128,6 +143,43 @@ export class LensData {
       thresholds: this.deps.thresholds?.(),
       profileLabel: named && (several || named.id !== 'default') ? named.label : undefined,
     }) };
+  }
+
+  async chat(
+    key: string, id: string | undefined, scope: ChatScope | undefined,
+    view: (presentation: ChatPresentation) => ChatView | undefined, reason?: string,
+  ): Promise<PanelModel> {
+    const detail = id ? await this.detail(id) : undefined;
+    const session = detail?.mode === 'session' ? detail.session : undefined;
+    const privateMode = this.deps.privateMode();
+    const main = session?.agents.find(agent => agent.kind === 'main')?.laneId;
+    const history: ChatRow[] = [];
+    if (main) {
+      for (const row of session!.rows) {
+        if (row.laneId !== main) continue;
+        if (row.kind === 'user' || row.kind === 'assistant' || row.kind === 'final') {
+          const text = row.text ?? (privateMode ? 'Hidden in private display mode' : undefined);
+          if (text) history.push({ id: row.id, role: row.kind === 'user' ? 'user' : 'assistant', text });
+        } else if (row.kind === 'tool') {
+          history.push({ id: row.id, role: 'tool', text: row.label });
+        }
+      }
+    }
+    const profile = scope && this.deps.profiles().find(item => item.provider === scope.provider && item.id === scope.profile);
+    const presentation: ChatPresentation = {
+      title: session?.title ?? (id ? 'Session' : 'New chat'),
+      project: session?.project ?? (scope ? safeText(basename(scope.cwd), 100) : undefined),
+      provider: session?.provider ?? (scope ? providerLabels[scope.provider] : undefined),
+      profile: profile?.label ?? session?.profile,
+      privateMode, history, reason,
+    };
+    const chat = view(presentation) ?? {
+      key, title: presentation.title, project: presentation.project, provider: presentation.provider, profile: presentation.profile,
+      privateMode, rows: history, draft: '', revision: 0, state: 'view-only',
+      reason: reason ?? (detail?.mode === 'empty' ? detail.message : 'This recorded session is available for inspection.'),
+      canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
+    };
+    return { mode: 'chat', chat, id, session };
   }
 
   /** Every lane that currently has a High or Critical context level, for the optional alerts. */

@@ -1,3 +1,5 @@
+import type { ChatAdapter } from '../chat/types';
+
 export type Provider = 'claude-code' | 'codex';
 
 export interface Profile {
@@ -91,7 +93,8 @@ export interface Adapter {
   homeOverride: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME';
   defaultHome: string;
   historyDirectory: string;
-  capabilities: { watch: true; usage: true; limits: readonly number[]; auth: { status: boolean }; chat: false; modelSelect: false };
+  capabilities: { watch: true; usage: true; limits: readonly number[]; auth: { status: boolean }; chat: boolean; modelSelect: false };
+  chat?: ChatAdapter;
   classifyRecord: (record: unknown, source: Source) => RecordKind;
   parseRecords: (record: unknown, source: Source, offset: number) => Event[];
 }

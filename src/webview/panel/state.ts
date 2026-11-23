@@ -1,5 +1,7 @@
 import type { PanelModel, PanelTab, UsageFilters } from '../../shared/protocol';
 import { api } from '../dom';
+import { parseChatPosition } from './chat';
+import type { ChatPosition } from './chat';
 
 /** One place the reader can come Back to: the session, its lane filter and the topmost visible row. */
 export interface Place {
@@ -24,11 +26,14 @@ export interface Ui {
   usage: UsageFilters;
   /** Session the saved view belongs to. */
   session?: string;
+  chatKey?: string;
+  chatPosition?: ChatPosition;
+  view?: 'usage' | 'tasks';
   /** Back history of this panel, newest last. */
   history: Place[];
 }
 
-const tabs: readonly PanelTab[] = ['timeline', 'map', 'files', 'usage', 'tasks'];
+const tabs: readonly PanelTab[] = ['chat', 'timeline', 'map', 'files', 'usage', 'tasks'];
 
 function isPlace(value: unknown): value is Place {
   if (typeof value !== 'object' || value === null) return false;
@@ -39,7 +44,7 @@ function isPlace(value: unknown): value is Place {
 export const defaultUsage: UsageFilters = { range: '30', project: '', adapter: '' };
 
 export function loadUi(): Ui {
-  const base: Ui = { tab: 'timeline', lane: '', kind: '', expanded: [], fileSearch: '', fileKind: '', usage: defaultUsage, history: [] };
+  const base: Ui = { tab: 'chat', lane: '', kind: '', expanded: [], fileSearch: '', fileKind: '', usage: defaultUsage, history: [] };
   const value = api.getState();
   if (typeof value !== 'object' || value === null) return base;
   const saved = value as Partial<Ui>;
@@ -56,6 +61,9 @@ export function loadUi(): Ui {
       && typeof usage.project === 'string' && typeof usage.adapter === 'string'
       ? { range: usage.range, project: usage.project.slice(0, 64), adapter: usage.adapter.slice(0, 40) } : defaultUsage,
     session: typeof saved.session === 'string' ? saved.session : undefined,
+    chatKey: typeof saved.chatKey === 'string' ? saved.chatKey.slice(0, 64) : undefined,
+    chatPosition: parseChatPosition(saved.chatPosition),
+    view: saved.view === 'usage' || saved.view === 'tasks' ? saved.view : undefined,
     history: Array.isArray(saved.history) ? saved.history.filter(isPlace).slice(-historyLimit).map(place => ({
       session: place.session.slice(0, 64), lane: place.lane.slice(0, 80), kind: place.kind.slice(0, 20),
       anchor: place.anchor.slice(0, 200), tab: place.tab })) : [],

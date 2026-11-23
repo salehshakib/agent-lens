@@ -15,7 +15,7 @@
   "categories": ["Other"],
   "extensionKind": ["ui"],
   "main": "./dist/host/extension.js",
-  "activationEvents": ["onStartupFinished"],
+  "activationEvents": ["onStartupFinished", "onWebviewPanel:agentLens.panel"],
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": true
@@ -41,6 +41,7 @@
       ]
     },
     "commands": [
+      { "command": "agentLens.newChat", "title": "New Chat", "category": "Agent Lens" },
       { "command": "agentLens.openUsage", "title": "Open Usage and Limits", "category": "Agent Lens" },
       { "command": "agentLens.openTasks", "title": "Open Background Tasks", "category": "Agent Lens" },
       { "command": "agentLens.openParent", "title": "Open Parent of Current Session", "category": "Agent Lens" },
