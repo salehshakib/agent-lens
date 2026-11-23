@@ -1,27 +1,25 @@
 /**
- * Explicit "Refresh limits" gate (plan section 6). The structured /usage candidate has not been verified
- * with a signed-in probe in a disposable profile, so the action stays disabled. No parser for the
- * unverified report shape exists here by design: nothing may guess at it.
+ * Explicit "Refresh limits" gate (plan section 6). Refresh runs one tiny headless `claude -p` Haiku turn and
+ * reads the `rate_limit_event` it prints (verified with Claude Code 2.1.330). It needs Claude Code on PATH
+ * and at least one Claude profile.
  */
 export interface RefreshGate {
   enabled: boolean;
   reason: string;
 }
 
-export interface Verification {
-  /** Set only after the documented single-command probe has been verified by a person in a disposable profile. */
-  usageReportVerified: boolean;
+export interface RefreshState {
+  claudeFound: boolean;
+  profiles: number;
+  running: boolean;
+  /** Last failure message, shown until the next successful refresh. */
+  error?: string;
 }
 
-export const unverified: Verification = { usageReportVerified: false };
-
-export function refreshGate(verification: Verification = unverified): RefreshGate {
-  if (!verification.usageReportVerified) {
-    return {
-      enabled: false,
-      reason: 'Refresh limits is waiting for a verified signed-in probe of the Claude /usage report. '
-        + 'Use the status-line relay or the official /usage command in Claude Code for now.',
-    };
-  }
-  return { enabled: true, reason: 'Refresh the Claude limits for this profile.' };
+export function refreshGate(state: RefreshState): RefreshGate {
+  if (state.profiles === 0) return { enabled: false, reason: 'No Claude profile is configured.' };
+  if (state.running) return { enabled: false, reason: 'Refreshing Claude limits…' };
+  if (!state.claudeFound) return { enabled: false, reason: 'Claude Code was not found on PATH, so limits cannot be refreshed.' };
+  if (state.error) return { enabled: true, reason: 'Last refresh failed: ' + state.error };
+  return { enabled: true, reason: 'Sends one short Haiku message through Claude Code to read the current 5-hour and weekly limits.' };
 }
