@@ -6,7 +6,8 @@ import { render, resourceRoots } from './html';
 
 export interface SidebarActions {
   visibility(visible: boolean): void;
-  openSession(id: string, mode: 'timeline' | 'map'): void;
+  openSession(id: string, mode: 'chat' | 'map', start?: boolean): void;
+  newChat(): void;
   openParent(id: string): void;
   openUsage(): void;
   openTasks(): void;
@@ -50,7 +51,9 @@ export class SidebarView implements WebviewViewProvider {
             this.data.loadOlder(request.project);
             this.update();
             break;
-          case 'openSession': this.actions.openSession(request.id, 'timeline'); break;
+          case 'newChat': this.actions.newChat(); break;
+          case 'continueChat': this.actions.openSession(request.id, 'chat', true); break;
+          case 'openSession': this.actions.openSession(request.id, 'chat'); break;
           case 'openMap': this.actions.openSession(request.id, 'map'); break;
           case 'openParent': this.actions.openParent(request.id); break;
           case 'openUsage': this.actions.openUsage(); break;

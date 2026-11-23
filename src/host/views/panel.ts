@@ -1,163 +1,212 @@
 import { ViewColumn, window } from 'vscode';
 import type { Disposable, Uri, WebviewPanel } from 'vscode';
 import { parsePanelRequest } from '../../shared/protocol';
-import type { HostMessage, PanelModel, PanelTab, RelayCommand, UsageFilters } from '../../shared/protocol';
+import type { HostMessage, PanelModel, PanelRequest, PanelTab, RelayCommand, UsageFilters } from '../../shared/protocol';
 import type { LensData } from './data';
 import { render, resourceRoots } from './html';
 
+type Focus = { lane: string; row: string };
+export type ChatPanelRequest = Extract<PanelRequest, { type: `chat${string}` }>;
 export type PanelTarget =
-  | { kind: 'session'; id: string; tab: PanelTab; focus?: { lane: string; row: string } }
+  | { kind: 'chat'; key: string; id?: string; tab?: PanelTab; focus?: Focus; from?: string }
   | { kind: 'usage' }
   | { kind: 'tasks' };
 
 export interface PanelActions {
-  /** Load the full history of a session before it is shown. */
-  prepare(id: string): Promise<unknown>;
+  chat(key: string, id?: string): Promise<PanelModel>;
+  chatRequest(key: string, request: ChatPanelRequest): void;
+  sessionId(key: string): string | undefined;
+  openSession(id: string, tab: PanelTab, focus?: Focus, from?: string): void;
   openFile(id: string): void;
   openDiff(id: string): void;
   openTranscript(session: string, lane: string): void;
-  /** Resolve and open the parent of a lane. A menu appears when a resumed thread has several launches. */
-  openParent(session: string, lane: string): void;
+  openParent(session: string, lane: string, from?: string): void;
   openSettings(): void;
   relay(command: RelayCommand, profile: string): void;
   visibility(visible: boolean): void;
 }
 
-const defaultUsage: UsageFilters = { range: '30', project: '', adapter: '' };
-const refreshDelay = 250;
+interface Editor {
+  key: string;
+  panel: WebviewPanel;
+  target: PanelTarget;
+  ready: boolean;
+  sequence: number;
+  timer?: NodeJS.Timeout;
+  tab?: PanelTab;
+  focus?: Focus;
+  back?: string;
+  usageFilters: UsageFilters;
+}
 
-/** One editor tab that shows a session, the usage summary or the background tasks. */
+const defaultUsage: UsageFilters = { range: '30', project: '', adapter: '' };
+const refreshDelay = 100;
+
+/** Editors own view state. Conversation and worker state live independently in the host. */
 export class PanelView {
-  private panel?: WebviewPanel;
-  private ready = false;
-  private target?: PanelTarget;
-  private pendingTab?: PanelTab;
-  private pendingFocus?: { lane: string; row: string };
-  private usageFilters = defaultUsage;
-  private sequence = 0;
-  private timer?: NodeJS.Timeout;
+  static readonly viewType = 'agentLens.panel';
+  private readonly editors = new Map<string, Editor>();
 
   constructor(private readonly extensionUri: Uri, private readonly data: LensData, private readonly actions: PanelActions) {}
 
+  private key(target: PanelTarget): string {
+    return target.kind === 'chat' ? target.key : target.kind;
+  }
+
   show(target: PanelTarget): void {
-    this.target = target;
-    this.pendingTab = target.kind === 'session' ? target.tab : undefined;
-    this.pendingFocus = target.kind === 'session' ? target.focus : undefined;
-    if (this.panel) {
-      this.panel.title = this.title();
-      this.panel.reveal(this.panel.viewColumn ?? ViewColumn.Active, false);
-      this.refresh();
+    const key = this.key(target);
+    const existing = this.editors.get(key);
+    if (existing) {
+      if (target.kind === 'chat') {
+        existing.target = target;
+        existing.tab = target.tab;
+        existing.focus = target.focus;
+        if (target.from && target.from !== key) existing.back = target.from;
+      }
+      this.reveal(existing);
       return;
     }
-    const panel = window.createWebviewPanel('agentLens.panel', this.title(), ViewColumn.Active, {
-      enableScripts: true, retainContextWhenHidden: false, localResourceRoots: resourceRoots(this.extensionUri),
+    const panel = window.createWebviewPanel(PanelView.viewType, this.title(target), ViewColumn.Active, {
+      enableScripts: true, retainContextWhenHidden: true, localResourceRoots: resourceRoots(this.extensionUri),
     });
-    this.panel = panel;
-    this.ready = false;
-    this.actions.visibility(true);
+    this.attach(panel, target);
+  }
+
+  restore(panel: WebviewPanel, target: PanelTarget): void {
+    const existing = this.editors.get(this.key(target));
+    if (existing) {
+      panel.dispose();
+      return;
+    }
+    panel.webview.options = { enableScripts: true, localResourceRoots: resourceRoots(this.extensionUri) };
+    this.attach(panel, target);
+  }
+
+  private reveal(editor: Editor): void {
+    editor.panel.reveal(editor.panel.viewColumn ?? ViewColumn.Active, false);
+    this.refresh(editor);
+  }
+
+  private attach(panel: WebviewPanel, target: PanelTarget): void {
+    const key = this.key(target);
+    const editor: Editor = { key, panel, target, ready: false, sequence: 0, usageFilters: defaultUsage };
+    if (target.kind === 'chat') {
+      editor.tab = target.tab;
+      editor.focus = target.focus;
+      if (target.from !== key) editor.back = target.from;
+    }
+    this.editors.set(key, editor);
+    this.visibility();
     const listeners: Disposable[] = [
-      panel.webview.onDidReceiveMessage((message: unknown) => {
-        if (this.panel !== panel) return;
-        this.handle(message);
-      }),
+      panel.webview.onDidReceiveMessage((message: unknown) => this.handle(editor, message)),
       panel.onDidChangeViewState(() => {
-        if (this.panel !== panel) return;
-        this.actions.visibility(panel.visible);
-        if (panel.visible) this.refresh();
+        this.visibility();
+        if (panel.visible) this.refresh(editor);
       }),
       panel.onDidDispose(() => {
         for (const listener of listeners) listener.dispose();
-        clearTimeout(this.timer);
-        this.timer = undefined;
-        if (this.panel !== panel) return;
-        this.panel = undefined;
-        this.ready = false;
-        this.sequence++;
-        this.actions.visibility(false);
+        clearTimeout(editor.timer);
+        this.editors.delete(key);
+        this.visibility();
+        this.update();
       }),
     ];
     panel.webview.html = render(panel.webview, this.extensionUri, {
-      title: 'Agent Lens', script: 'panel.js', styles: ['lens.css', 'panel.css'],
+      title: 'Agent Lens', script: 'panel.js', styles: ['lens.css', 'panel.css', 'chat.css'],
       body: '<div id="root"></div><div id="live" class="visually-hidden" role="status" aria-live="polite"></div>',
     });
   }
 
-  private title(): string {
-    switch (this.target?.kind) {
+  private visibility(): void {
+    this.actions.visibility([...this.editors.values()].some(editor => editor.panel.visible));
+  }
+
+  private title(target: PanelTarget): string {
+    switch (target.kind) {
       case 'usage': return 'Agent Lens: Usage';
       case 'tasks': return 'Agent Lens: Background tasks';
-      default: return 'Agent Lens: Session';
+      case 'chat': return target.id ? 'Agent Lens: Session' : 'Agent Lens: New chat';
     }
   }
 
-  private handle(message: unknown): void {
+  private sessionId(editor: Editor): string | undefined {
+    return editor.target.kind === 'chat' ? this.actions.sessionId(editor.key) ?? editor.target.id : undefined;
+  }
+
+  private handle(editor: Editor, message: unknown): void {
     const request = parsePanelRequest(message);
-    if (!request) return;
+    if (!request || this.editors.get(editor.key) !== editor) return;
     switch (request.type) {
       case 'ready':
-        this.ready = true;
-        this.refresh();
+        editor.ready = true;
+        this.refresh(editor);
+        break;
+      case 'chatDraft': case 'chatSend': case 'chatContinue': case 'chatInterrupt': case 'chatRetry': case 'chatChooseScope':
+        if (editor.target.kind === 'chat') this.actions.chatRequest(editor.key, request);
         break;
       case 'openFile': this.actions.openFile(request.id); break;
       case 'openDiff': this.actions.openDiff(request.id); break;
       case 'openTranscript': this.actions.openTranscript(request.session, request.lane); break;
-      case 'openSession': this.show({ kind: 'session', id: request.id, tab: 'timeline' }); break;
-      case 'goto':
-        this.show({ kind: 'session', id: request.session, tab: 'timeline',
-          ...(request.lane || request.row ? { focus: { lane: request.lane, row: request.row } } : {}) });
+      case 'openSession': this.actions.openSession(request.id, 'chat', undefined, editor.key); break;
+      case 'goto': this.actions.openSession(request.session, 'timeline',
+        request.lane || request.row ? { lane: request.lane, row: request.row } : undefined, editor.key); break;
+      case 'openParent': this.actions.openParent(request.session, request.lane, editor.key); break;
+      case 'panelBack': {
+        const back = editor.back && this.editors.get(editor.back);
+        editor.back = undefined;
+        if (back) this.reveal(back);
         break;
-      case 'openParent': this.actions.openParent(request.session, request.lane); break;
+      }
       case 'openSettings': this.actions.openSettings(); break;
       case 'usageFilters':
-        this.usageFilters = request.filters;
-        this.refresh();
+        editor.usageFilters = request.filters;
+        this.refresh(editor);
         break;
       case 'relay': this.actions.relay(request.command, request.profile); break;
     }
   }
 
-  /** The session the panel currently shows, for the Open parent command. */
-  currentSession(): string | undefined {
-    return this.panel && this.target?.kind === 'session' ? this.target.id : undefined;
+  /** The active editor's recorded session, for the Open parent command. */
+  currentSession(): { id: string; key: string } | undefined {
+    const editor = [...this.editors.values()].find(item => item.panel.active);
+    const id = editor && this.sessionId(editor);
+    return editor && id ? { id, key: editor.key } : undefined;
   }
 
-  /** Throttled refresh for store changes. */
-  update(): void {
-    if (!this.panel?.visible || !this.ready || this.timer) return;
-    this.timer = setTimeout(() => {
-      this.timer = undefined;
-      this.refresh();
-    }, refreshDelay);
-  }
-
-  private async model(target: PanelTarget): Promise<PanelModel> {
-    switch (target.kind) {
-      case 'usage': return this.data.usage(this.usageFilters);
-      case 'tasks': return this.data.tasks();
-      case 'session':
-        await this.actions.prepare(target.id);
-        return this.data.detail(target.id);
+  update(key?: string): void {
+    const editors = key ? [this.editors.get(key)] : this.editors.values();
+    for (const editor of editors) {
+      if (!editor?.panel.visible || !editor.ready || editor.timer) continue;
+      editor.timer = setTimeout(() => {
+        editor.timer = undefined;
+        this.refresh(editor);
+      }, refreshDelay);
     }
   }
 
-  refresh(): void {
-    const panel = this.panel;
-    const target = this.target;
-    if (!panel?.visible || !this.ready || !target) return;
-    const sequence = ++this.sequence;
-    void this.model(target).then(model => {
-      if (sequence !== this.sequence || this.panel !== panel) return;
-      const message: HostMessage = { type: 'panel', model, ...(this.pendingTab ? { tab: this.pendingTab } : {}),
-        ...(this.pendingFocus ? { focus: this.pendingFocus } : {}) };
-      this.pendingTab = undefined;
-      this.pendingFocus = undefined;
-      return panel.webview.postMessage(message);
+  private model(editor: Editor): Promise<PanelModel> {
+    switch (editor.target.kind) {
+      case 'usage': return this.data.usage(editor.usageFilters);
+      case 'tasks': return this.data.tasks();
+      case 'chat': return this.actions.chat(editor.key, this.sessionId(editor));
+    }
+  }
+
+  private refresh(editor: Editor): void {
+    if (!editor.panel.visible || !editor.ready) return;
+    const sequence = ++editor.sequence;
+    void this.model(editor).then(model => {
+      if (sequence !== editor.sequence || this.editors.get(editor.key) !== editor) return;
+      if (model.mode === 'chat') editor.panel.title = 'Agent Lens: ' + model.chat.title;
+      const message: HostMessage = { type: 'panel', model, tab: editor.tab, focus: editor.focus,
+        back: Boolean(editor.back && this.editors.has(editor.back)) };
+      editor.tab = undefined;
+      editor.focus = undefined;
+      return editor.panel.webview.postMessage(message);
     }).catch(() => undefined);
   }
 
   dispose(): void {
-    clearTimeout(this.timer);
-    this.timer = undefined;
-    this.panel?.dispose();
+    for (const editor of this.editors.values()) editor.panel.dispose();
   }
 }

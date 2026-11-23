@@ -76,6 +76,7 @@ export interface SessionRow {
   /** Short warning labels such as Possible loop, No checks after edits, Context High. */
   warnings: SignalView[];
   parent: { state: ParentInfo['state']; reason?: string };
+  continueChat?: boolean;
 }
 
 export interface AgentRow {
@@ -354,22 +355,52 @@ export interface UsageModel {
   refresh: { enabled: boolean; reason: string };
 }
 
+export interface ChatRow {
+  id: string;
+  role: 'user' | 'assistant' | 'tool' | 'notice';
+  text: string;
+  state?: 'pending' | 'failed' | 'uncertain';
+}
+
+export interface ChatView {
+  key: string;
+  title: string;
+  project?: string;
+  provider?: string;
+  profile?: string;
+  state: 'draft' | 'view-only' | 'starting' | 'idle' | 'working' | 'interrupting' | 'blocked';
+  reason?: string;
+  rows: readonly ChatRow[];
+  draft: string;
+  /** Latest edit received by the host. Preserves edits newer than a model update. */
+  revision: number;
+  canSend: boolean;
+  canContinue: boolean;
+  canInterrupt: boolean;
+  canRetry: boolean;
+  canChooseScope: boolean;
+  privateMode: boolean;
+}
+
 export type PanelModel =
+  | { mode: 'chat'; chat: ChatView; id?: string; session?: SessionDetail }
   | { mode: 'session'; session: SessionDetail }
   | { mode: 'usage'; usage: UsageModel }
   | { mode: 'tasks'; tasks: TaskView[]; privateMode: boolean }
   | { mode: 'empty'; message: string };
 
 export type RelayCommand = 'enable' | 'decline' | 'uninstall' | 'refresh';
-export type PanelTab = 'timeline' | 'map' | 'files' | 'usage' | 'tasks';
+export type PanelTab = 'chat' | 'timeline' | 'map' | 'files' | 'usage' | 'tasks';
 
 export type HostMessage =
   | { type: 'sidebar'; model: SidebarModel }
   /** `tab` is set only when the host opens the panel on a specific tab. `focus` is set when Open parent targets a row. */
-  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string } };
+  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean };
 
 export type SidebarRequest =
   | { type: 'ready' }
+  | { type: 'newChat' }
+  | { type: 'continueChat'; id: string }
   | { type: 'filter'; filters: Filters }
   | { type: 'loadOlder'; project: string }
   | { type: 'openSession'; id: string }
@@ -382,6 +413,12 @@ export type SidebarRequest =
 
 export type PanelRequest =
   | { type: 'ready' }
+  | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
+  | { type: 'chatContinue' }
+  | { type: 'chatInterrupt' }
+  | { type: 'chatRetry' }
+  | { type: 'chatChooseScope' }
+  | { type: 'panelBack' }
   | { type: 'openFile'; id: string }
   | { type: 'openDiff'; id: string }
   | { type: 'openTranscript'; session: string; lane: string }
@@ -408,6 +445,7 @@ function text(value: unknown, max: number): value is string {
 }
 
 export const maxSearch = 200;
+export const maxChatDraft = 32_000;
 /** Provider id, a colon and a profile id of up to 160 characters. */
 export const maxProfileKey = 180;
 
@@ -430,14 +468,14 @@ function isRelayCommand(value: unknown): value is RelayCommand {
 export function parseSidebarRequest(message: unknown): SidebarRequest | undefined {
   if (typeof message !== 'object' || message === null) return undefined;
   const type = (message as { type?: unknown }).type;
-  if (type === 'ready' && shape(message, ['type'])) return { type };
+  if ((type === 'ready' || type === 'newChat') && shape(message, ['type'])) return { type };
   if (type === 'openUsage' && shape(message, ['type'])) return { type };
   if (type === 'openTasks' && shape(message, ['type'])) return { type };
   if (type === 'accountStatus' && shape(message, ['type', 'profile']) && text(message.profile, maxProfileKey)
     && message.profile) return { type, profile: message.profile };
   if (type === 'filter' && shape(message, ['type', 'filters']) && isFilters(message.filters)) return { type, filters: message.filters };
   if (type === 'loadOlder' && shape(message, ['type', 'project']) && text(message.project, 64)) return { type, project: message.project };
-  if ((type === 'openSession' || type === 'openMap' || type === 'openParent') && shape(message, ['type', 'id'])
+  if ((type === 'openSession' || type === 'openMap' || type === 'openParent' || type === 'continueChat') && shape(message, ['type', 'id'])
     && typeof message.id === 'string' && sessionId.test(message.id)) return { type, id: message.id };
   if (type === 'relay' && shape(message, ['type', 'command', 'profile']) && isRelayCommand(message.command)
     && text(message.profile, 64)) {
@@ -455,6 +493,12 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   if (typeof message !== 'object' || message === null) return undefined;
   const type = (message as { type?: unknown }).type;
   if (type === 'ready' && shape(message, ['type'])) return { type };
+  if (type === 'panelBack' && shape(message, ['type'])) return { type };
+  if ((type === 'chatContinue' || type === 'chatInterrupt' || type === 'chatRetry' || type === 'chatChooseScope')
+    && shape(message, ['type'])) return { type };
+  if ((type === 'chatDraft' || type === 'chatSend') && shape(message, ['type', 'revision', 'text'])
+    && typeof message.revision === 'number' && Number.isSafeInteger(message.revision) && message.revision >= 0
+    && text(message.text, maxChatDraft)) return { type, revision: message.revision, text: message.text };
   if ((type === 'openFile' || type === 'openDiff') && shape(message, ['type', 'id']) && typeof message.id === 'string'
     && actionId.test(message.id)) return { type, id: message.id };
   if (type === 'openTranscript' && shape(message, ['type', 'session', 'lane']) && typeof message.session === 'string'

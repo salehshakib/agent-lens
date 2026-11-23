@@ -129,10 +129,15 @@ function row(item: SessionRow, depth: number, now: number): HTMLElement {
       'aria-label': 'Open parent of ' + item.title + (item.parent.reason ? '. Unavailable: ' + item.parent.reason : ''),
       title: item.parent.reason },
   });
+  const continueChat = item.continueChat ? button('Continue', () => {
+    selected = item.id;
+    persist();
+    api.postMessage({ type: 'continueChat', id: item.id });
+  }, { cls: 'link', attrs: { 'data-nav': true, 'aria-label': 'Continue ' + item.title } }) : undefined;
   const reason = item.parent.state === 'unresolved' ? el('small', { cls: 'reason', text: 'Parent unavailable: ' + (item.parent.reason ?? 'not resolved yet') }) : undefined;
   const children = item.children.length ? el('ul', { cls: 'rows', attrs: { 'aria-label': 'Child sessions' } },
     ...item.children.map(child => row(child, depth + 1, now))) : undefined;
-  return el('li', { cls: 'row', attrs: { 'data-depth': depth } }, main, agents, map, parent, reason, children);
+  return el('li', { cls: 'row', attrs: { 'data-depth': depth } }, main, continueChat, agents, map, parent, reason, children);
 }
 
 function group(item: GroupNode, projectId: string, now: number): HTMLElement {
@@ -161,6 +166,7 @@ function render(next: SidebarModel): void {
   const now = Date.now();
   preserve(root as HTMLElement, () => {
     summary.replaceChildren(
+      button('New chat', () => api.postMessage({ type: 'newChat' }), { attrs: { 'data-nav': true, 'data-key': 'new-chat' } }),
       el('span', { text: next.liveCount + (next.liveCount === 1 ? ' live session' : ' live sessions') }),
       el('span', { text: next.backgroundCount + ' background' }),
       button('Usage', () => api.postMessage({ type: 'openUsage' }), { attrs: { 'data-nav': true } }),
