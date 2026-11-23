@@ -5,13 +5,6 @@ import { delimiter, join, resolve } from 'node:path';
 import { record } from '../privacy/projection';
 import type { LimitSample } from './model';
 
-/**
- * Read Claude's 5-hour and weekly limits with one tiny headless call (`claude -p`). Claude Code prints a
- * `rate_limit_event` in its stream-json output for every request, so one short Haiku turn is enough.
- * The call runs in an empty folder with only project settings, no MCP servers and no tools, so the user's
- * hooks, plugins and memory are not triggered. Only the window numbers are kept.
- */
-
 export interface ProbeWindows {
   fiveHour?: { usedPercent: number; resetsAt: number };
   sevenDay?: { usedPercent: number; resetsAt: number };
@@ -22,13 +15,13 @@ export type ProbeResult =
   | { ok: false; message: string };
 
 export const probeArgs = [
-  '-p', 'Reply with OK',
+  '-p', '/usage',
   '--output-format', 'stream-json', '--verbose',
-  '--model', 'haiku', '--max-turns', '1',
+  '--model', 'haiku',
+  '--tools', '',
   '--no-session-persistence',
   '--setting-sources', 'project',
   '--strict-mcp-config',
-  '--tools', '',
 ] as const;
 
 const timeoutMs = 60_000;
@@ -59,6 +52,98 @@ export function parseRateLimitLine(line: string): ProbeWindows | undefined {
   if (!windows) return undefined;
   const result: ProbeWindows = { fiveHour: window(windows.five_hour), sevenDay: window(windows.seven_day) };
   return result.fiveHour || result.sevenDay ? result : undefined;
+}
+
+const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const dayMs = 86_400_000;
+
+/** Represent a timestamp's local calendar fields as UTC so their difference gives the zone offset. */
+function localTime(formatter: Intl.DateTimeFormat, timestamp: number): number {
+  const parts = new Map(formatter.formatToParts(timestamp).map(({ type, value }) => [type, Number(value)]));
+  return Date.UTC(parts.get('year')!, parts.get('month')! - 1, parts.get('day')!,
+    parts.get('hour')!, parts.get('minute')!);
+}
+
+function parseReset(reset: string, at: number): number | undefined {
+  const match = /^(?:([A-Z][a-z]{2}) (\d{1,2}), )?(\d{1,2})(?::(\d{2}))?(am|pm) \(([A-Za-z][A-Za-z0-9_+/-]*)\)$/.exec(reset);
+  if (!match) return undefined;
+  const [, monthName, day, hourText, minuteText, period, timeZone] = match;
+  const hour = Number(hourText);
+  const minute = Number(minuteText ?? 0);
+  if (!timeZone || hour < 1 || hour > 12 || minute > 59) return undefined;
+
+  let formatter: Intl.DateTimeFormat;
+  try {
+    formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', hourCycle: 'h23',
+    });
+  } catch {
+    return undefined;
+  }
+  const today = new Date(localTime(formatter, at));
+  const month = monthName ? months.indexOf(monthName) : today.getUTCMonth();
+  const date = day ? Number(day) : today.getUTCDate();
+  if (month < 0 || date < 1 || date > 31) return undefined;
+  const year = today.getUTCFullYear();
+  for (const candidateYear of monthName ? [year, year + 1] : [year]) {
+    const wallTime = Date.UTC(candidateYear, month, date, hour % 12 + (period === 'pm' ? 12 : 0), minute);
+    if (new Date(wallTime).getUTCMonth() !== month) continue;
+    // Sample both sides of nearby offset changes and check the round trip at each candidate.
+    const candidates = [wallTime - dayMs, wallTime, wallTime + dayMs]
+      .map(point => wallTime - (localTime(formatter, point) - point))
+      .filter(point => point > at && point <= at + 8 * dayMs && localTime(formatter, point) === wallTime);
+    if (candidates.length) return Math.min(...candidates);
+  }
+  return undefined;
+}
+
+function readUsageWindows(text: string, at: number): ProbeWindows | undefined {
+  const windows: ProbeWindows = {};
+  for (const line of text.split('\n')) {
+    const match = /^(Current session|Current week \(all models\)): (\d{1,3})% used · resets (.+)$/.exec(line.trim());
+    if (!match?.[3]) continue;
+    const usedPercent = Number(match[2]);
+    if (usedPercent > 100) continue;
+    const resetsAt = parseReset(match[3], at);
+    if (resetsAt === undefined) continue;
+    const key = match[1] === 'Current session' ? 'fiveHour' : 'sevenDay';
+    windows[key] = { usedPercent, resetsAt };
+    if (windows.fiveHour && windows.sevenDay) return windows;
+  }
+  return undefined;
+}
+
+/** Read stream-json records, keeping only the parsed windows. */
+export class UsageReport {
+  private resultWindows?: ProbeWindows;
+  private assistantWindows?: ProbeWindows;
+
+  read(line: string, at: number): void {
+    if (this.resultWindows || line.length > maxLineChars) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line.trim());
+    } catch {
+      return;
+    }
+    const event = record(parsed);
+    if (event?.type === 'result' && typeof event.result === 'string') {
+      this.resultWindows = readUsageWindows(event.result, at);
+    } else if (event?.type === 'assistant' && !this.assistantWindows) {
+      const content = record(event.message)?.content;
+      if (!Array.isArray(content)) return;
+      const text = content.map(record)
+        .map(block => block?.type === 'text' && typeof block.text === 'string' ? block.text : '').join('\n');
+      this.assistantWindows = readUsageWindows(text, at);
+    }
+  }
+
+  finish(at: number): ProbeResult {
+    const windows = this.resultWindows ?? this.assistantWindows;
+    return windows
+      ? { ok: true, windows, at }
+      : { ok: false, message: 'Claude Code usage report format was not recognized.' };
+  }
 }
 
 export function probeSamples(result: Extract<ProbeResult, { ok: true }>, profile: string): LimitSample[] {
@@ -112,7 +197,7 @@ export function profileEnv(home: string, env: NodeJS.ProcessEnv = process.env, u
   return next;
 }
 
-/** Run the probe once for a profile home. `workdir` must be an Agent Lens-owned folder. */
+/** Run Claude Code's local usage command once. `workdir` must be an Agent Lens-owned folder. */
 export async function probeClaudeLimits(home: string, workdir: string, now: () => number = Date.now): Promise<ProbeResult> {
   const executable = await resolveClaude();
   if (!executable) return { ok: false, message: 'Claude Code was not found on PATH.' };
@@ -120,9 +205,12 @@ export async function probeClaudeLimits(home: string, workdir: string, now: () =
   return new Promise<ProbeResult>(done => {
     let timedOut = false;
     let startFailed = false;
-    let windows: ProbeWindows | undefined;
+    const report = new UsageReport();
     let buffer = '';
-    const child = spawn(executable, [...probeArgs], { cwd: workdir, env: profileEnv(home), windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    let discardingLine = false;
+    const child = spawn(executable, [...probeArgs], {
+      cwd: workdir, env: profileEnv(home), shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+    });
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill();
@@ -132,10 +220,14 @@ export async function probeClaudeLimits(home: string, workdir: string, now: () =
       buffer += chunk;
       let index;
       while ((index = buffer.indexOf('\n')) >= 0) {
-        windows = parseRateLimitLine(buffer.slice(0, index).trim()) ?? windows;
+        if (!discardingLine) report.read(buffer.slice(0, index), now());
+        discardingLine = false;
         buffer = buffer.slice(index + 1);
       }
-      if (buffer.length > maxLineChars) buffer = '';
+      if (buffer.length > maxLineChars) {
+        discardingLine = true;
+        buffer = '';
+      }
     });
     let settled = false;
     const finish = (result: ProbeResult) => {
@@ -149,13 +241,12 @@ export async function probeClaudeLimits(home: string, workdir: string, now: () =
       startFailed = true;
       if (child.pid === undefined) finish({ ok: false, message: 'Claude Code could not be started.' });
     });
-    child.on('close', code => {
-      windows = parseRateLimitLine(buffer.trim()) ?? windows;
-      if (windows) finish({ ok: true, windows, at: now() });
-      else if (timedOut) finish({ ok: false, message: 'Claude did not answer within 60 seconds.' });
+    child.on('close', () => {
+      const at = now();
+      if (!discardingLine && buffer) report.read(buffer, at);
+      if (timedOut) finish({ ok: false, message: 'Claude did not answer within 60 seconds.' });
       else if (startFailed) finish({ ok: false, message: 'Claude Code could not be started.' });
-      else if (code === 0) finish({ ok: false, message: 'Claude answered without limit data. This account may not report subscription limits.' });
-      else finish({ ok: false, message: 'Claude exited with code ' + code + '. Check that this profile is signed in.' });
+      else finish(report.finish(at));
     });
   });
 }
