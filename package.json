@@ -2,7 +2,7 @@
   "name": "agent-lens",
   "displayName": "Agent Lens",
   "description": "Observe local coding agent activity in VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "salehshakib",
   "private": true,
   "repository": {
@@ -60,6 +60,13 @@
             "scope": "machine",
             "default": {},
             "markdownDescription": "Local source settings keyed by `claude-code` or `codex`. Each can set `enabled`, an observation-only `logRoot`, and additional `profiles` with `id`, `label`, and `home`."
+          },
+          "agentLens.chat.permissionMode": {
+            "type": "string",
+            "scope": "machine",
+            "enum": ["auto", "default", "acceptEdits", "plan"],
+            "default": "auto",
+            "markdownDescription": "Claude Code permission mode for Agent Lens chats. `auto` lets Claude Code's safety check approve commands, as in your normal sessions. Anything that still needs a decision is denied until approval prompts arrive. Applies to chats started or continued after the change."
           },
           "agentLens.privateDisplay": {
             "type": "boolean",
