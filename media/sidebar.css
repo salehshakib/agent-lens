@@ -16,6 +16,7 @@ body {
 .filters input { width: 100%; }
 .filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .filter-row select { width: 100%; }
+.filter-row select:nth-child(3) { grid-column: 1 / -1; }
 
 details.project > summary {
   cursor: pointer;
@@ -51,6 +52,12 @@ details.project > summary {
 
 .source { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; padding: 6px 0; border-bottom: 1px solid var(--vscode-widget-border, transparent); }
 .source small { flex-basis: 100%; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+details.accounts { margin-top: 12px; }
+details.accounts > summary { cursor: pointer; font-weight: 600; }
+.account { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-bottom: 1px solid var(--vscode-widget-border, transparent); }
+.account small { color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+.account-state { font-weight: 600; }
+.account-note { display: block; margin-top: 6px; color: var(--vscode-descriptionForeground); }
 details.sources { margin-top: 12px; }
 details.sources > summary { cursor: pointer; font-weight: 600; }
 

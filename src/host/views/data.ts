@@ -1,5 +1,7 @@
 import type { Provider } from '../adapters/types';
 import { safeText } from '../privacy/projection';
+import { profileKey } from '../accounts/profiles';
+import { buildAccounts, profileOptions } from '../accounts/view';
 import { relayContext } from '../limits/claude-relay';
 import type { RelaySnapshot } from '../limits/claude-relay';
 import { buildGauges } from '../limits/model';
@@ -21,6 +23,8 @@ export interface ProfileInfo {
   provider: Provider;
   id: string;
   label: string;
+  /** Canonical home folder of the profile. */
+  home: string;
 }
 
 export interface LensDeps {
@@ -31,6 +35,8 @@ export interface LensDeps {
   timeZone?: string;
   privateMode(): boolean;
   profiles(): ProfileInfo[];
+  /** The user home folder, shortened to a tilde in the Accounts view. */
+  userHome: string;
   /** Cached relay snapshots and samples for one Claude profile id. */
   relay(profileId: string): { snapshots: RelaySnapshot[]; samples: LimitSample[] };
   relayViews(): RelayView[];
@@ -89,16 +95,20 @@ export class LensData {
   async sidebar(filters: Filters): Promise<SidebarModel> {
     const sessions = await this.deps.sessions();
     const privateMode = this.deps.privateMode();
+    const profiles = this.deps.profiles();
     const { tree, total } = buildTree(sessions, {
       now: this.deps.now(), timeZone: this.deps.timeZone, privateMode, filters, earlierLimits: this.earlierLimits,
       relayContexts: new Map([...this.relayContexts(sessions)].map(([id, sample]) => [id, sample.percent])),
       thresholds: this.deps.thresholds?.(),
+      profileLabels: new Map(profiles.map(profile => [profileKey(profile.provider, profile.id), profile.label])),
     });
     const { adapters, projects } = filterOptions(sessions);
     return {
       gauges: this.views(this.gauges().main), liveCount: this.liveCount(sessions),
       backgroundCount: buildTasks(sessions, privateMode).filter(task => task.status === 'Live' || task.status === 'Waiting').length,
-      adapters, projects, tree, sources: this.deps.sources(), relays: this.deps.relayViews(), refresh: this.deps.refresh(),
+      adapters, projects, tree, sources: this.deps.sources(), profiles: profileOptions(profiles, sessions),
+      accounts: buildAccounts({ profiles, sessions, totals: this.deps.usageTotals(), userHome: this.deps.userHome }),
+      relays: this.deps.relayViews(), refresh: this.deps.refresh(),
       filters, privateMode, total,
     };
   }
@@ -107,12 +117,16 @@ export class LensData {
     const sessions = await this.deps.sessions();
     const session = sessions.find(item => item.id === id);
     if (!session) return { mode: 'empty', message: 'This session is no longer available. It may have been removed or its source is disabled.' };
-    const profile = this.deps.profiles().find(item => item.provider === 'claude-code' && item.id === session.profile);
+    const profiles = this.deps.profiles();
+    const profile = profiles.find(item => item.provider === 'claude-code' && item.id === session.profile);
+    const named = profiles.find(item => item.provider === session.provider && item.id === session.profile);
+    const several = profiles.filter(item => item.provider === session.provider).length > 1;
     const snapshots = profile ? this.deps.relay(profile.id).snapshots : [];
     const context = session.provider === 'claude-code' ? relayContext(snapshots, session.nativeId, this.deps.now()) : undefined;
     return { mode: 'session', session: buildDetail(session, sessions, {
       now: this.deps.now(), privateMode: this.deps.privateMode(), relayContext: context?.percent,
       thresholds: this.deps.thresholds?.(),
+      profileLabel: named && (several || named.id !== 'default') ? named.label : undefined,
     }) };
   }
 

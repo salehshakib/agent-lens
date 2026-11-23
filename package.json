@@ -45,6 +45,8 @@
       { "command": "agentLens.openTasks", "title": "Open Background Tasks", "category": "Agent Lens" },
       { "command": "agentLens.openParent", "title": "Open Parent of Current Session", "category": "Agent Lens" },
       { "command": "agentLens.openSignalSettings", "title": "Open Signal Settings", "category": "Agent Lens" },
+      { "command": "agentLens.showAccounts", "title": "Show Accounts", "category": "Agent Lens" },
+      { "command": "agentLens.accounts.openStatus", "title": "Open Official Account Status Terminal", "category": "Agent Lens" },
       { "command": "agentLens.relay.enable", "title": "Enable Claude Limits Relay", "category": "Agent Lens" },
       { "command": "agentLens.relay.remove", "title": "Remove Claude Limits Relay", "category": "Agent Lens" }
     ],
@@ -120,6 +122,8 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "tsc --outDir dist/test && node --test \"dist/test/test/*.test.js\"",
+    "profile": "node --expose-gc scripts/profile.mjs",
+    "inspect:vsix": "node scripts/inspect-vsix.mjs",
     "vscode:prepublish": "npm run build"
   },
   "devDependencies": {

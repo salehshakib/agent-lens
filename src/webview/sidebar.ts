@@ -1,6 +1,6 @@
 import { isHostMessage } from '../shared/protocol';
-import type { Filters, GroupNode, ProjectNode, SessionRow, SidebarModel } from '../shared/protocol';
-import { formatAge, formatReset } from '../shared/format';
+import type { AccountProfileView, Filters, GroupNode, ProjectNode, SessionRow, SidebarModel } from '../shared/protocol';
+import { formatAge, formatReset, formatTokens } from '../shared/format';
 import { announce, api, badge, button, el, gaugeBlock, navigate, preserve, signalBadge } from './dom';
 import { relayCard } from './relay';
 
@@ -10,7 +10,7 @@ interface Saved {
   selected?: string;
 }
 
-const empty: Filters = { search: '', adapter: '', project: '', warnings: false };
+const empty: Filters = { search: '', adapter: '', project: '', warnings: false, profile: '' };
 
 function load(): Saved {
   const value = api.getState();
@@ -18,10 +18,10 @@ function load(): Saved {
   const saved = value as Partial<Saved>;
   const filters = saved.filters;
   const valid = typeof filters === 'object' && filters !== null && typeof filters.search === 'string'
-    && typeof filters.adapter === 'string' && typeof filters.project === 'string';
+    && typeof filters.adapter === 'string' && typeof filters.project === 'string' && (filters.profile === undefined || typeof filters.profile === 'string');
   return {
     filters: valid ? { search: filters.search.slice(0, 200), adapter: filters.adapter.slice(0, 40), project: filters.project.slice(0, 64),
-      warnings: filters.warnings === true } : empty,
+      warnings: filters.warnings === true, profile: (filters.profile ?? '').slice(0, 180) } : empty,
     collapsed: Array.isArray(saved.collapsed) ? saved.collapsed.filter((item): item is string => typeof item === 'string').slice(0, 200) : [],
     selected: typeof saved.selected === 'string' ? saved.selected : undefined,
   };
@@ -49,12 +49,14 @@ const adapter = el('select', { attrs: { 'aria-label': 'Filter by agent' } });
 const project = el('select', { attrs: { 'aria-label': 'Filter by project' } });
 const warnings = el('input', { attrs: { type: 'checkbox', id: 'has-warnings' } });
 warnings.checked = filters.warnings;
+const profile = el('select', { attrs: { 'aria-label': 'Filter by profile' } });
 const tree = el('div', { cls: 'tree', attrs: { role: 'group', 'aria-label': 'Sessions by project' } });
 const sources = el('details', { cls: 'sources' });
+const accounts = el('details', { cls: 'accounts' });
 const privacy = el('p', { cls: 'privacy', attrs: { hidden: true }, text: 'Private display mode is on. Prompts, commands, output and diffs are hidden.' });
 
 function sendFilters(): void {
-  filters = { search: search.value, adapter: adapter.value, project: project.value, warnings: warnings.checked };
+  filters = { search: search.value, adapter: adapter.value, project: project.value, warnings: warnings.checked, profile: profile.value };
   persist();
   api.postMessage({ type: 'filter', filters });
 }
@@ -66,14 +68,15 @@ search.addEventListener('input', () => {
 adapter.addEventListener('change', sendFilters);
 project.addEventListener('change', sendFilters);
 warnings.addEventListener('change', sendFilters);
+profile.addEventListener('change', sendFilters);
 tree.addEventListener('keydown', event => navigate(tree, event));
 
 root.append(
   summary, privacy, quotas, relays,
-  el('div', { cls: 'filters' }, search, el('div', { cls: 'filter-row' }, adapter, project),
+  el('div', { cls: 'filters' }, search, el('div', { cls: 'filter-row' }, adapter, project, profile),
     el('label', { cls: 'check', attrs: { for: 'has-warnings', title: 'Sessions with a live loop, a turn that finished without checks, or high context. Settings: Agent Lens Signals.' } },
       warnings, el('span', { text: 'Has warnings' }))),
-  tree, sources,
+  tree, accounts, sources,
 );
 
 function setOptions(select: HTMLSelectElement, all: string, options: readonly { id: string; label: string }[], value: string): void {
@@ -88,8 +91,23 @@ function openSession(id: string): void {
   api.postMessage({ type: 'openSession', id });
 }
 
+function accountCard(item: AccountProfileView, now: number): HTMLElement {
+  const counts = item.sessions + (item.sessions === 1 ? ' session' : ' sessions') + ' · ' + item.live + ' live'
+    + (item.tokens !== undefined ? ' · ' + formatTokens(item.tokens) + ' tokens' : '');
+  return el('div', { cls: 'account' },
+    el('strong', { text: item.label }),
+    el('span', { text: item.provider + ' · ' + item.role + (item.active ? ' · Active' : '') }),
+    el('small', { cls: 'account-home', text: item.home }),
+    el('span', { cls: 'account-state', text: item.state + (item.mode ? ' · ' + item.mode : '') }),
+    el('small', { text: item.reason + ' ' + (item.checkedAt ? 'Checked ' + formatAge(item.checkedAt, now) + '.' : 'Not checked.') }),
+    el('small', { text: counts }),
+    button('Open official status in terminal', () => api.postMessage({ type: 'accountStatus', profile: item.key }), {
+      cls: 'link', attrs: { 'data-nav': true, 'aria-label': 'Open official status in a terminal for ' + item.label },
+    }));
+}
+
 function row(item: SessionRow, depth: number, now: number): HTMLElement {
-  const meta = [item.provider, item.project, item.updatedAt ? formatAge(item.updatedAt, now) : undefined].filter(Boolean).join(' · ');
+  const meta = [item.provider, item.profile, item.project, item.updatedAt ? formatAge(item.updatedAt, now) : undefined].filter(Boolean).join(' · ');
   const main = el('button', {
     cls: 'row-main',
     attrs: { type: 'button', 'data-nav': true, 'data-key': item.id, 'aria-current': selected === item.id ? 'true' : undefined },
@@ -153,12 +171,19 @@ function render(next: SidebarModel): void {
     relays.replaceChildren(...next.relays.map(relayCard));
     if (document.activeElement !== adapter) setOptions(adapter, 'All agents', next.adapters, filters.adapter);
     if (document.activeElement !== project) setOptions(project, 'All projects', next.projects, filters.project);
+    if (document.activeElement !== profile) setOptions(profile, 'All profiles', next.profiles, filters.profile ?? '');
     if (!next.tree.length) {
-      tree.replaceChildren(el('p', { cls: 'empty', text: next.total === 0 && (filters.search || filters.adapter || filters.project || filters.warnings)
+      tree.replaceChildren(el('p', { cls: 'empty', text: next.total === 0 && (filters.search || filters.adapter || filters.project || filters.warnings || filters.profile)
         ? 'No sessions match these filters.' : 'No sessions found yet. Sessions appear here when Claude Code or Codex records activity on this computer.' }));
     } else {
       tree.replaceChildren(...next.tree.map(item => projectNode(item, now)));
     }
+    accounts.replaceChildren(el('summary', { text: 'Accounts' }),
+      ...(next.accounts.profiles.length ? [] : [el('p', { cls: 'empty', text: 'No profiles configured.' })]),
+      ...next.accounts.profiles.map(item => accountCard(item, now)),
+      ...next.accounts.unassigned.map(item => el('small', { cls: 'account-note',
+        text: item.provider + ': ' + item.sessions + (item.sessions === 1 ? ' session' : ' sessions') + ' from observation-only sources, no profile attached.' })),
+      el('small', { cls: 'account-note', text: 'Status is read from the official command in a terminal you start. Agent Lens does not read credential files or switch accounts.' }));
     sources.replaceChildren(el('summary', { text: 'Sources' }), ...next.sources.map(source => el('div', { cls: 'source' },
       el('strong', { text: source.label }),
       el('span', { text: source.state }),
@@ -178,4 +203,4 @@ window.addEventListener('message', event => {
 });
 
 api.postMessage({ type: 'ready' });
-if (filters.search || filters.adapter || filters.project || filters.warnings) api.postMessage({ type: 'filter', filters });
+if (filters.search || filters.adapter || filters.project || filters.warnings || filters.profile) api.postMessage({ type: 'filter', filters });

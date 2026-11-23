@@ -69,6 +69,8 @@ export interface SessionRow {
   updatedAt?: number;
   /** Project label when the row sits outside its parent's project. */
   project?: string;
+  /** Profile label when the session belongs to a saved profile. */
+  profile?: string;
   agents: AgentRow[];
   children: SessionRow[];
   /** Short warning labels such as Possible loop, No checks after edits, Context High. */
@@ -114,6 +116,33 @@ export interface Filters {
   project: string;
   /** Show only sessions with a live loop, an unresolved done-without-checks outcome or a high context level. */
   warnings: boolean;
+  /** Profile key from the profile options. Empty or absent means all profiles. */
+  profile?: string;
+}
+
+export type AccountState = 'Signed in' | 'Signed out' | 'External configuration' | 'Unknown';
+
+export interface AccountProfileView {
+  /** Opaque key, provider and profile id, used to filter sessions and open the official status terminal. */
+  key: string;
+  provider: string;
+  label: string;
+  role: 'Default' | 'Saved';
+  active: boolean;
+  home: string;
+  state: AccountState;
+  reason: string;
+  mode?: string;
+  checkedAt?: number;
+  sessions: number;
+  live: number;
+  tokens?: number;
+}
+
+export interface AccountsView {
+  profiles: AccountProfileView[];
+  /** Sessions read from observation-only roots, which carry no profile attribution. */
+  unassigned: { provider: string; sessions: number }[];
 }
 
 export interface SidebarModel {
@@ -124,6 +153,8 @@ export interface SidebarModel {
   projects: FilterOption[];
   tree: ProjectNode[];
   sources: SourceView[];
+  profiles: FilterOption[];
+  accounts: AccountsView;
   relays: RelayView[];
   refresh: { enabled: boolean; reason: string };
   filters: Filters;
@@ -170,6 +201,7 @@ export interface AgentNode {
   status: string;
   tone: StatusTone;
   model?: string;
+  effort?: string;
   elapsedMs?: number;
   tokens?: number;
   tokenLabel: string;
@@ -236,6 +268,19 @@ export interface TaskView {
   at?: number;
 }
 
+/** One model and effort pair observed in an agent's recorded turns. */
+export interface ObservedModelRow {
+  lane: string;
+  model?: string;
+  effort?: string;
+  /** Turns that recorded this pair. Absent when only a lane-level record exists. */
+  turns?: number;
+  /** Evidence source label, or Not recorded. */
+  source: string;
+  /** The pair currently shown for the agent. */
+  current: boolean;
+}
+
 export interface SessionDetail {
   id: string;
   title: string;
@@ -247,6 +292,7 @@ export interface SessionDetail {
   tone: StatusTone;
   model?: string;
   effort?: string;
+  observed: ObservedModelRow[];
   elapsedMs?: number;
   agentCount: number;
   contextPercent?: number;
@@ -331,6 +377,7 @@ export type SidebarRequest =
   | { type: 'openParent'; id: string }
   | { type: 'openUsage' }
   | { type: 'openTasks' }
+  | { type: 'accountStatus'; profile: string }
   | { type: 'relay'; command: RelayCommand; profile: string };
 
 export type PanelRequest =
@@ -361,10 +408,13 @@ function text(value: unknown, max: number): value is string {
 }
 
 export const maxSearch = 200;
+/** Provider id, a colon and a profile id of up to 160 characters. */
+export const maxProfileKey = 180;
 
 export function isFilters(value: unknown): value is Filters {
-  return shape(value, ['search', 'adapter', 'project', 'warnings']) && text(value.search, maxSearch)
-    && text(value.adapter, 40) && text(value.project, 64) && typeof value.warnings === 'boolean';
+  const base = shape(value, ['search', 'adapter', 'project', 'warnings']) || shape(value, ['search', 'adapter', 'project', 'warnings', 'profile']);
+  return base && text(value.search, maxSearch) && text(value.adapter, 40) && text(value.project, 64)
+    && typeof value.warnings === 'boolean' && (!('profile' in value) || text(value.profile, maxProfileKey));
 }
 
 export function isUsageFilters(value: unknown): value is UsageFilters {
@@ -383,6 +433,8 @@ export function parseSidebarRequest(message: unknown): SidebarRequest | undefine
   if (type === 'ready' && shape(message, ['type'])) return { type };
   if (type === 'openUsage' && shape(message, ['type'])) return { type };
   if (type === 'openTasks' && shape(message, ['type'])) return { type };
+  if (type === 'accountStatus' && shape(message, ['type', 'profile']) && text(message.profile, maxProfileKey)
+    && message.profile) return { type, profile: message.profile };
   if (type === 'filter' && shape(message, ['type', 'filters']) && isFilters(message.filters)) return { type, filters: message.filters };
   if (type === 'loadOlder' && shape(message, ['type', 'project']) && text(message.project, 64)) return { type, project: message.project };
   if ((type === 'openSession' || type === 'openMap' || type === 'openParent') && shape(message, ['type', 'id'])

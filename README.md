@@ -36,6 +36,12 @@ Open **Agent Lens** in the Activity Bar to view local source status. Agent Lens 
 
 A profile `home` contains the provider's usual directory layout. A `logRoot` points directly at Claude's `projects` or Codex's `sessions` layout and carries no profile attribution. Set `enabled` to `false` to stop observing a provider. Paths must be absolute and local. Duplicate and overlapping roots are rejected.
 
+## Accounts, profiles and models
+
+The **Accounts** section in the sidebar lists each configured profile with its home folder, session and token counts, and an account state. In this version every account state shows **Unknown**: Agent Lens does not run `claude` or `codex` and never reads credential files, because the output of the official status commands has not been verified. **Open official status in terminal** (also the command **Agent Lens: Open Official Account Status Terminal**) opens a terminal for that profile and types the official status command without running it, so you press Enter yourself. It needs a trusted workspace. Sign-in, sign-out and account switching are not part of this version.
+
+The sidebar profile filter shows only sessions from one profile, and rows name their profile when a provider has more than one. Sessions from a `logRoot` carry no profile and appear as Unassigned. The session Usage tab lists the observed model and effort for each agent, with the evidence it came from. These are values the agent recorded, not the selection that was requested, and a missing value shows as Not recorded.
+
 ## Claude-to-Codex launcher convention
 
 When preparing the external `codex-first` launcher for M1 delegation linking, update the fresh and resume launch references in `~/.claude/skills/codex-first/SKILL.md` and `scripts/codex-resume` where used.

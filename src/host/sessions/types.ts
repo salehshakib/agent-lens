@@ -12,6 +12,8 @@ export type TokenCounts = {
   total?: number;
 };
 
+export type ModelSource = "transcript" | "turn-context" | "thread-settings";
+
 export type ContextLevel = "Normal" | "High" | "Critical";
 
 export type ContextSample = {
@@ -118,6 +120,8 @@ export type Turn = {
   durationMs?: number;
   model?: string;
   effort?: string;
+  /** Which recorded evidence supplied the model and effort. Never a requested selection. */
+  modelSource?: ModelSource;
   cwd?: string;
   rootId?: string;
   usage?: TokenCounts;

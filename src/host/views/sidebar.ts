@@ -11,9 +11,11 @@ export interface SidebarActions {
   openUsage(): void;
   openTasks(): void;
   relay(command: RelayCommand, profile: string): void;
+  /** Open the official read-only status command for the profile with this key. */
+  accountStatus(profile: string): void;
 }
 
-const emptyFilters: Filters = { search: '', adapter: '', project: '', warnings: false };
+const emptyFilters: Filters = { search: '', adapter: '', project: '', warnings: false, profile: '' };
 
 export class SidebarView implements WebviewViewProvider {
   static readonly viewType = 'agentLens.sessions';
@@ -54,6 +56,7 @@ export class SidebarView implements WebviewViewProvider {
           case 'openUsage': this.actions.openUsage(); break;
           case 'openTasks': this.actions.openTasks(); break;
           case 'relay': this.actions.relay(request.command, request.profile); break;
+          case 'accountStatus': this.actions.accountStatus(request.profile); break;
         }
       }),
       view.onDidChangeVisibility(() => {

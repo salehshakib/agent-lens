@@ -58,5 +58,17 @@
 ## Phase E · Profiles and packaging
 
 6. Show verified read-only account status or Unknown, active profile scopes, and observed model and effort. Profile synthetic histories, check external discovery, and inspect the local VSIX (§7, §11–15).
+   Part E1 (accounts, profiles, models) is listed first. Part E2 (profiling, discovery smoke test, VSIX inspection) is tracked by the other agent.
+   - **6.1** (E1, done) Account status model: Signed in, Signed out, External configuration, Unknown, with last check and mode. A result is accepted only from a verified probe, and only the allowlisted state, mode and check time are kept. No email, plan or identity field is read or stored (§12).
+   - **6.2** (E1, done) No probe is run. The plan names `claude auth status --json` and `codex login status`, but neither output shape was ever collected, so both providers show Unknown with the reason. This follows the 4.8 rule: no parser for an unverified shape.
+   - **6.3** (E1, done in code, manual check open) Official status in a terminal: a user-invoked command opens a terminal for the chosen profile (profile home in the terminal environment, none for the default profile), types the official status command without running it and leaves Enter to the user. Gated on Workspace Trust.
+   - **6.4** (E1, done) Profile scope model: default and saved profiles per provider with an active marker, the home shown with the user home shortened, per-profile session, live and token counts from the ledger, and sessions from observation-only roots kept as unassigned.
+   - **6.5** (E1, done in code, manual check open) UI: an Accounts section in the sidebar, a profile label on session rows and in the session header, a profile filter in the sidebar, and the `agentLens.showAccounts` and `agentLens.accounts.openStatus` commands. Switch, sign-in and sign-out stay absent (M2, M3).
+   - **6.6** (E1, done) Observed model and effort: record the evidence source per turn (recorded response, turn context, thread settings), group each agent's turns by model and effort, show the table next to the session token table, and show effort on each Agent map node. Missing values show Not recorded and are never guessed. The requested selection stays out of M1.
+   - **6.7** (E1, done) Tests (`test/accounts*.test.ts`, `test/models*.test.ts`) with synthetic data and no CLI, then build, typecheck and test.
+   - **6.8** (E2) Profile large synthetic histories.
+   - **6.9** (E2) Smoke-test external discovery.
+   - **6.10** (E2) Inspect the local VSIX against the runtime allowlist.
+   - **6.11** (open, manual) Verified status for both providers: record the output of the official status commands on a disposable signed-in profile per CLI, then add parsers. The two-home isolation checks from §12 stay open too.
 
 Run build, strict typecheck and offline tests before each phase commit. Keep repository and provider data separate throughout verification.
