@@ -1,0 +1,4 @@
+{"id":"10000000-0000-4000-8000-000000000001","thread_name":"Fixture renderer","updated_at":"2026-01-05T10:00:00.000Z","account_id":"private-index-marker"}
+{"id":"10000000-0000-4000-8000-000000000001","thread_name":"Renamed fixture renderer","updated_at":"2026-01-05T11:00:00.000Z"}
+{"id":"missing-fixture-id","thread_name":"Invalid fixture identity","updated_at":"2026-01-05T12:00:00.000Z"}
+{"id":"10000000-0000-4000-8000-000000000002","thread_name":"  ","updated_at":"2026-01-05T12:30:00.000Z"}

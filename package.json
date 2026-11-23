@@ -1,0 +1,68 @@
+{
+  "name": "agent-lens",
+  "displayName": "Agent Lens",
+  "description": "Observe local coding agent activity in VS Code.",
+  "version": "0.1.0",
+  "publisher": "salehshakib",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/salehshakib/agent-lens.git"
+  },
+  "engines": {
+    "vscode": "^1.147.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "main": "./dist/host/extension.js",
+  "activationEvents": ["onStartupFinished"],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentLens.activity",
+          "title": "Agent Lens",
+          "icon": "media/activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentLens.activity": [
+        {
+          "id": "agentLens.sessions",
+          "name": "Sources",
+          "type": "webview"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Lens",
+      "properties": {
+        "agentLens.agents": {
+          "type": "object",
+          "scope": "machine",
+          "default": {},
+          "markdownDescription": "Local source settings keyed by `claude-code` or `codex`. Each can set `enabled`, an observation-only `logRoot`, and additional `profiles` with `id`, `label`, and `home`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --outDir dist/test && node --test \"dist/test/test/*.test.js\"",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.146.0",
+    "@vscode/vsce": "4.1.1",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3"
+  }
+}
