@@ -4,10 +4,12 @@ import type { Gauge } from '../limits/model';
 import { safeText } from '../privacy/projection';
 import { mergeTimeline } from '../sessions/items';
 import type { BackgroundTask, FileAction, Lane, Session, State, TimelineRow, TokenCounts } from '../sessions/types';
+import { breadcrumb, laneContext, laneSignals, parentInfo, sessionSignals, signalView, warningLabels } from './signal-models';
+import type { LaneContext, Names, Thresholds } from './signal-models';
 import type { UsageTotal } from '../usage/ledger';
 import type {
-  AgentNode, AgentRow, DayBar, FileGroup, FilterOption, Filters, GaugeView, GroupNode, ModelRow, ProjectNode,
-  RowView, SessionDetail, SessionRow, StatusTone, TaskView, TokenRow, ToolView, UsageFilters, UsageModel, UsageView,
+  AgentNode, AgentRow, DayBar, FileGroup, FilterOption, Filters, GaugeView, GroupNode, ModelRow, ParentInfo, ProjectNode,
+  RowView, SessionDetail, SessionRow, SignalView, StatusTone, TaskView, TokenRow, ToolView, UsageFilters, UsageModel, UsageView,
 } from '../../shared/protocol';
 
 export const providerLabels: Record<Provider, string> = { 'claude-code': 'Claude Code', codex: 'Codex' };
@@ -63,6 +65,9 @@ export interface TreeOptions {
   /** Loaded Earlier rows per project id. */
   earlierLimits: ReadonlyMap<string, number>;
   pageSize?: number;
+  /** Fresh Claude status-line context percentages by session id. */
+  relayContexts?: ReadonlyMap<string, number>;
+  thresholds?: Thresholds;
 }
 
 function matchesSearch(session: Session, search: string, privateMode: boolean): boolean {
@@ -86,19 +91,36 @@ function agentRows(session: Session): AgentRow[] {
   }));
 }
 
-function sessionRow(session: Session, privateMode: boolean, children: SessionRow[], project?: string): SessionRow {
+export function namesFor(privateMode: boolean): Names {
+  return { session: session => title(session, privateMode), project: projectLabel };
+}
+
+function sessionWarnings(session: Session, options: Pick<TreeOptions, 'relayContexts' | 'thresholds' | 'privateMode'>): SignalView[] {
+  const main = session.lanes[0];
+  const context = main ? laneContext(session, main, options.relayContexts?.get(session.id), options.thresholds) : { approximate: false };
+  return warningLabels(sessionSignals(session, context, options.privateMode));
+}
+
+function sessionRow(session: Session, privateMode: boolean, children: SessionRow[], warnings: SignalView[],
+  byId: ReadonlyMap<string, Session>, project?: string): SessionRow {
+  const main = session.lanes[0];
+  const parent = main ? parentInfo(session, main, byId, namesFor(privateMode)) : { state: 'root' as const, targets: [] };
   return {
     id: session.id, provider: providerLabels[session.provider], title: title(session, privateMode), status: session.status,
-    tone: toneFor(session.status), updatedAt: session.updatedAt, project, agents: agentRows(session), children,
+    tone: toneFor(session.status), updatedAt: session.updatedAt, project, agents: agentRows(session), children, warnings,
+    parent: { state: parent.state, reason: parent.reason },
   };
 }
 
 /** Build the project tree: project, then Live, Today and Earlier, with children nested under their parent. */
 export function buildTree(sessions: readonly Session[], options: TreeOptions): { tree: ProjectNode[]; total: number } {
   const { filters } = options;
+  const allById = new Map(sessions.map(session => [session.id, session]));
+  const warned = new Map(sessions.map(session => [session.id, sessionWarnings(session, options)]));
   const visible = sessions.filter(session =>
     (!filters.adapter || session.provider === filters.adapter) &&
     (!filters.project || projectId(session) === filters.project) &&
+    (!filters.warnings || (warned.get(session.id)?.length ?? 0) > 0) &&
     matchesSearch(session, filters.search.trim(), options.privateMode));
   const byId = new Map(visible.map(session => [session.id, session]));
   const childrenOf = new Map<string, Session[]>();
@@ -121,7 +143,8 @@ export function buildTree(sessions: readonly Session[], options: TreeOptions): {
   function build(session: Session, depth: number, parentProject: string): SessionRow {
     const own = projectId(session);
     const kids = depth >= maxDepth ? [] : (childrenOf.get(session.id) ?? []).sort(rank).map(child => build(child, depth + 1, own));
-    return sessionRow(session, options.privateMode, kids, own === parentProject || !parentProject ? undefined : projectLabel(session));
+    return sessionRow(session, options.privateMode, kids, warned.get(session.id) ?? [], allById,
+      own === parentProject || !parentProject ? undefined : projectLabel(session));
   }
   const today = localDay(options.now, options.timeZone);
   const projects = new Map<string, { label: string; live: SessionRow[]; today: SessionRow[]; earlier: SessionRow[] }>();
@@ -172,7 +195,7 @@ function rowView(row: TimelineRow, lanes: ReadonlyMap<string, Lane>, privateMode
   const text = privateMode ? { truncated: false } : clip(row.text);
   const output = privateMode ? { truncated: false } : clip(row.output);
   return {
-    id: row.id, laneId: row.laneId, lane: lanes.get(row.laneId)?.title ?? 'Agent', at: row.at, kind: row.kind,
+    id: row.id, laneId: row.laneId, turnId: row.turnId, lane: lanes.get(row.laneId)?.title ?? 'Agent', at: row.at, kind: row.kind,
     label: safeText(row.label, 80) ?? 'Event', text: text.text, textTruncated: text.truncated || undefined,
     output: output.text, outputTruncated: output.truncated || undefined, status: row.status,
     command: privateMode ? undefined : safeText(row.command, 2000), exitCode: row.exitCode,
@@ -211,7 +234,8 @@ function laneTools(session: Session, lane: Lane, privateMode: boolean): ToolView
 }
 
 function agentNode(session: Session, lane: Lane, opts: { now: number; privateMode: boolean; kind: AgentNode['kind'];
-  id: string; parent?: string; parentTitle?: string; contextPercent?: number; contextApproximate?: boolean; note?: string }): AgentNode {
+  id: string; parent?: string; parentTitle?: string; contextPercent?: number; contextApproximate?: boolean; note?: string;
+  level: LaneContext; parentInfo: ParentInfo }): AgentNode {
   const tokens = laneTokens(lane.usage);
   const status = lane.pending ? 'Pending' : lane.status;
   const context = lane.context;
@@ -222,6 +246,7 @@ function agentNode(session: Session, lane: Lane, opts: { now: number; privateMod
     tokenLabel: tokens === undefined ? 'tokens unavailable'
       : 'tokens used' + (lane.usageScope ? ' (' + scopeText[lane.usageScope] + ')' : ''),
     contextPercent: opts.contextPercent ?? context?.percent, contextApproximate: opts.contextPercent === undefined ? context?.approximate : false,
+    contextLevel: opts.level.level, signals: laneSignals(lane, opts.level, opts.privateMode), parentInfo: opts.parentInfo,
     parentTitle: opts.parentTitle, transcript: lane.transcriptAvailable === true, sessionId: session.id,
     tools: laneTools(session, lane, opts.privateMode), note: opts.note ?? lane.parentReason,
   };
@@ -232,6 +257,7 @@ export interface DetailOptions {
   privateMode: boolean;
   /** Relay context fill for the Claude main session, when fresh. */
   relayContext?: number;
+  thresholds?: Thresholds;
 }
 
 function countsRow(label: string, counts: TokenCounts | undefined): TokenRow {
@@ -302,32 +328,74 @@ function contextText(session: Session, relay: number | undefined): { percent?: n
   return { text: 'Context unavailable' };
 }
 
+/** Mark repeated-call rows and insert the end-of-turn marker rows. Both come from the reduced signals, never from text. */
+function decorateRows(session: Session, rows: RowView[], privateMode: boolean): RowView[] {
+  const labels = new Map(rows.map(row => [row.id, row.label]));
+  const byId = new Map(rows.map(row => [row.id, row]));
+  for (const signal of session.signals) {
+    if (signal.kind !== 'loop') continue;
+    const view = signalView(signal, privateMode);
+    const first = signal.rowIds[0];
+    if (!view || !first) continue;
+    for (const id of signal.rowIds) {
+      const row = byId.get(id);
+      if (row) {
+        row.loop = { id: signal.id, tool: labels.get(first) ?? 'Tool', count: signal.count ?? signal.rowIds.length, live: signal.state === 'live' };
+        row.signals = [view];
+      }
+    }
+  }
+  const out = [...rows];
+  for (const signal of session.signals) {
+    if (signal.kind !== 'check') continue;
+    const view = signalView(signal, privateMode);
+    let index = -1;
+    for (let at = out.length - 1; at >= 0; at--) {
+      if (out[at]!.laneId === signal.laneId && out[at]!.turnId === signal.turnId && out[at]!.kind !== 'signal') { index = at; break; }
+    }
+    if (!view || index < 0) continue;
+    const anchor = out[index]!;
+    out.splice(index + 1, 0, {
+      id: signal.id, laneId: signal.laneId, turnId: signal.turnId, lane: anchor.lane, at: anchor.at, kind: 'signal',
+      label: view.label, text: view.detail, signals: [view],
+      links: { edit: signal.edit, check: signal.check },
+    });
+  }
+  return out;
+}
+
 export function buildDetail(session: Session, sessions: readonly Session[], options: DetailOptions): SessionDetail {
   const { now, privateMode } = options;
   const lanes = new Map(session.lanes.map(lane => [lane.id, lane]));
   const merged = mergeTimeline(session.lanes);
-  const rows = merged.slice(-maxRows).map(row => rowView(row, lanes, privateMode));
+  const rows = decorateRows(session, merged.slice(-maxRows).map(row => rowView(row, lanes, privateMode)), privateMode);
   const main = session.lanes[0];
   const byId = new Map(sessions.map(item => [item.id, item]));
+  const names = namesFor(privateMode);
+  const levelOf = (owner: Session, lane: Lane) => laneContext(owner, lane, lane === owner.lanes[0] ? options.relayContext : undefined, options.thresholds);
   const agents: AgentNode[] = [];
   if (main) {
     agents.push(agentNode(session, main, { now, privateMode, kind: 'main', id: main.id,
-      contextPercent: options.relayContext }));
+      contextPercent: options.relayContext, level: levelOf(session, main), parentInfo: parentInfo(session, main, byId, names) }));
   }
   for (const lane of session.lanes.slice(1)) {
     const parent = lane.parent && lanes.has(lane.parent.laneId) ? lane.parent.laneId : main?.id;
     const unresolved = !lane.parent;
     agents.push(agentNode(session, lane, { now, privateMode, kind: 'agent', id: lane.id, parent,
       parentTitle: parent ? lanes.get(parent)?.title : undefined,
-      note: unresolved ? (lane.parentReason ?? 'Parent not resolved yet') : undefined }));
+      note: unresolved ? (lane.parentReason ?? 'Parent not resolved yet') : undefined,
+      level: levelOf(session, lane), parentInfo: parentInfo(session, lane, byId, names) }));
   }
   for (const edge of session.children) {
     const child = byId.get(edge.sessionId);
     const childMain = child?.lanes[0];
     if (!child || !childMain || agents.some(agent => agent.id === child.id)) continue;
     agents.push(agentNode(child, childMain, { now, privateMode, kind: 'codex-run', id: child.id,
-      parent: lanes.has(edge.laneId) ? edge.laneId : main?.id, parentTitle: lanes.get(edge.laneId)?.title ?? main?.title }));
+      parent: lanes.has(edge.laneId) ? edge.laneId : main?.id, parentTitle: lanes.get(edge.laneId)?.title ?? main?.title,
+      level: levelOf(child, childMain), parentInfo: parentInfo(child, childMain, byId, names) }));
   }
+  const level = main ? levelOf(session, main) : { approximate: false };
+  const summary = sessionSignals(session, level, privateMode);
   const context = contextText(session, options.relayContext);
   const total = laneTokens(session.usage);
   const agentCount = session.lanes.length + session.children.length;
@@ -336,7 +404,10 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     project: projectLabel(session), branch: safeText(session.branch, 80), status: session.status, tone: toneFor(session.status),
     model: session.model, effort: session.effort,
     elapsedMs: main ? elapsed(main, now) : undefined, agentCount,
-    contextPercent: context.percent, contextApproximate: context.approximate, contextText: context.text,
+    contextPercent: context.percent, contextApproximate: context.approximate, contextText: context.text, contextLevel: level.level,
+    signals: { liveLoops: summary.liveLoops, outcome: summary.outcome, context: summary.context },
+    parent: main ? parentInfo(session, main, byId, names) : { state: 'root', targets: [] },
+    breadcrumb: breadcrumb(session, byId, names),
     usageText: total === undefined ? 'Usage unavailable' : total + ' tokens' + (session.usagePartial ? ' (partial)' : ''),
     rows, rowsOmitted: Math.max(0, merged.length - rows.length), agents,
     files: fileGroups(session.files, lanes, privateMode), usage: usageView(session),

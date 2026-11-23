@@ -43,6 +43,13 @@ export type ParentTarget = {
   relation: "agent" | "child" | "launch";
 };
 
+/** A pointer at one timeline row, possibly in another session of the same delegation tree. */
+export type RowRef = {
+  sessionId: string;
+  laneId: string;
+  rowId: string;
+};
+
 export type Signal = {
   id: string;
   laneId: string;
@@ -54,6 +61,11 @@ export type Signal = {
   detail?: string;
   count?: number;
   level?: ContextLevel;
+  /** Done without checks outcome. */
+  outcome?: "no-checks" | "check-failed" | "check-unknown";
+  /** Last confirmed edit and last check of a turn tree, for the end-of-turn marker links. */
+  edit?: RowRef;
+  check?: RowRef;
 };
 
 export type FileAction = {

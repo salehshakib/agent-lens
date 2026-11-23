@@ -14,6 +14,8 @@ import { resolveProject } from './project';
 import type { ProjectIdentity } from './project';
 import { reduceSession } from './reduce';
 import type { ReducedSession } from './reduce';
+import { defaultSignalSettings, evaluateChecks } from './signals';
+import type { SignalSettings } from './signals';
 import type { FileAction, Session } from './types';
 
 type ObservedBatch = SourceBatch & { readerEpoch: number };
@@ -110,7 +112,16 @@ export class SessionStore {
   private historyRequest = 0;
   private nextAgingCheck = 0;
 
+  private settings: SignalSettings = defaultSignalSettings;
+
   constructor(private readonly taskRoot?: string, private readonly now: () => number = Date.now) {}
+
+  /** Apply new signal settings. Every session is reduced again, since loops, checks and levels depend on them. */
+  setSignalSettings(settings: SignalSettings): void {
+    this.settings = settings;
+    this.evidenceChanged = true;
+    this.revision++;
+  }
 
   setCatalog(key: string, adapter: Adapter, sources: ReadonlyMap<string, Source>): void {
     this.roots.set(key, { adapter, sources: new Map(sources) });
@@ -364,7 +375,8 @@ export class SessionStore {
           }
         }
       }
-      const model = reduceSession(evidence, this.now(), cwd => this.projects.get(cwd), titles.get(id)?.title, presence.get(id));
+      const model = reduceSession(evidence, this.now(), cwd => this.projects.get(cwd), titles.get(id)?.title, presence.get(id),
+        this.settings);
       if (!model) continue;
       if (evidence.some(entry => this.observed.has(entry.source.key))) {
         this.models.set(id, model);
@@ -378,8 +390,8 @@ export class SessionStore {
     const retained = [...this.models.values()];
     const now = this.now();
     const copies = retained.map(model => {
-      const session = { ...model.session, parents: [], children: [],
-        lanes: model.session.lanes.map(lane => ({ ...lane })) } as Session;
+      const session = { ...model.session, parents: [], children: [], signals: [...model.session.signals],
+        lanes: model.session.lanes.map(lane => ({ ...lane, signals: [...lane.signals] })) } as Session;
       return { ...model, session, codex: model.codex && { ...model.codex, session } };
     });
     const ancestry = copies.flatMap(model => model.codex ? [model.codex] : []);
@@ -421,7 +433,16 @@ export class SessionStore {
       return this.refresh();
     }
     for (const id of removals) this.ledger.remove(id);
-    for (const model of copies) this.ledger.replace(model.session, model.tools);
+    const outcomes = evaluateChecks(copies.map(model => ({ session: model.session, evidence: model.evidence })));
+    for (const model of copies) {
+      const checks = outcomes.signals.get(model.session.id) ?? [];
+      const main = model.session.lanes[0];
+      if (checks.length && main) {
+        main.signals = [...main.signals, ...checks];
+        model.session.signals = [...model.session.signals, ...checks];
+      }
+      this.ledger.replace(model.session, model.tools, [...model.ledgerSignals, ...(outcomes.ledger.get(model.session.id) ?? [])]);
+    }
     this.sessionCache = sessionCache.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.id.localeCompare(b.id));
     this.cleanRevision = revision;
     return this.sessionCache;
@@ -458,6 +479,15 @@ export class SessionStore {
       (child.launches ??= []).push(link);
       child.parents.push(link.parent);
       parent.children.push({ ...link.parent, sessionId: child.id, laneId: link.laneId, turnId: link.turnId });
+    }
+    // A resumed Codex thread keeps every launch edge, newest first. The newest one is the lane's resolved parent.
+    for (const model of models) {
+      const { session } = model;
+      if (!session.launches || session.launches.length < 1) continue;
+      session.launches.sort((a, b) => (b.parent.at ?? -Infinity) - (a.parent.at ?? -Infinity));
+      session.parents = session.launches.map(link => link.parent);
+      const main = session.lanes[0];
+      if (main) main.parent = session.launches[0]!.parent;
     }
   }
 }

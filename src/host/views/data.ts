@@ -1,17 +1,21 @@
 import type { Provider } from '../adapters/types';
+import { safeText } from '../privacy/projection';
 import { relayContext } from '../limits/claude-relay';
 import type { RelaySnapshot } from '../limits/claude-relay';
 import { buildGauges } from '../limits/model';
 import type { Gauge, LimitSample } from '../limits/model';
 import type { RefreshGate } from '../limits/refresh';
 import type { Session } from '../sessions/types';
+import type { Thresholds } from './signal-models';
 import type { UsageTotal } from '../usage/ledger';
 import type {
-  Filters, GaugeView, PanelModel, RelayView, SidebarModel, SourceView, UsageFilters, UsageModel,
+  Filters, GaugeView, PanelModel, ParentInfo, RelayView, SidebarModel, SourceView, UsageFilters, UsageModel,
 } from '../../shared/protocol';
 import {
-  buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, providerLabels,
+  buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, namesFor, providerLabels,
 } from './models';
+import { laneContext, parentInfo } from './signal-models';
+import type { ContextCandidate } from './alerts';
 
 export interface ProfileInfo {
   provider: Provider;
@@ -32,6 +36,8 @@ export interface LensDeps {
   relayViews(): RelayView[];
   sources(): SourceView[];
   refresh(): RefreshGate;
+  /** Context level thresholds from settings. The defaults apply when absent. */
+  thresholds?(): Thresholds;
 }
 
 /** Builds every view model from host state. It holds only paging state, never provider data. */
@@ -65,11 +71,28 @@ export class LensData {
     return sessions.filter(session => session.status === 'Live').length;
   }
 
+  /** Fresh status-line context samples for Claude sessions, by session id. */
+  private relayContexts(sessions: readonly Session[]): Map<string, { percent: number; at: number }> {
+    const found = new Map<string, { percent: number; at: number }>();
+    const snapshots = new Map<string, RelaySnapshot[]>();
+    const profiles = new Map(this.deps.profiles().filter(profile => profile.provider === 'claude-code').map(profile => [profile.id, profile]));
+    for (const session of sessions) {
+      if (session.provider !== 'claude-code' || !session.profile || !profiles.has(session.profile)) continue;
+      let cached = snapshots.get(session.profile);
+      if (!cached) snapshots.set(session.profile, cached = this.deps.relay(session.profile).snapshots);
+      const context = relayContext(cached, session.nativeId, this.deps.now());
+      if (context?.percent !== undefined) found.set(session.id, { percent: context.percent, at: context.at });
+    }
+    return found;
+  }
+
   async sidebar(filters: Filters): Promise<SidebarModel> {
     const sessions = await this.deps.sessions();
     const privateMode = this.deps.privateMode();
     const { tree, total } = buildTree(sessions, {
       now: this.deps.now(), timeZone: this.deps.timeZone, privateMode, filters, earlierLimits: this.earlierLimits,
+      relayContexts: new Map([...this.relayContexts(sessions)].map(([id, sample]) => [id, sample.percent])),
+      thresholds: this.deps.thresholds?.(),
     });
     const { adapters, projects } = filterOptions(sessions);
     return {
@@ -89,7 +112,37 @@ export class LensData {
     const context = session.provider === 'claude-code' ? relayContext(snapshots, session.nativeId, this.deps.now()) : undefined;
     return { mode: 'session', session: buildDetail(session, sessions, {
       now: this.deps.now(), privateMode: this.deps.privateMode(), relayContext: context?.percent,
+      thresholds: this.deps.thresholds?.(),
     }) };
+  }
+
+  /** Every lane that currently has a High or Critical context level, for the optional alerts. */
+  async contextCandidates(): Promise<ContextCandidate[]> {
+    const sessions = await this.deps.sessions();
+    const relays = this.relayContexts(sessions);
+    const names = namesFor(this.deps.privateMode());
+    const found: ContextCandidate[] = [];
+    for (const session of sessions) {
+      for (const lane of session.lanes) {
+        const relay = lane === session.lanes[0] ? relays.get(session.id) : undefined;
+        const context = laneContext(session, lane, relay?.percent, this.deps.thresholds?.());
+        if (!context.level) continue;
+        found.push({ sessionId: session.id, laneId: lane.id,
+          title: names.session(session) + (lane === session.lanes[0] || this.deps.privateMode() ? '' : ', ' + (safeText(lane.title, 60) ?? 'agent')),
+          level: context.level, percent: context.percent, approximate: context.approximate,
+          at: relay?.at ?? lane.context?.at, epoch: lane.rows.filter(row => row.kind === 'compact').length });
+      }
+    }
+    return found;
+  }
+
+  /** Parent targets of a lane, newest first. An empty lane id means the session's main lane. */
+  async parent(sessionId: string, laneId: string): Promise<ParentInfo> {
+    const sessions = await this.deps.sessions();
+    const session = sessions.find(item => item.id === sessionId);
+    const lane = session && (laneId ? session.lanes.find(item => item.id === laneId) : session.lanes[0]);
+    if (!session || !lane) return { state: 'unresolved', reason: 'This session is no longer available.', targets: [] };
+    return parentInfo(session, lane, new Map(sessions.map(item => [item.id, item])), namesFor(this.deps.privateMode()));
   }
 
   async tasks(): Promise<PanelModel> {

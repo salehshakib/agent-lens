@@ -6,7 +6,7 @@ import type { LensData } from './data';
 import { render, resourceRoots } from './html';
 
 export type PanelTarget =
-  | { kind: 'session'; id: string; tab: PanelTab }
+  | { kind: 'session'; id: string; tab: PanelTab; focus?: { lane: string; row: string } }
   | { kind: 'usage' }
   | { kind: 'tasks' };
 
@@ -16,6 +16,9 @@ export interface PanelActions {
   openFile(id: string): void;
   openDiff(id: string): void;
   openTranscript(session: string, lane: string): void;
+  /** Resolve and open the parent of a lane. A menu appears when a resumed thread has several launches. */
+  openParent(session: string, lane: string): void;
+  openSettings(): void;
   relay(command: RelayCommand, profile: string): void;
   visibility(visible: boolean): void;
 }
@@ -29,6 +32,7 @@ export class PanelView {
   private ready = false;
   private target?: PanelTarget;
   private pendingTab?: PanelTab;
+  private pendingFocus?: { lane: string; row: string };
   private usageFilters = defaultUsage;
   private sequence = 0;
   private timer?: NodeJS.Timeout;
@@ -38,6 +42,7 @@ export class PanelView {
   show(target: PanelTarget): void {
     this.target = target;
     this.pendingTab = target.kind === 'session' ? target.tab : undefined;
+    this.pendingFocus = target.kind === 'session' ? target.focus : undefined;
     if (this.panel) {
       this.panel.title = this.title();
       this.panel.reveal(this.panel.viewColumn ?? ViewColumn.Active, false);
@@ -97,12 +102,23 @@ export class PanelView {
       case 'openDiff': this.actions.openDiff(request.id); break;
       case 'openTranscript': this.actions.openTranscript(request.session, request.lane); break;
       case 'openSession': this.show({ kind: 'session', id: request.id, tab: 'timeline' }); break;
+      case 'goto':
+        this.show({ kind: 'session', id: request.session, tab: 'timeline',
+          ...(request.lane || request.row ? { focus: { lane: request.lane, row: request.row } } : {}) });
+        break;
+      case 'openParent': this.actions.openParent(request.session, request.lane); break;
+      case 'openSettings': this.actions.openSettings(); break;
       case 'usageFilters':
         this.usageFilters = request.filters;
         this.refresh();
         break;
       case 'relay': this.actions.relay(request.command, request.profile); break;
     }
+  }
+
+  /** The session the panel currently shows, for the Open parent command. */
+  currentSession(): string | undefined {
+    return this.panel && this.target?.kind === 'session' ? this.target.id : undefined;
   }
 
   /** Throttled refresh for store changes. */
@@ -131,8 +147,10 @@ export class PanelView {
     const sequence = ++this.sequence;
     void this.model(target).then(model => {
       if (sequence !== this.sequence || this.panel !== panel) return;
-      const message: HostMessage = { type: 'panel', model, ...(this.pendingTab ? { tab: this.pendingTab } : {}) };
+      const message: HostMessage = { type: 'panel', model, ...(this.pendingTab ? { tab: this.pendingTab } : {}),
+        ...(this.pendingFocus ? { focus: this.pendingFocus } : {}) };
       this.pendingTab = undefined;
+      this.pendingFocus = undefined;
       return panel.webview.postMessage(message);
     }).catch(() => undefined);
   }

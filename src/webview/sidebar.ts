@@ -1,7 +1,7 @@
 import { isHostMessage } from '../shared/protocol';
 import type { Filters, GroupNode, ProjectNode, SessionRow, SidebarModel } from '../shared/protocol';
 import { formatAge, formatReset } from '../shared/format';
-import { announce, api, badge, button, el, gaugeBlock, navigate, preserve } from './dom';
+import { announce, api, badge, button, el, gaugeBlock, navigate, preserve, signalBadge } from './dom';
 import { relayCard } from './relay';
 
 interface Saved {
@@ -10,7 +10,7 @@ interface Saved {
   selected?: string;
 }
 
-const empty: Filters = { search: '', adapter: '', project: '' };
+const empty: Filters = { search: '', adapter: '', project: '', warnings: false };
 
 function load(): Saved {
   const value = api.getState();
@@ -20,7 +20,8 @@ function load(): Saved {
   const valid = typeof filters === 'object' && filters !== null && typeof filters.search === 'string'
     && typeof filters.adapter === 'string' && typeof filters.project === 'string';
   return {
-    filters: valid ? { search: filters.search.slice(0, 200), adapter: filters.adapter.slice(0, 40), project: filters.project.slice(0, 64) } : empty,
+    filters: valid ? { search: filters.search.slice(0, 200), adapter: filters.adapter.slice(0, 40), project: filters.project.slice(0, 64),
+      warnings: filters.warnings === true } : empty,
     collapsed: Array.isArray(saved.collapsed) ? saved.collapsed.filter((item): item is string => typeof item === 'string').slice(0, 200) : [],
     selected: typeof saved.selected === 'string' ? saved.selected : undefined,
   };
@@ -46,12 +47,14 @@ const relays = el('section', { cls: 'relays', attrs: { 'aria-label': 'Claude lim
 const search = el('input', { attrs: { type: 'search', placeholder: 'Search sessions', 'aria-label': 'Search sessions', maxlength: 200, value: filters.search } });
 const adapter = el('select', { attrs: { 'aria-label': 'Filter by agent' } });
 const project = el('select', { attrs: { 'aria-label': 'Filter by project' } });
+const warnings = el('input', { attrs: { type: 'checkbox', id: 'has-warnings' } });
+warnings.checked = filters.warnings;
 const tree = el('div', { cls: 'tree', attrs: { role: 'group', 'aria-label': 'Sessions by project' } });
 const sources = el('details', { cls: 'sources' });
 const privacy = el('p', { cls: 'privacy', attrs: { hidden: true }, text: 'Private display mode is on. Prompts, commands, output and diffs are hidden.' });
 
 function sendFilters(): void {
-  filters = { search: search.value, adapter: adapter.value, project: project.value };
+  filters = { search: search.value, adapter: adapter.value, project: project.value, warnings: warnings.checked };
   persist();
   api.postMessage({ type: 'filter', filters });
 }
@@ -62,11 +65,14 @@ search.addEventListener('input', () => {
 });
 adapter.addEventListener('change', sendFilters);
 project.addEventListener('change', sendFilters);
+warnings.addEventListener('change', sendFilters);
 tree.addEventListener('keydown', event => navigate(tree, event));
 
 root.append(
   summary, privacy, quotas, relays,
-  el('div', { cls: 'filters' }, search, el('div', { cls: 'filter-row' }, adapter, project)),
+  el('div', { cls: 'filters' }, search, el('div', { cls: 'filter-row' }, adapter, project),
+    el('label', { cls: 'check', attrs: { for: 'has-warnings', title: 'Sessions with a live loop, a turn that finished without checks, or high context. Settings: Agent Lens Signals.' } },
+      warnings, el('span', { text: 'Has warnings' }))),
   tree, sources,
 );
 
@@ -92,15 +98,23 @@ function row(item: SessionRow, depth: number, now: number): HTMLElement {
   el('span', { cls: 'row-title', text: item.title }),
   badge(item.status, item.tone),
   el('span', { cls: 'row-meta', text: meta }),
+  item.warnings.length ? el('span', { cls: 'row-signals', attrs: { role: 'group', 'aria-label': 'Warnings' } },
+    ...item.warnings.map(signalBadge)) : undefined,
   );
   const agents = item.agents.length ? el('ul', { cls: 'agents', attrs: { 'aria-label': 'Agents in this session' } },
     ...item.agents.map(agent => el('li', {}, el('span', { text: agent.title }), badge(agent.status, agent.tone)))) : undefined;
   const map = item.agents.length ? button('Agent map', () => api.postMessage({ type: 'openMap', id: item.id }), {
     cls: 'link', attrs: { 'data-nav': true, 'aria-label': 'Open agent map for ' + item.title },
   }) : undefined;
+  const parent = item.parent.state === 'root' ? undefined : button('Open parent', () => api.postMessage({ type: 'openParent', id: item.id }), {
+    cls: 'link', attrs: { 'data-nav': item.parent.state === 'resolved', disabled: item.parent.state === 'unresolved',
+      'aria-label': 'Open parent of ' + item.title + (item.parent.reason ? '. Unavailable: ' + item.parent.reason : ''),
+      title: item.parent.reason },
+  });
+  const reason = item.parent.state === 'unresolved' ? el('small', { cls: 'reason', text: 'Parent unavailable: ' + (item.parent.reason ?? 'not resolved yet') }) : undefined;
   const children = item.children.length ? el('ul', { cls: 'rows', attrs: { 'aria-label': 'Child sessions' } },
     ...item.children.map(child => row(child, depth + 1, now))) : undefined;
-  return el('li', { cls: 'row', attrs: { 'data-depth': depth } }, main, agents, map, children);
+  return el('li', { cls: 'row', attrs: { 'data-depth': depth } }, main, agents, map, parent, reason, children);
 }
 
 function group(item: GroupNode, projectId: string, now: number): HTMLElement {
@@ -140,7 +154,7 @@ function render(next: SidebarModel): void {
     if (document.activeElement !== adapter) setOptions(adapter, 'All agents', next.adapters, filters.adapter);
     if (document.activeElement !== project) setOptions(project, 'All projects', next.projects, filters.project);
     if (!next.tree.length) {
-      tree.replaceChildren(el('p', { cls: 'empty', text: next.total === 0 && (filters.search || filters.adapter || filters.project)
+      tree.replaceChildren(el('p', { cls: 'empty', text: next.total === 0 && (filters.search || filters.adapter || filters.project || filters.warnings)
         ? 'No sessions match these filters.' : 'No sessions found yet. Sessions appear here when Claude Code or Codex records activity on this computer.' }));
     } else {
       tree.replaceChildren(...next.tree.map(item => projectNode(item, now)));
@@ -164,4 +178,4 @@ window.addEventListener('message', event => {
 });
 
 api.postMessage({ type: 'ready' });
-if (filters.search || filters.adapter || filters.project) api.postMessage({ type: 'filter', filters });
+if (filters.search || filters.adapter || filters.project || filters.warnings) api.postMessage({ type: 'filter', filters });

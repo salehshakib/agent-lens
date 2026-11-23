@@ -53,3 +53,6 @@ details.project > summary {
 .source small { flex-basis: 100%; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
 details.sources { margin-top: 12px; }
 details.sources > summary { cursor: pointer; font-weight: 600; }
+
+.row-signals { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.row > small.reason { display: block; margin-left: 18px; font-size: 0.85em; }

@@ -11,7 +11,10 @@ import { RelayManager } from './host/limits/manager';
 import type { RelayProfile } from './host/limits/manager';
 import { refreshGate } from './host/limits/refresh';
 import { claudeTaskRoot } from './host/sessions/delegation';
+import { defaultSignalSettings, parseSignalSettings } from './host/sessions/signals';
+import type { SignalSettings } from './host/sessions/signals';
 import { SessionStore } from './host/sessions/store';
+import { alertText, ContextAlerts } from './host/views/alerts';
 import { LensData } from './host/views/data';
 import type { ProfileInfo } from './host/views/data';
 import { PanelView } from './host/views/panel';
@@ -27,6 +30,29 @@ export function activate(context: ExtensionContext): SessionStore {
   let modelUpdate: NodeJS.Timeout | undefined;
   const taskRoot = claudeTaskRoot(process.env.LOCALAPPDATA);
   const store = new SessionStore(taskRoot);
+  let signalSettings: SignalSettings = defaultSignalSettings;
+  let alertsEnabled = false;
+  const alerts = new ContextAlerts(Date.now());
+
+  /** Signal settings are machine scoped. Workspace and repository values are never read. */
+  function configured(name: string): unknown {
+    const inspected = workspace.getConfiguration('agentLens').inspect<unknown>(name);
+    return inspected?.globalValue ?? inspected?.defaultValue;
+  }
+
+  function readSignalSettings(): void {
+    signalSettings = parseSignalSettings({
+      loopThreshold: configured('signals.loopThreshold'), checkIgnore: configured('signals.checkIgnore'),
+      checkCommands: configured('signals.checkCommands'), warnPercent: configured('context.warnPercent'),
+      criticalPercent: configured('context.criticalPercent'),
+    });
+    store.setSignalSettings(signalSettings);
+    const enabled = configured('context.alerts') === true;
+    // Switching alerts on starts from now, so earlier samples stay historical.
+    if (enabled && !alertsEnabled) alerts.reset(Date.now());
+    alertsEnabled = enabled;
+  }
+  readSignalSettings();
 
   function privateMode(): boolean {
     return workspace.getConfiguration('agentLens').get<boolean>('privateDisplay', false) === true;
@@ -78,6 +104,7 @@ export function activate(context: ExtensionContext): SessionStore {
     relayViews: () => relay.views(),
     sources,
     refresh: () => refreshGate(),
+    thresholds: () => ({ warnPercent: signalSettings.warnPercent, criticalPercent: signalSettings.criticalPercent }),
   });
   const status = new StatusView('agentLens.openUsage');
 
@@ -105,6 +132,8 @@ export function activate(context: ExtensionContext): SessionStore {
       }
       void commands.executeCommand('vscode.open', Uri.file(source.path));
     },
+    openParent: (session, lane) => void openParent(session, lane),
+    openSettings: () => void commands.executeCommand('workbench.action.openSettings', '@ext:salehshakib.agent-lens'),
     relay: (command, profile) => void relay.command(command, profile),
     visibility: visible => {
       panelVisible = visible;
@@ -117,14 +146,48 @@ export function activate(context: ExtensionContext): SessionStore {
       visibility();
     },
     openSession: (id, mode) => panel.show({ kind: 'session', id, tab: mode === 'map' ? 'map' : 'timeline' }),
+    openParent: id => void openParent(id, ''),
     openUsage: () => panel.show({ kind: 'usage' }),
     openTasks: () => panel.show({ kind: 'tasks' }),
     relay: (command, profile) => void relay.command(command, profile),
   });
 
+  /** Open the parent row of a lane. Several launches of a resumed Codex thread open a small menu, newest first. */
+  async function openParent(sessionId: string, laneId: string): Promise<void> {
+    const info = await data.parent(sessionId, laneId);
+    if (info.state === 'root') {
+      void window.showInformationMessage('This session has no parent.');
+      return;
+    }
+    if (info.state === 'unresolved') {
+      void window.showInformationMessage('The parent is not available. ' + (info.reason ?? 'It could not be resolved.'));
+      return;
+    }
+    let picked = info.targets[0];
+    if (info.targets.length > 1) {
+      const choice = await window.showQuickPick(info.targets.map(target => ({
+        label: target.label, description: target.at === undefined ? 'time unknown' : new Date(target.at).toLocaleString(), target,
+      })), { placeHolder: 'This thread was launched more than once. Choose the launch to open.' });
+      picked = choice?.target;
+    }
+    if (picked) panel.show({ kind: 'session', id: picked.sessionId, tab: 'timeline', focus: { lane: picked.laneId, row: picked.rowId } });
+  }
+
+  function showAlerts(): void {
+    if (!alertsEnabled) return;
+    void data.contextCandidates().then(candidates => {
+      for (const alert of alerts.next(candidates)) {
+        void window.showWarningMessage(alertText(alert), 'Open Agent map').then(choice => {
+          if (choice) panel.show({ kind: 'session', id: alert.sessionId, tab: 'map' });
+        });
+      }
+    }).catch(() => undefined);
+  }
+
   function refreshViews(): void {
     sidebar.update();
     panel.update();
+    showAlerts();
     void store.sessions().then(sessions => status.update(data.liveCount(sessions), data.gauges().main)).catch(() => undefined);
   }
 
@@ -183,6 +246,13 @@ export function activate(context: ExtensionContext): SessionStore {
     window.registerWebviewViewProvider(SidebarView.viewType, sidebar),
     commands.registerCommand('agentLens.openUsage', () => panel.show({ kind: 'usage' })),
     commands.registerCommand('agentLens.openTasks', () => panel.show({ kind: 'tasks' })),
+    commands.registerCommand('agentLens.openParent', () => {
+      const id = panel.currentSession();
+      if (!id) void window.showInformationMessage('Open a session in Agent Lens first.');
+      else void openParent(id, '');
+    }),
+    commands.registerCommand('agentLens.openSignalSettings',
+      () => void commands.executeCommand('workbench.action.openSettings', '@ext:salehshakib.agent-lens')),
     commands.registerCommand('agentLens.relay.enable', async () => {
       const id = await chooseProfile();
       if (id) await relay.command('enable', id);
@@ -194,6 +264,10 @@ export function activate(context: ExtensionContext): SessionStore {
     workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('agentLens.agents')) refreshConfiguration();
       else if (event.affectsConfiguration('agentLens.privateDisplay')) refreshViews();
+      else if (event.affectsConfiguration('agentLens.signals') || event.affectsConfiguration('agentLens.context')) {
+        readSignalSettings();
+        refreshViews();
+      }
     }),
     { dispose: disposeObservers },
     { dispose: () => { relay.dispose(); panel.dispose(); status.dispose(); } },

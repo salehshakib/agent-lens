@@ -1,6 +1,7 @@
 import type { AgentNode } from '../../shared/protocol';
 import { formatDuration, formatTokens } from '../../shared/format';
-import { api, badge, button, el } from '../dom';
+import { api, badge, button, el, signalBadge } from '../dom';
+import { parentAction } from './nav';
 import type { SessionModel, Ui } from './state';
 import { saveUi } from './state';
 
@@ -24,6 +25,8 @@ function popover(node: AgentNode, close: () => void): HTMLElement {
     el('h4', { text: node.title }),
     el('p', { cls: 'muted', text: kindText[node.kind] + (node.parentTitle ? ' · started by ' + node.parentTitle : '') }),
     node.note ? el('p', { text: node.note }) : undefined,
+    node.signals.length ? el('ul', { cls: 'signal-list', attrs: { 'aria-label': 'Signals' } },
+      ...node.signals.map(view => el('li', {}, signalBadge(view)))) : undefined,
     el('h5', { text: 'Tools, in order' }),
     node.tools.length ? el('ol', { cls: 'tools' }, ...node.tools.map(tool => el('li', {},
       el('strong', { text: tool.name }),
@@ -31,6 +34,7 @@ function popover(node: AgentNode, close: () => void): HTMLElement {
       tool.line ? el('span', { cls: 'muted', text: ' (' + tool.line + ')' }) : undefined)))
       : el('p', { cls: 'muted', text: 'No tool calls recorded.' }),
     el('div', { cls: 'actions' },
+      parentAction(node.sessionId, node.laneId, node.parentInfo, node.id.slice(0, 16)),
       node.transcript
         ? button('Open transcript', () => api.postMessage({ type: 'openTranscript', session: node.sessionId, lane: node.laneId }))
         : el('span', { cls: 'muted', text: 'Transcript not available.' }),
@@ -62,6 +66,8 @@ export function mapTab(session: SessionModel, ui: Ui, rerender: () => void): HTM
     if (visited.has(node.id) || depth > 8) return el('li');
     visited.add(node.id);
     const open = ui.agent === node.id;
+    const level = node.signals.find(view => view.kind === 'context');
+    const warnings = node.signals.filter(view => view.kind !== 'context');
     const trigger = el('button', {
       cls: 'agent-card', attrs: { type: 'button', 'data-key': 'agent-' + node.id, 'aria-expanded': open, 'aria-haspopup': 'dialog' },
       on: { click: () => { ui.agent = open ? undefined : node.id; saveUi(ui); rerender(); } },
@@ -69,7 +75,8 @@ export function mapTab(session: SessionModel, ui: Ui, rerender: () => void): HTM
     el('span', { cls: 'agent-title', text: node.title }),
     badge(node.status, node.tone),
     el('span', { cls: 'muted', text: kindText[node.kind] }),
-    el('span', { cls: 'agent-stats', text: stats(node) }));
+    warnings.length ? el('span', { cls: 'agent-signals' }, ...warnings.map(signalBadge)) : undefined,
+    el('span', { cls: 'agent-stats' }, stats(node), level ? ' ' : undefined, level ? signalBadge(level) : undefined));
     const pop = open ? popover(node, () => close(trigger)) : undefined;
     pop?.addEventListener('keydown', event => {
       if (event.key === 'Escape') {

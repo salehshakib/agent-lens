@@ -7,6 +7,7 @@ export interface VsCodeApi {
 }
 
 import { clean } from '../shared/clean';
+import type { SignalView } from '../shared/protocol';
 
 declare function acquireVsCodeApi(): VsCodeApi;
 
@@ -48,6 +49,15 @@ export function button(label: string, onClick: () => void, props: Props = {}): H
 /** A status label: the color class is decoration, the text is the signal. */
 export function badge(text: string, tone: string): HTMLSpanElement {
   return el('span', { cls: 'badge tone-' + tone, text });
+}
+
+/**
+ * A signal as a text label. The tone only colors it, the words carry the meaning. A warning gets a leading mark so it
+ * reads as a warning without color, and the full text is also the accessible name. No motion is used.
+ */
+export function signalBadge(view: SignalView): HTMLSpanElement {
+  const text = (view.tone === 'neutral' ? '' : '! ') + view.label + (view.detail ? ' · ' + view.detail : '');
+  return el('span', { cls: 'badge signal tone-' + view.tone, text, attrs: { title: text, 'data-signal': view.kind } });
 }
 
 export function visuallyHidden(text: string): HTMLSpanElement {

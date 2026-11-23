@@ -43,26 +43,78 @@
     "commands": [
       { "command": "agentLens.openUsage", "title": "Open Usage and Limits", "category": "Agent Lens" },
       { "command": "agentLens.openTasks", "title": "Open Background Tasks", "category": "Agent Lens" },
+      { "command": "agentLens.openParent", "title": "Open Parent of Current Session", "category": "Agent Lens" },
+      { "command": "agentLens.openSignalSettings", "title": "Open Signal Settings", "category": "Agent Lens" },
       { "command": "agentLens.relay.enable", "title": "Enable Claude Limits Relay", "category": "Agent Lens" },
       { "command": "agentLens.relay.remove", "title": "Remove Claude Limits Relay", "category": "Agent Lens" }
     ],
-    "configuration": {
-      "title": "Agent Lens",
-      "properties": {
-        "agentLens.agents": {
-          "type": "object",
-          "scope": "machine",
-          "default": {},
-          "markdownDescription": "Local source settings keyed by `claude-code` or `codex`. Each can set `enabled`, an observation-only `logRoot`, and additional `profiles` with `id`, `label`, and `home`."
-        },
-        "agentLens.privateDisplay": {
-          "type": "boolean",
-          "scope": "machine",
-          "default": false,
-          "markdownDescription": "Hide prompts, commands, command output, diffs and transcript links in Agent Lens views."
+    "configuration": [
+      {
+        "title": "Agent Lens",
+        "properties": {
+          "agentLens.agents": {
+            "type": "object",
+            "scope": "machine",
+            "default": {},
+            "markdownDescription": "Local source settings keyed by `claude-code` or `codex`. Each can set `enabled`, an observation-only `logRoot`, and additional `profiles` with `id`, `label`, and `home`."
+          },
+          "agentLens.privateDisplay": {
+            "type": "boolean",
+            "scope": "machine",
+            "default": false,
+            "markdownDescription": "Hide prompts, commands, command output, diffs and transcript links in Agent Lens views."
+          }
+        }
+      },
+      {
+        "title": "Agent Lens: Signals",
+        "properties": {
+          "agentLens.signals.loopThreshold": {
+            "type": "integer",
+            "scope": "machine",
+            "default": 3,
+            "minimum": 2,
+            "maximum": 50,
+            "markdownDescription": "Consecutive identical tool calls in one agent lane before Agent Lens shows a Possible loop. Polling calls count only while their result stays the same."
+          },
+          "agentLens.signals.checkIgnore": {
+            "type": "array",
+            "scope": "machine",
+            "items": { "type": "string" },
+            "default": ["**/*.md", "**/*.mdx", "**/*.txt"],
+            "markdownDescription": "Glob patterns for files whose edits do not need a check. Edits that match are ignored when Agent Lens decides whether a turn finished without checks."
+          },
+          "agentLens.signals.checkCommands": {
+            "type": "object",
+            "scope": "machine",
+            "default": {},
+            "markdownDescription": "Extra command patterns that count as a check, keyed by project root path or `*` for every project. A value is a list of regular expressions, or `{ \"replace\": true, \"patterns\": [...] }` to replace the built-in patterns for that root. Patterns are matched as text against the recorded command. Nothing is run, and patterns are never read from repository files."
+          },
+          "agentLens.context.warnPercent": {
+            "type": "integer",
+            "scope": "machine",
+            "default": 70,
+            "minimum": 1,
+            "maximum": 99,
+            "markdownDescription": "Context fill percentage where the level becomes High. It must be lower than the Critical percentage, or both return to their defaults."
+          },
+          "agentLens.context.criticalPercent": {
+            "type": "integer",
+            "scope": "machine",
+            "default": 90,
+            "minimum": 2,
+            "maximum": 100,
+            "markdownDescription": "Context fill percentage where the level becomes Critical."
+          },
+          "agentLens.context.alerts": {
+            "type": "boolean",
+            "scope": "machine",
+            "default": false,
+            "markdownDescription": "Show a notification when a live session first reaches High or Critical context. One alert per session, lane, level and compaction. Off by default."
+          }
         }
       }
-    }
+    ]
   },
   "scripts": {
     "build": "node scripts/build.mjs",

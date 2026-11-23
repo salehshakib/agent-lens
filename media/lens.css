@@ -136,3 +136,9 @@ pre { margin: 4px 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: reduce) {
   * { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 }
+
+/* Signals. The text label carries the meaning. The tone only adds a left marker. No motion. */
+.badge.signal { white-space: normal; }
+.check { display: inline-flex; align-items: center; gap: 6px; }
+.check input { margin: 0; }
+.reason { color: var(--vscode-descriptionForeground); }
