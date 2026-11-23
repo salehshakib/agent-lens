@@ -2,6 +2,10 @@
 !package.json
 !README.md
 !dist/host/extension.js
-!dist/webview/sources.js
+!dist/relay/relay.js
+!dist/webview/sidebar.js
+!dist/webview/panel.js
 !media/activity.svg
-!media/sources.css
+!media/lens.css
+!media/sidebar.css
+!media/panel.css

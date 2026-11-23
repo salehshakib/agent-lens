@@ -35,11 +35,17 @@
       "agentLens.activity": [
         {
           "id": "agentLens.sessions",
-          "name": "Sources",
+          "name": "Sessions",
           "type": "webview"
         }
       ]
     },
+    "commands": [
+      { "command": "agentLens.openUsage", "title": "Open Usage and Limits", "category": "Agent Lens" },
+      { "command": "agentLens.openTasks", "title": "Open Background Tasks", "category": "Agent Lens" },
+      { "command": "agentLens.relay.enable", "title": "Enable Claude Limits Relay", "category": "Agent Lens" },
+      { "command": "agentLens.relay.remove", "title": "Remove Claude Limits Relay", "category": "Agent Lens" }
+    ],
     "configuration": {
       "title": "Agent Lens",
       "properties": {
@@ -48,6 +54,12 @@
           "scope": "machine",
           "default": {},
           "markdownDescription": "Local source settings keyed by `claude-code` or `codex`. Each can set `enabled`, an observation-only `logRoot`, and additional `profiles` with `id`, `label`, and `home`."
+        },
+        "agentLens.privateDisplay": {
+          "type": "boolean",
+          "scope": "machine",
+          "default": false,
+          "markdownDescription": "Hide prompts, commands, command output, diffs and transcript links in Agent Lens views."
         }
       }
     }

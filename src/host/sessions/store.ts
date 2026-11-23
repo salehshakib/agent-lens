@@ -1,12 +1,13 @@
 import type { Adapter, Event, Source } from '../adapters/types';
 import { SourceReader } from '../discovery/reader';
 import type { SourceBatch } from '../discovery/reader';
+import type { LimitSample } from '../limits/model';
 import { UsageLedger } from '../usage/ledger';
 import { codexChildren } from './ancestry';
 import type { CodexAncestry } from './ancestry';
 import { delegationThreadId, resolveDelegations, TaskStartupReader } from './delegation';
 import type { ClaudeLaunchCandidate, CodexLaunchCandidate } from './delegation';
-import { sourceSessionId } from './evidence';
+import { key as evidenceKey, sourceSessionId } from './evidence';
 import type { Kind, SourceEvidence } from './evidence';
 import { rowFor } from './items';
 import { resolveProject } from './project';
@@ -257,6 +258,32 @@ export class SessionStore {
       }
     }
     return budget;
+  }
+
+  /** Account-window observations recorded by provider limit events, keyed by profile namespace. */
+  limitSamples(): LimitSample[] {
+    const samples: LimitSample[] = [];
+    for (const state of this.observed.values()) {
+      const { source } = state;
+      if (source.kind !== 'transcript') continue;
+      for (const event of state.events.values()) {
+        if (event.kind !== 'limits' || event.at === undefined) continue;
+        for (const window of event.windows) {
+          samples.push({ provider: source.provider, profile: source.profileId ?? source.home, bucket: event.bucket,
+            minutes: window.minutes, usedPercent: window.usedPercent, resetsAt: window.resetsAt, at: event.at });
+        }
+      }
+    }
+    return samples;
+  }
+
+  /** Resolve a lane's catalog transcript source. The path always comes from the approved catalog. */
+  transcriptSource(sessionId: string, laneId: string): Source | undefined {
+    for (const sourceKey of this.groups.get(sessionId) ?? []) {
+      const source = this.sources.get(sourceKey);
+      if (source?.kind === 'transcript' && evidenceKey(sessionId, 'lane', source.laneId) === laneId) return source;
+    }
+    return undefined;
   }
 
   file(id: string): FileAction | undefined {

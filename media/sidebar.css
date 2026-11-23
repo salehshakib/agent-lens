@@ -1,0 +1,55 @@
+body {
+  color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+  background: var(--vscode-sideBar-background);
+  padding-top: 8px;
+}
+
+.summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding-bottom: 6px; }
+.summary span:first-child { font-weight: 600; }
+.privacy { margin: 4px 0; padding: 4px 6px; border-left: 3px solid var(--vscode-editorInfo-foreground); }
+.privacy[hidden] { display: none; }
+
+.quotas { border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, var(--vscode-widget-border, transparent)); padding-bottom: 6px; }
+.quotas:empty { display: none; }
+
+.filters { display: grid; gap: 6px; margin: 8px 0; }
+.filters input { width: 100%; }
+.filter-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.filter-row select { width: 100%; }
+
+details.project > summary {
+  cursor: pointer;
+  padding: 4px 2px;
+  font-weight: 600;
+  background: var(--vscode-sideBarSectionHeader-background);
+  color: var(--vscode-sideBarSectionHeader-foreground, inherit);
+}
+.group h3 { color: var(--vscode-descriptionForeground); text-transform: none; }
+
+.rows { display: block; }
+.row { margin: 2px 0; }
+.row .rows { margin-left: 12px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--vscode-widget-border, currentColor)); padding-left: 6px; }
+.row-main {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 8px;
+  width: 100%;
+  padding: 4px 6px;
+  text-align: left;
+  border: 0;
+  color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+  background: transparent;
+}
+.row-main:hover { background: var(--vscode-list-hoverBackground); }
+.row-main[aria-current="true"] { background: var(--vscode-list-inactiveSelectionBackground); }
+.row-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-meta { grid-column: 1 / -1; font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+.agents { margin: 0 0 0 18px; font-size: 0.9em; }
+.agents li { display: flex; justify-content: space-between; gap: 8px; padding: 1px 6px; color: var(--vscode-descriptionForeground); }
+.more { margin: 4px 6px; }
+.row > .link { margin-left: 18px; }
+
+.source { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; padding: 6px 0; border-bottom: 1px solid var(--vscode-widget-border, transparent); }
+.source small { flex-basis: 100%; color: var(--vscode-descriptionForeground); overflow-wrap: anywhere; }
+details.sources { margin-top: 12px; }
+details.sources > summary { cursor: pointer; font-weight: 600; }

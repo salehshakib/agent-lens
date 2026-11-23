@@ -29,6 +29,16 @@
 ## Phase C · Views and limits
 
 4. Ship the paged project tree, timeline, Files, Agent map, Background tasks, Usage and quota surfaces. Add the consented Claude relay and reversible chaining. Gate explicit refresh on a verified disposable signed-in probe (§6–8, §14).
+   - **4.1** (done) Add view-model builders and the host/webview message protocol: project tree with Live, Today and Earlier (paged by 20) and parent nesting with a cycle guard, session detail, background tasks and usage tables. Validate every webview request on the host with opaque ids. Add a private display mode. Render with the §14 CSP.
+   - **4.2** (done) Ship the sidebar: summary, quota gauges, relay card, filters, the paged tree with nested children, "Load more", and the Sources section that replaces the Phase A Sources view.
+   - **4.3** (done) Ship the editor-tab panel with Timeline (collapsed reasoning and tool rows, follow and "Jump to latest"), Agent map with detail popover (ordered tools, Open transcript, Stop agent disabled with its reason), Files (Open file, Open recorded diff), Usage (gauges, filters, accessible daily chart and table, models) and Background tasks.
+   - **4.4** (done) Add the status bar quota and live-count item and the Usage and Background tasks commands.
+   - **4.5** (done) Build the gauge model: latest sample per provider, profile, bucket and window, fresh, stale, expired and missing states, Codex named-bucket rule, profile-scoped samples.
+   - **4.6** (done) Build the Claude relay: dependency-free status-line script that stores an allowlisted snapshot atomically and chains the prior command, host-side snapshot reader, relay context and Claude 5h/7d samples.
+   - **4.7** (done) Build the reversible install and uninstall that splice only the top-level statusLine member, with ownership state, precedence, duplicate-key, unrecognized-value and concurrent-edit checks. Add modal consent, remembered decline and a remove command. Tested only against temporary profiles.
+   - **4.8** (partly done) Refresh limits: the gate and the disabled control with its reason exist. It stays disabled until a signed-in probe records the structured result. No parser is written for the unverified shape.
+   - **4.9** (done) Test with synthetic data and temporary directories: gauges, relay core and end-to-end relay spawn, install and uninstall, view models, protocol guards. Build, typecheck and test.
+   - **4.10** (not done, open) Manual checks in VS Code: relay on a disposable Claude profile, themes and high contrast, keyboard and focus, screen reader, narrow layouts, the signed-in refresh probe. Quota and completion alerts are not built.
 
 ## Phase D · Signals and parent navigation
 
