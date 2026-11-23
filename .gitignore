@@ -3,3 +3,4 @@ node_modules/
 dist/
 *.vsix
 test/fixtures/.phase-a-*/
+test/fixtures/.phase-b-*/

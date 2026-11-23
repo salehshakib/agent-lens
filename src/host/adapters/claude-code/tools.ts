@@ -1,8 +1,12 @@
-import type { Event, EventBase, FileEvidence, LauncherEvidence, Outcome, ResultStatus } from "../types";
+import type { Event, EventBase, FileEvidence, Outcome, ResultStatus } from "../types";
 import {
   containsSensitivePath, count, identifier, record, safePath, safeText,
   toolArgumentKey,
 } from "../../privacy/projection";
+import { safeFileText } from "../../files/diff";
+import { claudeTaskOutputReference, extractCodexStartupEvidence, reconcileStartupEvidence, scheduledTaskReference } from "./launcher";
+
+export { extractCodexStartupEvidence } from "./launcher";
 
 type JsonObject = Record<string, unknown>;
 
@@ -71,6 +75,7 @@ export function claudeToolCall(block: JsonObject, base: EventBase, unsafeCwd: bo
       return { ...call, restricted: true };
     }
     call.command = safeText(input.command);
+    call.background = boolean(input.run_in_background);
     call.text = safeText(input.description, 512);
     // If sanitization changed the command, equality of the visible text is insufficient evidence.
     if (call.command && call.command === input.command) {
@@ -115,6 +120,7 @@ export function claudeToolCall(block: JsonObject, base: EventBase, unsafeCwd: bo
   } else if (name === "Agent" || (name === "Task" && identifier(input.subagent_type) && typeof input.prompt === "string")) {
     // A legacy Task is only a spawn candidate. The host still needs child identity evidence.
     call.spawn = true;
+    call.background = boolean(input.run_in_background);
     call.text = safeText(input.description, 512);
     const prompt = safeText(input.prompt);
     if (prompt && prompt === input.prompt) {
@@ -192,57 +198,24 @@ function patchFromResult(value: unknown): string | undefined {
       if (typeof line !== "string" || !/^[ +\-]/.test(line) || /[\r\n]/.test(line) || containsSensitivePath(line)) {
         return undefined;
       }
-      const sanitized = line === " " ? line : safeText(line);
-      if (!sanitized) return undefined;
       if (line[0] !== "+") oldSeen++;
       if (line[0] !== "-") newSeen++;
-      parts.push(sanitized);
+      parts.push(line);
     }
     if (oldSeen !== oldLines || newSeen !== newLines) return undefined;
   }
-  return parts.join("\n");
+  return safeFileText(parts.join("\n"));
 }
 
-function statedResultStatus(block: JsonObject, failed: boolean, scheduled: boolean): ResultStatus {
-  if (block.is_error === true || failed) return "failed";
+function statedResultStatus(block: JsonObject, failed: boolean, scheduled: boolean, exitCode?: number): ResultStatus {
+  if (block.is_error === true || failed || (exitCode !== undefined && exitCode !== 0)) return "failed";
   if (block.is_error !== false && block.is_error !== undefined) return "unknown";
   if (scheduled) return "scheduled";
-  if (block.is_error === false || (block.is_error === undefined &&
+  if (exitCode === 0 || block.is_error === false || (block.is_error === undefined &&
     (typeof block.content === "string" || Array.isArray(block.content)))) {
     return "success";
   }
   return "unknown";
-}
-
-const launcherUuid = "[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}";
-const markerLine = new RegExp("^AGENT_LENS_CODEX_SESSION=(" + launcherUuid + ")$");
-const threadIdPattern = new RegExp("^" + launcherUuid + "$");
-const launcherPrefix = 64 * 1024;
-
-export function extractCodexStartupEvidence(value: unknown): LauncherEvidence | undefined {
-  if (typeof value !== "string") return undefined;
-  const lines = value.slice(0, launcherPrefix).split(/\r?\n/);
-  if (value.length > launcherPrefix) lines.pop();
-  let evidence: Extract<LauncherEvidence, { threadId: string }> | undefined;
-  for (const line of lines) {
-    let threadId = markerLine.exec(line)?.[1];
-    const kind = threadId ? "marker" : "thread-started";
-    if (!threadId && line.startsWith("{") && line.length <= 2048) {
-      try {
-        const entry = record(JSON.parse(line));
-        if (entry?.type === "thread.started" && typeof entry.thread_id === "string" && threadIdPattern.test(entry.thread_id)) {
-          threadId = entry.thread_id;
-        }
-      } catch {
-        continue;
-      }
-    }
-    if (!threadId) continue;
-    threadId = threadId.toLowerCase();
-    if (evidence && evidence.threadId !== threadId) return { evidence: "conflicting" };
-    if (!evidence || kind === "marker") evidence = { evidence: kind, threadId };
-  }
-  return evidence;
 }
 
 export function claudeToolResult(
@@ -259,17 +232,25 @@ export function claudeToolResult(
   const attributed = sourceCallId === callId || (singleResult && owner.sourceToolUseID === undefined);
   const meta = attributed ? record(owner.toolUseResult) : undefined;
   const agentId = identifier(meta?.agentId);
-  const backgroundTaskId = identifier(meta?.backgroundTaskId);
+  const exitCode = Number.isSafeInteger(meta?.exitCode) ? meta?.exitCode as number : undefined;
+  const scheduledRef = attributed ? scheduledTaskReference(block.content) : undefined;
+  const backgroundTaskId = identifier(meta?.backgroundTaskId) ?? scheduledRef?.taskId;
   const interrupted = meta?.interrupted === true;
   const scheduled = backgroundTaskId !== undefined || (agentId !== undefined && boolean(meta?.isAsync) === true);
-  const status = statedResultStatus(block, interrupted || (attributed && !!identifier(owner.toolDenialKind)), scheduled);
+  const status = statedResultStatus(block, interrupted || (attributed && !!identifier(owner.toolDenialKind)), scheduled, exitCode);
   const rawPath = meta?.filePath;
   const restricted = unsafeCwd || [rawPath, meta?.backgroundCwdHint, meta?.stdout, meta?.stderr]
     .some(value => typeof value === "string" && containsSensitivePath(value));
   const files: FileEvidence[] = [];
   const path = !restricted ? safePath(rawPath) : undefined;
-  const patch = path ? patchFromResult(meta?.structuredPatch) : undefined;
-  if (path && patch) files.push({ path, kind: "edit", patch, status: status === "success" ? "applied" : "unknown" });
+  if (path && meta) {
+    const patch = patchFromResult(meta.structuredPatch);
+    const created = meta.type === "create";
+    const before = created ? "" : safeFileText(meta.oldString);
+    const after = safeFileText(created ? meta.content : meta.newString);
+    files.push({ path, kind: created ? "add" : "edit", patch, before, after,
+      status: status === "success" ? "applied" : status === "failed" ? "failed" : "unknown" });
+  }
 
   let text: string | undefined;
   if (!restricted) {
@@ -280,8 +261,12 @@ export function claudeToolResult(
       : stdout ?? renderResultContent(block.content);
   }
   return {
-    ...base, kind: "result", callId, status, text, files: files.length ? files : undefined,
-    agentId, backgroundTaskId, launcher: restricted ? undefined : extractCodexStartupEvidence(meta?.stdout),
+    ...base, kind: "result", callId, status, text, exitCode, files: files.length ? files : undefined,
+    agentId, backgroundTaskId,
+    backgroundCwd: restricted ? undefined : safePath(meta?.backgroundCwdHint),
+    taskOutputPath: restricted ? undefined : claudeTaskOutputReference(meta?.outputFilePath ?? meta?.outputFile)?.path ?? scheduledRef?.path,
+    launcher: restricted ? undefined : reconcileStartupEvidence(
+      extractCodexStartupEvidence(meta?.stdout), extractCodexStartupEvidence(meta?.stderr)),
     childOutcome: agentId ? taskOutcome(meta?.status) : undefined,
     sourceAssistantId: identifier(owner.sourceToolAssistantUUID),
     interrupted: interrupted || undefined,

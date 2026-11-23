@@ -91,15 +91,17 @@ function sessionMeta(base: EventBase, payload: Record<string, unknown>, source: 
     title: label(payload.agent_nickname) ?? label(child?.agent_nickname),
     agentType: label(payload.agent_role) ?? label(child?.agent_role),
     parentThreadId,
+    parentConflict: !agrees || parent === source.sessionId.toLowerCase() || undefined,
     historyStartOrdinal: count(payload.subagent_history_start_ordinal),
   }];
 }
 
-function modelSettings(base: EventBase, settings: Record<string, unknown>, effort: unknown): Event[] {
+function modelSettings(base: EventBase, settings: Record<string, unknown>, effort: unknown, modelSource: "turn-context" | "thread-settings"): Event[] {
   const collaboration = base.turnId ? record(record(settings.collaboration_mode)?.settings) : undefined;
   return [{
     ...base,
     kind: "metadata",
+    modelSource,
     model: label(settings.model) ?? label(collaboration?.model),
     effort: label(effort) ?? label(collaboration?.reasoning_effort),
     cwd: safePath(settings.cwd),
@@ -179,6 +181,7 @@ function eventMessage(base: EventBase, payload: Record<string, unknown>, source:
       const at = timestamp(payload.completed_at) ?? base.at;
       const turn: Event = {
         ...eventBase, at, kind: "turn", state: failed ? "failed" : "completed", durationMs: count(payload.duration_ms),
+        startedAt: timestamp(payload.started_at),
       };
       return [
         turn,
@@ -191,10 +194,11 @@ function eventMessage(base: EventBase, payload: Record<string, unknown>, source:
       return [{
         ...eventBase, kind: "turn", state: payload.reason === "interrupted" ? "interrupted" : "aborted",
         at: timestamp(payload.completed_at) ?? base.at, durationMs: count(payload.duration_ms),
+        startedAt: timestamp(payload.started_at),
       }];
     case "thread_settings_applied": {
       const settings = record(payload.thread_settings);
-      return settings ? modelSettings(base, settings, settings.reasoning_effort) : [];
+      return settings ? modelSettings(base, settings, settings.reasoning_effort, "thread-settings") : [];
     }
     case "token_count":
       return observedUsage(base, payload);
@@ -273,7 +277,7 @@ export function parseCodexRecords(value: unknown, source: Source, offset: number
     case "session_meta":
       return sessionMeta(base, payload, source);
     case "turn_context":
-      return modelSettings(attributed, payload, payload.effort);
+      return modelSettings(attributed, payload, payload.effort, "turn-context");
     case "event_msg":
       return eventMessage(attributed, payload, source);
     case "response_item":

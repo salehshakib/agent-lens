@@ -11,9 +11,19 @@ await Promise.all([
     external: ['vscode'],
     logLevel: 'info',
   }),
+  // The status-line relay runs outside VS Code as `node relay.js`. It has no dependencies.
   build({
-    entryPoints: ['src/webview/sources.ts'],
-    outfile: 'dist/webview/sources.js',
+    entryPoints: ['src/relay/relay.ts'],
+    outfile: 'dist/relay/relay.js',
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node22',
+    logLevel: 'info',
+  }),
+  build({
+    entryPoints: { sidebar: 'src/webview/sidebar.ts', panel: 'src/webview/panel.ts' },
+    outdir: 'dist/webview',
     bundle: true,
     platform: 'browser',
     format: 'iife',

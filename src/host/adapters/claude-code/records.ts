@@ -1,6 +1,7 @@
 import type { Event, EventBase, Source, Tokens } from "../types";
 import { containsSensitivePath, count, identifier, record, safePath, safeText, timestamp } from "../../privacy/projection";
 import { claudeToolCall, claudeToolResult, taskOutcome } from "./tools";
+import { claudeTaskOutputReference } from "./launcher";
 
 type JsonObject = Record<string, unknown>;
 type Metadata = Extract<Event, { kind: "metadata" }>;
@@ -72,7 +73,7 @@ function metadataFor(row: JsonObject, base: EventBase): Metadata | undefined {
     effort: identifier(row.perTurnEffort) ?? identifier(row.effort),
     version: emitterVersion(row.version),
     branch: safeText(row.gitBranch, 160),
-    stopReason: identifier(message?.stop_reason),
+    stopReason: row.isApiErrorMessage !== true ? identifier(message?.stop_reason) : undefined,
     outcome: message && row.isAbortedMidStream === true ? "aborted" : undefined,
   };
   return base.cwd || metadata.model || metadata.effort || metadata.version ||
@@ -114,6 +115,7 @@ function parseAgentMetadata(row: JsonObject, source: Source, offset: number): Ev
     model: identifier(row.model),
     effort: identifier(row.effort),
     outcome: row.stoppedByUser === true ? "interrupted" : row.finished === true ? "completed" : undefined,
+    stoppedByUser: row.stoppedByUser === true || undefined,
   }];
 }
 
@@ -175,11 +177,16 @@ function parseAttachment(row: JsonObject, base: EventBase): Event[] {
     const state = taskOutcome(attachment.status);
     return taskId && state ? [{
       ...base, kind: "task", taskId, state, description: safeText(attachment.description, 512),
+      taskOutputPath: claudeTaskOutputReference(attachment.outputFilePath)?.path,
+      sourceCallId: identifier(row.sourceToolUseID),
     }] : [];
   }
   if (attachment?.type !== "file") return [];
   const path = safePath(attachment.displayPath) ?? safePath(attachment.filename);
-  return path ? [{ ...base, kind: "message", role: "attachment", text: path }] : [];
+  return path ? [
+    { ...base, kind: "message", role: "attachment", text: path },
+    { ...base, id: `${base.id}:file`, kind: "file", files: [{ path, kind: "mention" }] },
+  ] : [];
 }
 
 function parseCheckpoints(row: JsonObject, base: EventBase): Event[] {

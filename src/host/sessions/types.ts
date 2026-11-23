@@ -16,6 +16,7 @@ export type ContextLevel = "Normal" | "High" | "Critical";
 
 export type ContextSample = {
   input?: number;
+  inputComponents?: Pick<TokenCounts, 'input' | 'cacheRead' | 'cacheWrite'>;
   capacity?: number;
   percent?: number;
   approximate: boolean;
@@ -67,6 +68,11 @@ export type FileAction = {
   status: "requested" | "read" | "applied" | "failed" | "inferred" | "recorded";
   at?: number;
   diff?: string;
+  diffKind?: 'hunks' | 'partial' | 'complete';
+  projectRoot?: string;
+  diffUnavailable?: string;
+  provider?: Source['provider'];
+  project?: string;
   movePath?: string;
   range?: { start: number; count?: number };
 };
@@ -85,10 +91,15 @@ export type TimelineRow = {
   exitCode?: number;
   file?: string;
   durationMs?: number;
+  responseId?: string;
+  parentRecordId?: string;
+  currentBranch?: boolean;
+  ambiguous?: boolean;
 };
 
 export type Turn = {
   id: string;
+  nativeId?: string;
   state: State;
   startedAt?: number;
   endedAt?: number;
@@ -97,6 +108,8 @@ export type Turn = {
   effort?: string;
   cwd?: string;
   rootId?: string;
+  usage?: TokenCounts;
+  usageScope?: UsageObservation['scope'];
 };
 
 export type Lane = {
@@ -109,9 +122,15 @@ export type Lane = {
   rows: TimelineRow[];
   turns: Turn[];
   parent?: ParentTarget;
+  parentSessionId?: string;
   parentReason?: string;
+  branchLeaf?: string;
+  pending?: boolean;
+  transcriptAvailable?: boolean;
+  latestActivity?: TimelineRow;
   context?: ContextSample;
   usage?: TokenCounts;
+  usageScope?: UsageObservation['scope'];
   signals: Signal[];
   startedAt?: number;
   updatedAt?: number;
@@ -134,8 +153,10 @@ export type Session = {
   nativeId: string;
   cwd?: string;
   project?: string;
+  projectRoot?: string;
   branch?: string;
   title: string;
+  origin?: string;
   model?: string;
   effort?: string;
   status: State;
@@ -143,6 +164,9 @@ export type Session = {
   lanes: Lane[];
   context?: ContextSample;
   usage?: TokenCounts;
+  usageScope?: UsageObservation['scope'];
+  usagePartial?: boolean;
+  launches?: import('./delegation').DelegationLink[];
   parents: ParentTarget[];
   parentReason?: string;
   children: ParentTarget[];

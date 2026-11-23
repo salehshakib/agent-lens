@@ -1,26 +1,56 @@
 import { homedir } from 'node:os';
-import { window, workspace } from 'vscode';
+import { commands, Uri, window, workspace } from 'vscode';
 import type { ExtensionContext } from 'vscode';
 import { adapters } from './host/adapters/registry';
 import type { Provider } from './host/adapters/types';
 import { RootObservation } from './host/discovery/observation';
 import { configureRoots } from './host/discovery/roots';
 import type { RootConfiguration } from './host/discovery/roots';
-import { SourcesView } from './host/views/sources';
-import type { SourceStatus } from './shared/sources';
+import { registerFileActions } from './host/files/actions';
+import { RelayManager } from './host/limits/manager';
+import type { RelayProfile } from './host/limits/manager';
+import { refreshGate } from './host/limits/refresh';
+import { claudeTaskRoot } from './host/sessions/delegation';
+import { SessionStore } from './host/sessions/store';
+import { LensData } from './host/views/data';
+import type { ProfileInfo } from './host/views/data';
+import { PanelView } from './host/views/panel';
+import { SidebarView } from './host/views/sidebar';
+import { StatusView } from './host/views/status';
+import type { SourceView } from './shared/protocol';
 
-export function activate(context: ExtensionContext): void {
+export function activate(context: ExtensionContext): SessionStore {
   let configuration = new Map<Provider, RootConfiguration>();
   let observers = new Map<Provider, RootObservation[]>();
-  let visible = false;
+  let sidebarVisible = false;
+  let panelVisible = false;
+  let modelUpdate: NodeJS.Timeout | undefined;
+  const taskRoot = claudeTaskRoot(process.env.LOCALAPPDATA);
+  const store = new SessionStore(taskRoot);
 
-  function status(): SourceStatus[] {
+  function privateMode(): boolean {
+    return workspace.getConfiguration('agentLens').get<boolean>('privateDisplay', false) === true;
+  }
+
+  function profiles(): ProfileInfo[] {
+    return [...configuration].flatMap(([provider, config]) => config.roots
+      .filter(root => root.profile)
+      .map(root => ({ provider, id: root.profile!.id, label: root.profile!.label })));
+  }
+
+  function relayProfiles(): RelayProfile[] {
+    return (configuration.get('claude-code')?.roots ?? [])
+      .filter(root => root.profile)
+      .map(root => ({ id: root.profile!.id, label: root.profile!.label, home: root.profile!.home }));
+  }
+
+  function sources(): SourceView[] {
     return adapters.map(adapter => {
       const config = configuration.get(adapter.id);
       const statuses = (observers.get(adapter.id) ?? []).map(observer => observer.status);
       const available = statuses.some(status => status.state === 'available');
       const partial = config?.rejected || statuses.some(status => status.partial || status.state !== 'available');
-      let state: SourceStatus['state'] = 'Missing source';
+      let state = 'Missing source';
       if (config?.disabled) state = 'Disabled';
       else if (available) state = partial ? 'Partial coverage' : 'Available';
       else if (statuses.some(status => status.state === 'scanning')) state = 'Scanning';
@@ -35,37 +65,139 @@ export function activate(context: ExtensionContext): void {
     });
   }
 
-  const view = new SourcesView(context.extensionUri, status, shown => {
-    visible = shown;
-    for (const roots of observers.values()) {
-      for (const observer of roots) observer.setVisible(shown);
-    }
+  const relay = new RelayManager(context.globalStorageUri.fsPath, Uri.joinPath(context.extensionUri, 'dist', 'relay', 'relay.js').fsPath,
+    context.globalState, () => refreshViews());
+  const data = new LensData({
+    sessions: () => store.sessions(),
+    usageTotals: () => store.ledger.totals(),
+    limitSamples: () => store.limitSamples(),
+    now: Date.now,
+    privateMode,
+    profiles,
+    relay: id => relay.snapshots(id),
+    relayViews: () => relay.views(),
+    sources,
+    refresh: () => refreshGate(),
   });
+  const status = new StatusView('agentLens.openUsage');
+
+  function visibility(): void {
+    const visible = sidebarVisible || panelVisible;
+    for (const roots of observers.values()) {
+      for (const observer of roots) observer.setVisible(visible);
+    }
+    relay.setVisible(visible);
+  }
+
+  const panel = new PanelView(context.extensionUri, data, {
+    prepare: id => store.materialize(id),
+    openFile: id => void commands.executeCommand('agentLens.files.open', id),
+    openDiff: id => void commands.executeCommand('agentLens.files.diff', id),
+    openTranscript: (session, lane) => {
+      if (privateMode()) {
+        void window.showInformationMessage('Transcripts are hidden in private display mode.');
+        return;
+      }
+      const source = store.transcriptSource(session, lane);
+      if (!source) {
+        void window.showInformationMessage('This transcript is no longer available.');
+        return;
+      }
+      void commands.executeCommand('vscode.open', Uri.file(source.path));
+    },
+    relay: (command, profile) => void relay.command(command, profile),
+    visibility: visible => {
+      panelVisible = visible;
+      visibility();
+    },
+  });
+  const sidebar = new SidebarView(context.extensionUri, data, {
+    visibility: visible => {
+      sidebarVisible = visible;
+      visibility();
+    },
+    openSession: (id, mode) => panel.show({ kind: 'session', id, tab: mode === 'map' ? 'map' : 'timeline' }),
+    openUsage: () => panel.show({ kind: 'usage' }),
+    openTasks: () => panel.show({ kind: 'tasks' }),
+    relay: (command, profile) => void relay.command(command, profile),
+  });
+
+  function refreshViews(): void {
+    sidebar.update();
+    panel.update();
+    void store.sessions().then(sessions => status.update(data.liveCount(sessions), data.gauges().main)).catch(() => undefined);
+  }
+
+  function updateModel(): void {
+    modelUpdate ??= setTimeout(() => {
+      modelUpdate = undefined;
+      refreshViews();
+    }, 100);
+  }
+
   function disposeObservers() {
     for (const roots of observers.values()) {
       for (const observer of roots) observer.dispose();
     }
     observers.clear();
+    clearTimeout(modelUpdate);
+    modelUpdate = undefined;
+    store.clear();
   }
   function refreshConfiguration() {
     const settings = workspace.getConfiguration('agentLens').inspect<unknown>('agents');
     const next = configureRoots(adapters, settings?.globalValue ?? settings?.defaultValue, homedir(), process.env);
     disposeObservers();
     configuration = next;
+    relay.setProfiles(relayProfiles());
     observers = new Map([...next].map(([id, config]) => [id, config.roots.map(root => {
-      const observer = new RootObservation(root, { onChange: () => view.update() });
-      observer.setVisible(visible);
+      const observer = new RootObservation(root, {
+        onChange: () => {
+          store.setCatalog(root.key, root.adapter, observer.catalog);
+          updateModel();
+        },
+        onBatch: batch => {
+          store.ingest(batch);
+          updateModel();
+        },
+      });
+      observer.setVisible(sidebarVisible || panelVisible);
       observer.start();
       return observer;
     })]));
-    view.update();
+    refreshViews();
   }
+
+  async function chooseProfile(): Promise<string | undefined> {
+    const choices = relayProfiles();
+    if (choices.length <= 1) return choices[0]?.id;
+    const picked = await window.showQuickPick(choices.map(item => ({ label: item.label, id: item.id })), { placeHolder: 'Choose a Claude Code profile' });
+    return picked?.id;
+  }
+
+  registerFileActions(context, id => store.file(id), () => [
+    ...[...configuration.values()].flatMap(config => config.roots.map(root => root.boundary)),
+    ...(taskRoot ? [taskRoot] : []),
+  ]);
   context.subscriptions.push(
-    window.registerWebviewViewProvider('agentLens.sessions', view),
+    window.registerWebviewViewProvider(SidebarView.viewType, sidebar),
+    commands.registerCommand('agentLens.openUsage', () => panel.show({ kind: 'usage' })),
+    commands.registerCommand('agentLens.openTasks', () => panel.show({ kind: 'tasks' })),
+    commands.registerCommand('agentLens.relay.enable', async () => {
+      const id = await chooseProfile();
+      if (id) await relay.command('enable', id);
+    }),
+    commands.registerCommand('agentLens.relay.remove', async () => {
+      const id = await chooseProfile();
+      if (id) await relay.command('uninstall', id);
+    }),
     workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('agentLens.agents')) refreshConfiguration();
+      else if (event.affectsConfiguration('agentLens.privateDisplay')) refreshViews();
     }),
     { dispose: disposeObservers },
+    { dispose: () => { relay.dispose(); panel.dispose(); status.dispose(); } },
   );
   refreshConfiguration();
+  return store;
 }
