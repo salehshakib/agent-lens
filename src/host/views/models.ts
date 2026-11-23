@@ -2,9 +2,11 @@ import { createHash } from 'node:crypto';
 import type { Provider } from '../adapters/types';
 import type { Gauge } from '../limits/model';
 import { safeText } from '../privacy/projection';
+import { profileKey } from '../accounts/profiles';
 import { mergeTimeline } from '../sessions/items';
 import type { BackgroundTask, FileAction, Lane, Session, State, TimelineRow, TokenCounts } from '../sessions/types';
 import type { UsageTotal } from '../usage/ledger';
+import { observedModels } from './observed';
 import type {
   AgentNode, AgentRow, DayBar, FileGroup, FilterOption, Filters, GaugeView, GroupNode, ModelRow, ProjectNode,
   RowView, SessionDetail, SessionRow, StatusTone, TaskView, TokenRow, ToolView, UsageFilters, UsageModel, UsageView,
@@ -62,6 +64,8 @@ export interface TreeOptions {
   filters: Filters;
   /** Loaded Earlier rows per project id. */
   earlierLimits: ReadonlyMap<string, number>;
+  /** Profile labels by profile key. A row shows its profile when a provider has more than one. */
+  profileLabels?: ReadonlyMap<string, string>;
   pageSize?: number;
 }
 
@@ -86,10 +90,10 @@ function agentRows(session: Session): AgentRow[] {
   }));
 }
 
-function sessionRow(session: Session, privateMode: boolean, children: SessionRow[], project?: string): SessionRow {
+function sessionRow(session: Session, privateMode: boolean, children: SessionRow[], project?: string, profile?: string): SessionRow {
   return {
     id: session.id, provider: providerLabels[session.provider], title: title(session, privateMode), status: session.status,
-    tone: toneFor(session.status), updatedAt: session.updatedAt, project, agents: agentRows(session), children,
+    tone: toneFor(session.status), updatedAt: session.updatedAt, project, profile, agents: agentRows(session), children,
   };
 }
 
@@ -99,6 +103,7 @@ export function buildTree(sessions: readonly Session[], options: TreeOptions): {
   const visible = sessions.filter(session =>
     (!filters.adapter || session.provider === filters.adapter) &&
     (!filters.project || projectId(session) === filters.project) &&
+    (!filters.profile || profileKey(session.provider, session.profile) === filters.profile) &&
     matchesSearch(session, filters.search.trim(), options.privateMode));
   const byId = new Map(visible.map(session => [session.id, session]));
   const childrenOf = new Map<string, Session[]>();
@@ -117,11 +122,21 @@ export function buildTree(sessions: readonly Session[], options: TreeOptions): {
     nested.add(session.id);
     childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), session]);
   }
+  const labels = options.profileLabels ?? new Map<string, string>();
+  const profilesPerProvider = new Map<string, number>();
+  for (const key of labels.keys()) {
+    const provider = key.slice(0, key.indexOf(':'));
+    profilesPerProvider.set(provider, (profilesPerProvider.get(provider) ?? 0) + 1);
+  }
+  const profileFor = (session: Session): string | undefined =>
+    session.profile !== undefined && (profilesPerProvider.get(session.provider) ?? 0) > 1
+      ? labels.get(profileKey(session.provider, session.profile)) : undefined;
   const rank = (a: Session, b: Session) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.id.localeCompare(b.id);
   function build(session: Session, depth: number, parentProject: string): SessionRow {
     const own = projectId(session);
     const kids = depth >= maxDepth ? [] : (childrenOf.get(session.id) ?? []).sort(rank).map(child => build(child, depth + 1, own));
-    return sessionRow(session, options.privateMode, kids, own === parentProject || !parentProject ? undefined : projectLabel(session));
+    return sessionRow(session, options.privateMode, kids, own === parentProject || !parentProject ? undefined : projectLabel(session),
+      profileFor(session));
   }
   const today = localDay(options.now, options.timeZone);
   const projects = new Map<string, { label: string; live: SessionRow[]; today: SessionRow[]; earlier: SessionRow[] }>();
@@ -217,7 +232,7 @@ function agentNode(session: Session, lane: Lane, opts: { now: number; privateMod
   const context = lane.context;
   return {
     id: opts.id, laneId: lane.id, parent: opts.parent, title: safeText(lane.title, 100) ?? 'Agent', kind: opts.kind,
-    status, tone: lane.pending ? 'neutral' : toneFor(lane.status), model: lane.model ?? session.model,
+    status, tone: lane.pending ? 'neutral' : toneFor(lane.status), model: lane.model ?? session.model, effort: lane.effort,
     elapsedMs: elapsed(lane, opts.now), tokens,
     tokenLabel: tokens === undefined ? 'tokens unavailable'
       : 'tokens used' + (lane.usageScope ? ' (' + scopeText[lane.usageScope] + ')' : ''),
@@ -232,6 +247,8 @@ export interface DetailOptions {
   privateMode: boolean;
   /** Relay context fill for the Claude main session, when fresh. */
   relayContext?: number;
+  /** Profile label to show in the header. Set when the session's profile is worth naming. */
+  profileLabel?: string;
 }
 
 function countsRow(label: string, counts: TokenCounts | undefined): TokenRow {
@@ -332,9 +349,9 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
   const total = laneTokens(session.usage);
   const agentCount = session.lanes.length + session.children.length;
   return {
-    id: session.id, title: title(session, privateMode), provider: providerLabels[session.provider], profile: session.profile,
+    id: session.id, title: title(session, privateMode), provider: providerLabels[session.provider], profile: options.profileLabel,
     project: projectLabel(session), branch: safeText(session.branch, 80), status: session.status, tone: toneFor(session.status),
-    model: session.model, effort: session.effort,
+    model: session.model, effort: session.effort, observed: observedModels(session),
     elapsedMs: main ? elapsed(main, now) : undefined, agentCount,
     contextPercent: context.percent, contextApproximate: context.approximate, contextText: context.text,
     usageText: total === undefined ? 'Usage unavailable' : total + ' tokens' + (session.usagePartial ? ' (partial)' : ''),

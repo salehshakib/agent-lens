@@ -1,6 +1,8 @@
 import { homedir } from 'node:os';
 import { commands, Uri, window, workspace } from 'vscode';
 import type { ExtensionContext } from 'vscode';
+import { statusTerminal } from './host/accounts/terminal';
+import { profileKey } from './host/accounts/profiles';
 import { adapters } from './host/adapters/registry';
 import type { Provider } from './host/adapters/types';
 import { RootObservation } from './host/discovery/observation';
@@ -35,7 +37,7 @@ export function activate(context: ExtensionContext): SessionStore {
   function profiles(): ProfileInfo[] {
     return [...configuration].flatMap(([provider, config]) => config.roots
       .filter(root => root.profile)
-      .map(root => ({ provider, id: root.profile!.id, label: root.profile!.label })));
+      .map(root => ({ provider, id: root.profile!.id, label: root.profile!.label, home: root.profile!.home })));
   }
 
   function relayProfiles(): RelayProfile[] {
@@ -74,6 +76,7 @@ export function activate(context: ExtensionContext): SessionStore {
     now: Date.now,
     privateMode,
     profiles,
+    userHome: homedir(),
     relay: id => relay.snapshots(id),
     relayViews: () => relay.views(),
     sources,
@@ -120,6 +123,7 @@ export function activate(context: ExtensionContext): SessionStore {
     openUsage: () => panel.show({ kind: 'usage' }),
     openTasks: () => panel.show({ kind: 'tasks' }),
     relay: (command, profile) => void relay.command(command, profile),
+    accountStatus: key => openAccountStatus(key),
   });
 
   function refreshViews(): void {
@@ -175,6 +179,30 @@ export function activate(context: ExtensionContext): SessionStore {
     return picked?.id;
   }
 
+  /** Types the official status command into a terminal. The user presses Enter; nothing runs here. */
+  function openAccountStatus(key: string): void {
+    if (!workspace.isTrusted) {
+      void window.showInformationMessage('Trust this workspace to open a terminal for the official account status.');
+      return;
+    }
+    const profile = profiles().find(item => profileKey(item.provider, item.id) === key);
+    const adapter = adapters.find(item => item.id === profile?.provider);
+    if (!profile || !adapter) return;
+    const request = statusTerminal(adapter, profile);
+    const terminal = window.createTerminal({ name: request.name, env: request.env });
+    terminal.sendText(request.text, false);
+    terminal.show();
+  }
+
+  async function chooseAccount(): Promise<string | undefined> {
+    const choices = profiles();
+    if (choices.length <= 1) return choices[0] && profileKey(choices[0].provider, choices[0].id);
+    const picked = await window.showQuickPick(choices.map(item => ({
+      label: item.label, description: adapters.find(adapter => adapter.id === item.provider)?.label, key: profileKey(item.provider, item.id),
+    })), { placeHolder: 'Choose an account profile' });
+    return picked?.key;
+  }
+
   registerFileActions(context, id => store.file(id), () => [
     ...[...configuration.values()].flatMap(config => config.roots.map(root => root.boundary)),
     ...(taskRoot ? [taskRoot] : []),
@@ -183,6 +211,11 @@ export function activate(context: ExtensionContext): SessionStore {
     window.registerWebviewViewProvider(SidebarView.viewType, sidebar),
     commands.registerCommand('agentLens.openUsage', () => panel.show({ kind: 'usage' })),
     commands.registerCommand('agentLens.openTasks', () => panel.show({ kind: 'tasks' })),
+    commands.registerCommand('agentLens.showAccounts', () => commands.executeCommand('agentLens.sessions.focus')),
+    commands.registerCommand('agentLens.accounts.openStatus', async () => {
+      const key = await chooseAccount();
+      if (key) openAccountStatus(key);
+    }),
     commands.registerCommand('agentLens.relay.enable', async () => {
       const id = await chooseProfile();
       if (id) await relay.command('enable', id);

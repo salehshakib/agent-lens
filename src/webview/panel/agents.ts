@@ -9,7 +9,7 @@ const stopReason = 'Stopping agents is not available yet. Agent Lens only observ
 
 function stats(node: AgentNode): string {
   const parts = [
-    node.model,
+    node.model && node.effort ? node.model + ' (' + node.effort + ' effort)' : node.model ?? (node.effort ? node.effort + ' effort' : undefined),
     node.elapsedMs === undefined ? undefined : 'elapsed ' + formatDuration(node.elapsedMs),
     node.tokens === undefined ? 'tokens unavailable' : formatTokens(node.tokens) + ' ' + node.tokenLabel,
     node.contextPercent === undefined ? 'context unavailable'
