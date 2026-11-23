@@ -121,3 +121,24 @@ body { max-width: 1100px; margin: 0 auto; padding-top: 0; }
 .task { padding: 6px 0; border-bottom: 1px solid var(--vscode-widget-border, var(--vscode-editorGroup-border, transparent)); }
 .task-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
 .tasks { display: block; }
+
+/* Session header: Back, Open parent, breadcrumb and the signal summary. */
+.head-actions { margin: 0 0 4px; }
+.parent-action { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.crumbs ol { display: flex; flex-wrap: wrap; align-items: baseline; margin: 0 0 4px; padding: 0; list-style: none; }
+.crumbs li { display: inline-flex; align-items: baseline; }
+.crumbs .sep { padding: 0 2px; }
+.signal-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0; }
+
+/* Timeline signals: repeated-call groups, end-of-turn markers and the row a jump landed on. */
+.loop-group > .thead .label { font-family: var(--vscode-editor-font-family, monospace); overflow-wrap: anywhere; }
+.loop-members { display: block; margin: 4px 0 0 16px; padding-left: 10px; border-left: 1px solid var(--vscode-tree-indentGuidesStroke, var(--vscode-widget-border, currentColor)); }
+.kind-signal { background: var(--vscode-textBlockQuote-background); }
+.focus-target { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; background: var(--vscode-editor-findMatchHighlightBackground, var(--vscode-list-hoverBackground)); }
+@media (prefers-reduced-motion: reduce) {
+  .focus-target { transition: none; animation: none; }
+}
+
+/* Agent map signals. */
+.agent-signals { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px; }
+.signal-list { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; padding: 0; list-style: none; }

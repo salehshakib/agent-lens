@@ -1,6 +1,18 @@
 import type { PanelModel, PanelTab, UsageFilters } from '../../shared/protocol';
 import { api } from '../dom';
 
+/** One place the reader can come Back to: the session, its lane filter and the topmost visible row. */
+export interface Place {
+  session: string;
+  lane: string;
+  kind: string;
+  /** Row id at the top of the viewport, or empty. */
+  anchor: string;
+  tab: PanelTab;
+}
+
+export const historyLimit = 20;
+
 export interface Ui {
   tab: PanelTab;
   lane: string;
@@ -12,13 +24,22 @@ export interface Ui {
   usage: UsageFilters;
   /** Session the saved view belongs to. */
   session?: string;
+  /** Back history of this panel, newest last. */
+  history: Place[];
 }
 
 const tabs: readonly PanelTab[] = ['timeline', 'map', 'files', 'usage', 'tasks'];
+
+function isPlace(value: unknown): value is Place {
+  if (typeof value !== 'object' || value === null) return false;
+  const place = value as Record<string, unknown>;
+  return typeof place.session === 'string' && typeof place.lane === 'string' && typeof place.kind === 'string'
+    && typeof place.anchor === 'string' && tabs.includes(place.tab as PanelTab);
+}
 export const defaultUsage: UsageFilters = { range: '30', project: '', adapter: '' };
 
 export function loadUi(): Ui {
-  const base: Ui = { tab: 'timeline', lane: '', kind: '', expanded: [], fileSearch: '', fileKind: '', usage: defaultUsage };
+  const base: Ui = { tab: 'timeline', lane: '', kind: '', expanded: [], fileSearch: '', fileKind: '', usage: defaultUsage, history: [] };
   const value = api.getState();
   if (typeof value !== 'object' || value === null) return base;
   const saved = value as Partial<Ui>;
@@ -35,6 +56,9 @@ export function loadUi(): Ui {
       && typeof usage.project === 'string' && typeof usage.adapter === 'string'
       ? { range: usage.range, project: usage.project.slice(0, 64), adapter: usage.adapter.slice(0, 40) } : defaultUsage,
     session: typeof saved.session === 'string' ? saved.session : undefined,
+    history: Array.isArray(saved.history) ? saved.history.filter(isPlace).slice(-historyLimit).map(place => ({
+      session: place.session.slice(0, 64), lane: place.lane.slice(0, 80), kind: place.kind.slice(0, 20),
+      anchor: place.anchor.slice(0, 200), tab: place.tab })) : [],
   };
 }
 

@@ -7,12 +7,15 @@ import { render, resourceRoots } from './html';
 export interface SidebarActions {
   visibility(visible: boolean): void;
   openSession(id: string, mode: 'timeline' | 'map'): void;
+  openParent(id: string): void;
   openUsage(): void;
   openTasks(): void;
   relay(command: RelayCommand, profile: string): void;
+  /** Open the official read-only status command for the profile with this key. */
+  accountStatus(profile: string): void;
 }
 
-const emptyFilters: Filters = { search: '', adapter: '', project: '' };
+const emptyFilters: Filters = { search: '', adapter: '', project: '', warnings: false, profile: '' };
 
 export class SidebarView implements WebviewViewProvider {
   static readonly viewType = 'agentLens.sessions';
@@ -49,9 +52,11 @@ export class SidebarView implements WebviewViewProvider {
             break;
           case 'openSession': this.actions.openSession(request.id, 'timeline'); break;
           case 'openMap': this.actions.openSession(request.id, 'map'); break;
+          case 'openParent': this.actions.openParent(request.id); break;
           case 'openUsage': this.actions.openUsage(); break;
           case 'openTasks': this.actions.openTasks(); break;
           case 'relay': this.actions.relay(request.command, request.profile); break;
+          case 'accountStatus': this.actions.accountStatus(request.profile); break;
         }
       }),
       view.onDidChangeVisibility(() => {

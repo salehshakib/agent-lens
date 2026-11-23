@@ -95,6 +95,8 @@ export function classifyHint(root: ApprovedRoot, path: string): 'source' | 'scan
   return undefined;
 }
 
+const probeConcurrency = 24;
+
 export async function discoverSources(root: ApprovedRoot, signal: AbortSignal) {
   const sources = new Map<string, Source>();
   const writers = new Set<string>();
@@ -106,13 +108,28 @@ export async function discoverSources(root: ApprovedRoot, signal: AbortSignal) {
     if (status === 'unavailable') partial = true;
   }
 
+  // Probes run with bounded concurrency; results are inserted in walk order.
+  const pending: string[] = [];
   async function add(path: string) {
-    try {
-      const source = await probeSource(root, path);
-      if (source) sources.set(source.key, source);
-    } catch (error) {
-      classify(error);
+    pending.push(path);
+  }
+
+  async function flush() {
+    const paths = pending.splice(0);
+    const results: (Source | undefined)[] = new Array(paths.length);
+    let next = 0;
+    async function worker() {
+      while (next < paths.length && !signal.aborted) {
+        const index = next++;
+        try {
+          results[index] = await probeSource(root, paths[index]!);
+        } catch (error) {
+          classify(error);
+        }
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(probeConcurrency, paths.length) }, worker));
+    for (const source of results) if (source) sources.set(source.key, source);
   }
 
   async function visit(path: string, onEntry: (entry: Dirent, path: string) => Promise<void>, optional = true) {
@@ -171,10 +188,12 @@ export async function discoverSources(root: ApprovedRoot, signal: AbortSignal) {
           classify(error);
         }
       });
+      await flush();
       for (const source of sources.values()) {
         if (source.kind === 'transcript') source.writerPresent = writers.has(source.sessionId);
       }
     }
   }
+  await flush();
   return { sources, state: state as Access, partial };
 }

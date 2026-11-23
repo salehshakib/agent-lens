@@ -12,6 +12,8 @@ export type TokenCounts = {
   total?: number;
 };
 
+export type ModelSource = "transcript" | "turn-context" | "thread-settings";
+
 export type ContextLevel = "Normal" | "High" | "Critical";
 
 export type ContextSample = {
@@ -43,6 +45,13 @@ export type ParentTarget = {
   relation: "agent" | "child" | "launch";
 };
 
+/** A pointer at one timeline row, possibly in another session of the same delegation tree. */
+export type RowRef = {
+  sessionId: string;
+  laneId: string;
+  rowId: string;
+};
+
 export type Signal = {
   id: string;
   laneId: string;
@@ -54,6 +63,11 @@ export type Signal = {
   detail?: string;
   count?: number;
   level?: ContextLevel;
+  /** Done without checks outcome. */
+  outcome?: "no-checks" | "check-failed" | "check-unknown";
+  /** Last confirmed edit and last check of a turn tree, for the end-of-turn marker links. */
+  edit?: RowRef;
+  check?: RowRef;
 };
 
 export type FileAction = {
@@ -106,6 +120,8 @@ export type Turn = {
   durationMs?: number;
   model?: string;
   effort?: string;
+  /** Which recorded evidence supplied the model and effort. Never a requested selection. */
+  modelSource?: ModelSource;
   cwd?: string;
   rootId?: string;
   usage?: TokenCounts;

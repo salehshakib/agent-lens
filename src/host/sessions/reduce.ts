@@ -1,7 +1,7 @@
 import type { Source } from '../adapters/types';
 import { FileIndex } from '../files/index';
 import { reduceUsage, resolveContext } from '../usage/ledger';
-import type { LedgerTool } from '../usage/ledger';
+import type { LedgerSignal, LedgerTool } from '../usage/ledger';
 import { backgroundTasks, claudeChildren } from './ancestry';
 import type { CodexAncestry } from './ancestry';
 import { firstTitle, fresh, isKind, key, latestTime, sourceSessionId, stateByOutcome } from './evidence';
@@ -10,6 +10,8 @@ import { isTimelineEvent, pairCalls, reconcileCodex, rowFor } from './items';
 import type { PairedCall } from './items';
 import { recordedPath } from './project';
 import type { ProjectIdentity } from './project';
+import { checkMatcher, collectEvidence, defaultSignalSettings, deriveContext, deriveLoops, ignoreMatcher } from './signals';
+import type { ContextStep, RunEvidence, SignalSettings } from './signals';
 import { assignTurns, finishTurns } from './turns';
 import type { LaneWork } from './turns';
 import type { Session } from './types';
@@ -19,6 +21,10 @@ export interface ReducedSession {
   tools: LedgerTool[];
   calls: PairedCall[];
   tasks: Positioned<Kind<'task'>>[];
+  /** Confirmed edits and recorded checks, joined across the delegation tree by the store. */
+  evidence: RunEvidence;
+  /** Loop and context signals counted by the ledger. Check outcomes are added by the store after the tree join. */
+  ledgerSignals: LedgerSignal[];
   codex?: CodexAncestry;
 }
 
@@ -70,6 +76,7 @@ export function reduceSession(
   projectFor: (cwd: string) => ProjectIdentity | undefined = () => undefined,
   title?: string,
   presence: Kind<'metadata'>[] = [],
+  settings: SignalSettings = defaultSignalSettings,
 ): ReducedSession | undefined {
   const source = input[0]?.source;
   if (!source) return undefined;
@@ -99,6 +106,8 @@ export function reduceSession(
   const timelineItems = [...allItems.filter(isTimelineEvent), ...paired.calls, ...paired.unmatched];
   const visible = claude ? timelineItems : reconcileCodex(timelineItems);
   const calls: PairedCall[] = [];
+  const callRows = new Map<PairedCall, string>();
+  const ledgerSignals: LedgerSignal[] = [];
   const tools: LedgerTool[] = [];
   const files = new FileIndex();
   const unresolved = new Set<string>();
@@ -117,6 +126,7 @@ export function reduceSession(
     } else if (isKind(item, 'call')) {
       const call = item as PairedCall;
       calls.push(call);
+      callRows.set(call, row.id);
       const result = call.result?.event;
       if (claude && item.turnId && (!result || !synchronousTerminals.has(result.status) || item.ambiguous)) {
         unresolved.add(item.turnId);
@@ -167,9 +177,26 @@ export function reduceSession(
       turn.usageScope = usage.byTurnScope.get(turn.id);
     }
     work.lane.context = usage.byLaneContext.get(work.lane.id);
-    for (const item of work.items) {
+    const steps: ContextStep[] = [];
+    for (const item of [...work.items].sort((a, b) => a.order - b.order)) {
+      if (isKind(item, 'compaction')) {
+        steps.push({ kind: 'compaction' });
+        continue;
+      }
       if (!isKind(item, 'context')) continue;
       work.lane.context = resolveContext(item.event, item.turnId ? work.turns.get(item.turnId)?.capacity : undefined);
+      if (work.lane.context) steps.push({ kind: 'sample', sample: work.lane.context });
+    }
+    // Levels exist only where a percentage exists. Claude transcripts carry none, so the relay percentage is joined later.
+    const history = deriveContext(work.lane.id, steps, settings, now);
+    ledgerSignals.push(...history.ledger);
+    if (work.lane.context && history.current?.level) {
+      work.lane.context = { ...work.lane.context, level: history.current.level };
+      if (history.current.level !== 'Normal') work.lane.signals.push({
+        id: key('context', work.lane.id, String(history.epoch), history.current.level), laneId: work.lane.id, kind: 'context',
+        state: 'live', rowIds: [], label: 'Context ' + history.current.level.toLowerCase() + (history.current.approximate ? ' (approximate)' : ''),
+        detail: Math.round(history.current.percent ?? 0) + '% of context window', level: history.current.level,
+      });
     }
   }
   session.usageObservations = usage.observations;
@@ -180,6 +207,14 @@ export function reduceSession(
   session.model = main.lane.model;
   session.effort = main.lane.effort;
   session.files = files.actions();
+  const rowId = (call: PairedCall) => callRows.get(call) ?? '';
+  const loops = deriveLoops(calls, rowId, settings.loopThreshold,
+    laneId => { const status = byLane.get(laneId)?.lane.status; return status === 'Live' || status === 'Waiting'; });
+  ledgerSignals.push(...loops.ledger);
+  for (const signal of loops.signals) byLane.get(signal.laneId)?.lane.signals.push(signal);
+  for (const work of lanes) session.signals.push(...work.lane.signals);
+  const evidence = collectEvidence(id, claude, calls, rowId, session.files, checkMatcher(settings, session.projectRoot),
+    ignoreMatcher(settings.checkIgnore));
   const tasks = allItems.filter((item): item is Positioned<Kind<'task'>> => isKind(item, 'task'));
   if (claude) {
     claudeChildren(session, lanes, calls, now);
@@ -193,7 +228,7 @@ export function reduceSession(
   session.status = session.lanes.some(lane => lane.status === 'Live') || session.background.some(task => task.status === 'Live')
     ? 'Live' : main.lane.status;
   return {
-    session, calls, tools, tasks,
+    session, calls, tools, tasks, evidence, ledgerSignals,
     codex: claude ? undefined : {
       source: main.source, session, metadata: main.metadata,
       spawns: allItems.filter((item): item is Positioned<Kind<'spawn'>> => isKind(item, 'spawn')),

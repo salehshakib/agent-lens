@@ -39,7 +39,7 @@ function variant(base: Session, id: string, updatedAt: number, patch: Partial<Se
 }
 
 const options = (overrides: Partial<TreeOptions> = {}): TreeOptions => ({
-  now: instant + day, timeZone: 'UTC', privateMode: false, filters: { search: '', adapter: '', project: '' },
+  now: instant + day, timeZone: 'UTC', privateMode: false, filters: { search: '', adapter: '', project: '', warnings: false },
   earlierLimits: new Map(), ...overrides,
 });
 
@@ -86,13 +86,13 @@ test('children nest under their parent and a cycle is not nested', () => {
 test('search and adapter filters narrow the tree and private mode hides titles', () => {
   const claude = claudeSession();
   const codex = codexSession();
-  equal(buildTree([claude, codex], options({ filters: { search: '', adapter: 'codex', project: '' } })).total, 1);
-  equal(buildTree([claude, codex], options({ filters: { search: 'no-such-text', adapter: '', project: '' } })).total, 0);
+  equal(buildTree([claude, codex], options({ filters: { search: '', adapter: 'codex', project: '', warnings: false } })).total, 1);
+  equal(buildTree([claude, codex], options({ filters: { search: 'no-such-text', adapter: '', project: '', warnings: false } })).total, 0);
   const open = buildTree([claude], options()).tree[0]!.groups[0]!.rows[0]!;
   ok(open.title.includes('Secret fixture prompt'));
   const hidden = buildTree([claude], options({ privateMode: true })).tree[0]!.groups[0]!.rows[0]!;
   ok(!hidden.title.includes('Secret'));
-  equal(buildTree([claude], options({ privateMode: true, filters: { search: 'Secret', adapter: '', project: '' } })).total, 0);
+  equal(buildTree([claude], options({ privateMode: true, filters: { search: 'Secret', adapter: '', project: '', warnings: false } })).total, 0);
 });
 
 test('session detail shows ordered rows, and private mode strips prompts, commands and output', () => {

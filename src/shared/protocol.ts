@@ -24,6 +24,42 @@ export interface RelayView {
   detail: string;
 }
 
+/** One signal shown as a label. The text label always accompanies the tone, never the color alone. */
+export interface SignalView {
+  kind: 'loop' | 'check' | 'context';
+  state: 'live' | 'historical';
+  label: string;
+  detail?: string;
+  tone: StatusTone;
+}
+
+/** A timeline row, possibly in another session of the same delegation tree. */
+export interface RowTarget {
+  sessionId: string;
+  laneId: string;
+  rowId: string;
+}
+
+export interface ParentChoice extends RowTarget {
+  /** Session, lane and time text for the choice menu. */
+  label: string;
+  at?: number;
+}
+
+export interface ParentInfo {
+  state: 'root' | 'unresolved' | 'resolved';
+  /** Why the parent is unresolved. */
+  reason?: string;
+  /** Launch targets, newest first. Several appear when a Codex thread was resumed by more than one launch. */
+  targets: ParentChoice[];
+}
+
+export interface Crumb {
+  label: string;
+  /** Present on every ancestor segment. The current segment has none. */
+  target?: RowTarget;
+}
+
 export interface SessionRow {
   id: string;
   provider: string;
@@ -33,8 +69,13 @@ export interface SessionRow {
   updatedAt?: number;
   /** Project label when the row sits outside its parent's project. */
   project?: string;
+  /** Profile label when the session belongs to a saved profile. */
+  profile?: string;
   agents: AgentRow[];
   children: SessionRow[];
+  /** Short warning labels such as Possible loop, No checks after edits, Context High. */
+  warnings: SignalView[];
+  parent: { state: ParentInfo['state']; reason?: string };
 }
 
 export interface AgentRow {
@@ -73,6 +114,35 @@ export interface Filters {
   search: string;
   adapter: string;
   project: string;
+  /** Show only sessions with a live loop, an unresolved done-without-checks outcome or a high context level. */
+  warnings: boolean;
+  /** Profile key from the profile options. Empty or absent means all profiles. */
+  profile?: string;
+}
+
+export type AccountState = 'Signed in' | 'Signed out' | 'External configuration' | 'Unknown';
+
+export interface AccountProfileView {
+  /** Opaque key, provider and profile id, used to filter sessions and open the official status terminal. */
+  key: string;
+  provider: string;
+  label: string;
+  role: 'Default' | 'Saved';
+  active: boolean;
+  home: string;
+  state: AccountState;
+  reason: string;
+  mode?: string;
+  checkedAt?: number;
+  sessions: number;
+  live: number;
+  tokens?: number;
+}
+
+export interface AccountsView {
+  profiles: AccountProfileView[];
+  /** Sessions read from observation-only roots, which carry no profile attribution. */
+  unassigned: { provider: string; sessions: number }[];
 }
 
 export interface SidebarModel {
@@ -83,6 +153,8 @@ export interface SidebarModel {
   projects: FilterOption[];
   tree: ProjectNode[];
   sources: SourceView[];
+  profiles: FilterOption[];
+  accounts: AccountsView;
   relays: RelayView[];
   refresh: { enabled: boolean; reason: string };
   filters: Filters;
@@ -106,6 +178,12 @@ export interface RowView {
   exitCode?: number;
   durationMs?: number;
   file?: string;
+  turnId?: string;
+  /** Membership of a repeated-call streak. The first row of a streak carries the group head. */
+  loop?: { id: string; tool: string; count: number; live: boolean };
+  signals?: SignalView[];
+  /** End-of-turn marker links to the last confirmed edit and the last check. */
+  links?: { edit?: RowTarget; check?: RowTarget };
 }
 
 export interface ToolView {
@@ -123,11 +201,16 @@ export interface AgentNode {
   status: string;
   tone: StatusTone;
   model?: string;
+  effort?: string;
   elapsedMs?: number;
   tokens?: number;
   tokenLabel: string;
   contextPercent?: number;
   contextApproximate?: boolean;
+  /** High or Critical only. Normal and unknown capacity have no level. */
+  contextLevel?: 'High' | 'Critical';
+  signals: SignalView[];
+  parentInfo: ParentInfo;
   parentTitle?: string;
   transcript: boolean;
   /** Session that owns the transcript, which differs from the open session for a linked Codex run. */
@@ -185,6 +268,19 @@ export interface TaskView {
   at?: number;
 }
 
+/** One model and effort pair observed in an agent's recorded turns. */
+export interface ObservedModelRow {
+  lane: string;
+  model?: string;
+  effort?: string;
+  /** Turns that recorded this pair. Absent when only a lane-level record exists. */
+  turns?: number;
+  /** Evidence source label, or Not recorded. */
+  source: string;
+  /** The pair currently shown for the agent. */
+  current: boolean;
+}
+
 export interface SessionDetail {
   id: string;
   title: string;
@@ -196,12 +292,18 @@ export interface SessionDetail {
   tone: StatusTone;
   model?: string;
   effort?: string;
+  observed: ObservedModelRow[];
   elapsedMs?: number;
   agentCount: number;
   contextPercent?: number;
   contextApproximate?: boolean;
+  contextLevel?: 'High' | 'Critical';
   contextText: string;
   usageText: string;
+  /** Header summary: live streak count, latest turn outcome and context level. */
+  signals: { liveLoops: number; outcome?: SignalView; context?: SignalView };
+  parent: ParentInfo;
+  breadcrumb: Crumb[];
   rows: RowView[];
   rowsOmitted: number;
   agents: AgentNode[];
@@ -263,8 +365,8 @@ export type PanelTab = 'timeline' | 'map' | 'files' | 'usage' | 'tasks';
 
 export type HostMessage =
   | { type: 'sidebar'; model: SidebarModel }
-  /** `tab` is set only when the host opens the panel on a specific tab. */
-  | { type: 'panel'; model: PanelModel; tab?: PanelTab };
+  /** `tab` is set only when the host opens the panel on a specific tab. `focus` is set when Open parent targets a row. */
+  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string } };
 
 export type SidebarRequest =
   | { type: 'ready' }
@@ -272,8 +374,10 @@ export type SidebarRequest =
   | { type: 'loadOlder'; project: string }
   | { type: 'openSession'; id: string }
   | { type: 'openMap'; id: string }
+  | { type: 'openParent'; id: string }
   | { type: 'openUsage' }
   | { type: 'openTasks' }
+  | { type: 'accountStatus'; profile: string }
   | { type: 'relay'; command: RelayCommand; profile: string };
 
 export type PanelRequest =
@@ -282,6 +386,11 @@ export type PanelRequest =
   | { type: 'openDiff'; id: string }
   | { type: 'openTranscript'; session: string; lane: string }
   | { type: 'openSession'; id: string }
+  /** Open a session at a row. `lane` and `row` are empty to open the session without a target. */
+  | { type: 'goto'; session: string; lane: string; row: string }
+  /** Open the parent of the current session or lane. `lane` is empty for the main lane. */
+  | { type: 'openParent'; session: string; lane: string }
+  | { type: 'openSettings' }
   | { type: 'usageFilters'; filters: UsageFilters }
   | { type: 'relay'; command: RelayCommand; profile: string };
 
@@ -299,10 +408,13 @@ function text(value: unknown, max: number): value is string {
 }
 
 export const maxSearch = 200;
+/** Provider id, a colon and a profile id of up to 160 characters. */
+export const maxProfileKey = 180;
 
 export function isFilters(value: unknown): value is Filters {
-  return shape(value, ['search', 'adapter', 'project']) && text(value.search, maxSearch)
-    && text(value.adapter, 40) && text(value.project, 64);
+  const base = shape(value, ['search', 'adapter', 'project', 'warnings']) || shape(value, ['search', 'adapter', 'project', 'warnings', 'profile']);
+  return base && text(value.search, maxSearch) && text(value.adapter, 40) && text(value.project, 64)
+    && typeof value.warnings === 'boolean' && (!('profile' in value) || text(value.profile, maxProfileKey));
 }
 
 export function isUsageFilters(value: unknown): value is UsageFilters {
@@ -321,15 +433,21 @@ export function parseSidebarRequest(message: unknown): SidebarRequest | undefine
   if (type === 'ready' && shape(message, ['type'])) return { type };
   if (type === 'openUsage' && shape(message, ['type'])) return { type };
   if (type === 'openTasks' && shape(message, ['type'])) return { type };
+  if (type === 'accountStatus' && shape(message, ['type', 'profile']) && text(message.profile, maxProfileKey)
+    && message.profile) return { type, profile: message.profile };
   if (type === 'filter' && shape(message, ['type', 'filters']) && isFilters(message.filters)) return { type, filters: message.filters };
   if (type === 'loadOlder' && shape(message, ['type', 'project']) && text(message.project, 64)) return { type, project: message.project };
-  if ((type === 'openSession' || type === 'openMap') && shape(message, ['type', 'id']) && typeof message.id === 'string'
-    && sessionId.test(message.id)) return { type, id: message.id };
+  if ((type === 'openSession' || type === 'openMap' || type === 'openParent') && shape(message, ['type', 'id'])
+    && typeof message.id === 'string' && sessionId.test(message.id)) return { type, id: message.id };
   if (type === 'relay' && shape(message, ['type', 'command', 'profile']) && isRelayCommand(message.command)
     && text(message.profile, 64)) {
     return { type, command: message.command, profile: message.profile };
   }
   return undefined;
+}
+
+function optionalId(value: unknown): value is string {
+  return typeof value === 'string' && (value === '' || sessionId.test(value));
 }
 
 /** Validate a message from the session panel webview. */
@@ -345,6 +463,15 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   }
   if (type === 'openSession' && shape(message, ['type', 'id']) && typeof message.id === 'string'
     && sessionId.test(message.id)) return { type, id: message.id };
+  if (type === 'openSettings' && shape(message, ['type'])) return { type };
+  if (type === 'goto' && shape(message, ['type', 'session', 'lane', 'row']) && typeof message.session === 'string'
+    && sessionId.test(message.session) && optionalId(message.lane) && optionalId(message.row)) {
+    return { type, session: message.session, lane: message.lane, row: message.row };
+  }
+  if (type === 'openParent' && shape(message, ['type', 'session', 'lane']) && typeof message.session === 'string'
+    && sessionId.test(message.session) && optionalId(message.lane)) {
+    return { type, session: message.session, lane: message.lane };
+  }
   if (type === 'usageFilters' && shape(message, ['type', 'filters']) && isUsageFilters(message.filters)) {
     return { type, filters: message.filters };
   }

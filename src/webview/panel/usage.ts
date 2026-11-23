@@ -15,11 +15,27 @@ function tokenTable(rows: UsageView['tokens'], caption: string): HTMLElement {
       cell(row.input), cell(row.cacheRead), cell(row.cacheWrite), cell(row.output), cell(row.reasoning), cell(row.total)))));
 }
 
+function observedTable(rows: SessionModel['observed']): HTMLElement {
+  const text = (value: string | undefined) => value ?? 'Not recorded';
+  return el('table', { cls: 'observed' },
+    el('caption', { text: 'Observed model and effort. These are the values the agent recorded, not the selection that was requested.' }),
+    el('thead', {}, el('tr', {}, ...['Agent', 'Model', 'Effort', 'Turns', 'Source', 'Current']
+      .map(label => el('th', { attrs: { scope: 'col' }, text: label })))),
+    el('tbody', {}, ...rows.map(row => el('tr', {},
+      el('th', { attrs: { scope: 'row' }, text: row.lane }),
+      el('td', { text: text(row.model) }),
+      el('td', { text: text(row.effort) }),
+      el('td', { cls: 'num', text: row.turns === undefined ? '' : String(row.turns) }),
+      el('td', { text: row.source }),
+      el('td', { text: row.current ? 'Current' : '' })))));
+}
+
 /** Usage tab inside a session: this session's tokens and context, never account quota. */
 export function sessionUsageTab(session: SessionModel): HTMLElement {
   return el('section', { cls: 'usage-tab' },
     el('p', { text: session.usageText + ' · ' + session.contextText }),
     session.usage.tokens.length ? tokenTable(session.usage.tokens, 'Tokens by agent') : el('p', { cls: 'empty', text: 'No token counts recorded for this session.' }),
+    session.observed.length ? observedTable(session.observed) : undefined,
     el('p', { cls: 'muted', text: session.usage.scope + (session.usage.partial ? ' Some usage evidence is partial, so totals may be incomplete.' : '') }));
 }
 

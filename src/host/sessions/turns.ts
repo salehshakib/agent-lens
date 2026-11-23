@@ -88,6 +88,7 @@ function assignClaude(work: LaneWork, initialCwd?: string): void {
     if (event.kind === 'metadata') {
       turn.model = event.model ?? turn.model;
       turn.effort = event.effort ?? turn.effort;
+      if (event.model || event.effort) turn.modelSource = 'transcript';
       if (event.outcome === 'aborted' || terminalReasons.has(event.stopReason ?? '')) {
         if (turn.terminal !== 'Aborted') turn.terminal = event.outcome === 'aborted' ? 'Aborted' : 'Completed';
         turn.endedAt = latestTime(turn.endedAt, event.at);
@@ -116,10 +117,12 @@ function assignCodex(work: LaneWork, initialCwd?: string): void {
     if (event.kind === 'metadata' && event.modelSource === 'turn-context') {
       if (event.model) { turn.model = event.model; turn.modelFromContext = true; }
       if (event.effort) { turn.effort = event.effort; turn.effortFromContext = true; }
+      if (event.model || event.effort) turn.modelSource = 'turn-context';
       turn.cwd = event.cwd ?? turn.cwd;
     } else if (event.kind === 'metadata' && event.modelSource === 'thread-settings') {
       if (!turn.modelFromContext) turn.model = event.model ?? turn.model;
       if (!turn.effortFromContext) turn.effort = event.effort ?? turn.effort;
+      if (!turn.modelSource && (event.model || event.effort)) turn.modelSource = 'thread-settings';
       turn.cwd ??= event.cwd;
     }
     if (event.kind === 'turn') {
@@ -128,6 +131,7 @@ function assignCodex(work: LaneWork, initialCwd?: string): void {
         turn.started = true;
         turn.startedAt ??= event.at;
         turn.capacity = event.capacity ?? turn.capacity;
+        if (!turn.modelSource && (settings?.model || settings?.effort)) turn.modelSource = 'thread-settings';
         turn.model ??= settings?.model;
         turn.effort ??= settings?.effort;
         turn.cwd ??= item.cwd;
