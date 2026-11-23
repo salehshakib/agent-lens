@@ -3,9 +3,12 @@ import { window, workspace } from 'vscode';
 import type { Memento } from 'vscode';
 import type { RelayCommand, RelayView } from '../../shared/protocol';
 import { formatAge } from '../../shared/format';
+import { probeClaudeLimits, probeSamples, resolveClaude } from './claude-probe';
 import { limitSamples, readSnapshots } from './claude-relay';
 import type { RelaySnapshot } from './claude-relay';
+import { latestSamples } from './model';
 import type { LimitSample } from './model';
+import type { RefreshState } from './refresh';
 import { defaultPrecedencePaths, installRelay, onPath, relayDirectories, relayState, uninstallRelay } from './settings';
 
 export interface RelayProfile {
@@ -22,13 +25,24 @@ interface Cache {
 }
 
 const declinedKey = 'agentLens.relay.declined';
+const probeIntervalMs = 10 * 60_000;
 
-/** Owns the Claude status-line relay for every Claude profile: consent, install, removal and snapshot cache. */
+interface ProbeCache {
+  attemptedAt: number;
+  samples: LimitSample[];
+}
+
+/** Owns Claude limit probes and status-line relays for the configured profiles. */
 export class RelayManager {
   private readonly cache = new Map<string, Cache>();
+  private readonly probes = new Map<string, ProbeCache>();
   private profiles: RelayProfile[] = [];
   private timer?: NodeJS.Timeout;
   private busy = false;
+  private claudeFound = false;
+  private probeRunning = false;
+  private probeError?: string;
+  private disposed = false;
 
   constructor(
     private readonly storage: string,
@@ -39,8 +53,12 @@ export class RelayManager {
   ) {}
 
   setProfiles(profiles: readonly RelayProfile[]): void {
+    for (const profile of this.profiles) {
+      if (profiles.some(next => next.id === profile.id && next.home === profile.home)) continue;
+      this.cache.delete(profile.id);
+      this.probes.delete(profile.id);
+    }
     this.profiles = [...profiles];
-    for (const id of [...this.cache.keys()]) if (!this.profiles.some(profile => profile.id === id)) this.cache.delete(id);
     void this.poll();
   }
 
@@ -48,19 +66,58 @@ export class RelayManager {
   setVisible(visible: boolean): void {
     clearInterval(this.timer);
     this.timer = undefined;
-    if (!visible) return;
-    void this.poll();
+    if (!visible || this.disposed) return;
     this.timer = setInterval(() => void this.poll(), 15_000);
+    void this.poll();
   }
 
   dispose(): void {
+    this.disposed = true;
     clearInterval(this.timer);
     this.timer = undefined;
   }
 
   snapshots(profileId: string): { snapshots: RelaySnapshot[]; samples: LimitSample[] } {
     const cached = this.cache.get(profileId);
-    return { snapshots: cached?.snapshots ?? [], samples: cached?.samples ?? [] };
+    const probed = this.probes.get(profileId);
+    return { snapshots: cached?.snapshots ?? [], samples: [...cached?.samples ?? [], ...probed?.samples ?? []] };
+  }
+
+  refreshState(): RefreshState {
+    return { claudeFound: this.claudeFound, profiles: this.profiles.length, running: this.probeRunning, error: this.probeError };
+  }
+
+  private autoProbe(): void {
+    if (!this.timer || !this.claudeFound || this.probeRunning) return;
+    const staleBefore = this.now() - probeIntervalMs;
+    const profile = this.profiles.find(item => {
+      const attempt = this.probes.get(item.id)?.attemptedAt;
+      return (attempt === undefined || attempt <= staleBefore) &&
+        this.snapshots(item.id).samples.every(sample => sample.at < staleBefore);
+    });
+    if (profile) void this.runProbe(profile, false);
+  }
+
+  private async runProbe(profile: RelayProfile, manual: boolean): Promise<void> {
+    if (this.probeRunning || this.disposed) return;
+    this.probeRunning = true;
+    const entry = { attemptedAt: this.now(), samples: this.probes.get(profile.id)?.samples ?? [] };
+    this.probes.set(profile.id, entry);
+    this.changed();
+    try {
+      const result = await probeClaudeLimits(profile.home, join(this.storage, 'probe'), this.now)
+        .catch(() => ({ ok: false as const, message: 'Could not run Claude Code from the limit refresh folder.' }));
+      if (this.disposed || this.probes.get(profile.id) !== entry) return;
+      this.probeError = result.ok ? undefined : result.message;
+      if (result.ok) {
+        entry.samples = latestSamples([...entry.samples, ...probeSamples(result, profile.id)]);
+      } else if (manual) {
+        void window.showWarningMessage('Could not refresh Claude limits for "' + profile.label + '". ' + result.message);
+      }
+    } finally {
+      this.probeRunning = false;
+      if (!this.disposed) this.changed();
+    }
   }
 
   private declined(): string[] {
@@ -81,37 +138,43 @@ export class RelayManager {
       }
       if (cached?.nodeMissing) {
         return { ...base, state: 'unavailable' as const,
-          detail: 'The relay needs Node.js on PATH to run. Install Node.js to show Claude limits and context.' };
+          detail: 'The relay needs Node.js on PATH to show live Claude context fill.' };
       }
       if (declined.includes(profile.id)) {
         return { ...base, state: 'declined' as const,
-          detail: 'The relay is off. Claude limits and context are not shown. You can enable it at any time.' };
+          detail: 'The relay is off. You can enable it at any time to show live Claude context fill.' };
       }
       return { ...base, state: 'not-installed' as const,
-        detail: 'Claude limits and context need a small status-line relay. Nothing is changed until you enable it.' };
+        detail: 'Enable the optional status-line relay to show live Claude context fill.' };
     });
   }
 
   async poll(): Promise<void> {
-    if (this.busy) return;
+    if (this.busy || this.disposed) return;
     this.busy = true;
     try {
-      let changed = false;
-      const nodeMissing = this.profiles.length > 0 && !await onPath('node');
+      const [nodeFound, claude] = this.profiles.length > 0
+        ? await Promise.all([onPath('node'), resolveClaude()])
+        : [true, undefined];
+      const nodeMissing = !nodeFound;
+      let changed = this.claudeFound !== Boolean(claude);
+      this.claudeFound = Boolean(claude);
       for (const profile of this.profiles) {
         const dirs = relayDirectories(this.storage, profile.home);
         const installed = await relayState({ home: profile.home, storage: this.storage }) === 'installed';
         const snapshots = installed ? await readSnapshots(dirs.snapshots) : [];
+        if (!this.profiles.some(item => item.id === profile.id && item.home === profile.home)) continue;
         const next: Cache = { installed, nodeMissing, snapshots, samples: limitSamples(snapshots, profile.id) };
         const previous = this.cache.get(profile.id);
         if (!previous || previous.installed !== installed || previous.nodeMissing !== nodeMissing
           || JSON.stringify(previous.snapshots) !== JSON.stringify(snapshots)) changed = true;
         this.cache.set(profile.id, next);
       }
-      if (changed) this.changed();
+      if (changed && !this.disposed) this.changed();
     } finally {
       this.busy = false;
     }
+    this.autoProbe();
   }
 
   private precedencePaths(): string[] {
@@ -127,9 +190,7 @@ export class RelayManager {
     if (!profile) return;
     const locations = { home: profile.home, storage: this.storage };
     if (command === 'refresh') {
-      await window.showInformationMessage(
-        'Refresh limits is not available yet. It waits for a verified check of the Claude usage report. '
-        + 'Limits update from the status-line relay.');
+      await this.runProbe(profile, true);
       return;
     }
     if (command === 'decline') {

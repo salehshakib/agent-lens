@@ -1,5 +1,7 @@
 import { deepEqual, equal, ok } from 'node:assert/strict';
+import { join } from 'node:path';
 import { test } from 'node:test';
+import { parseRateLimitLine, probeSamples, profileEnv } from '../src/host/limits/claude-probe';
 import { limitSamples, parseSnapshot, projectStatusLine, relayContext, sessionToken } from '../src/host/limits/claude-relay';
 import type { RelaySnapshot } from '../src/host/limits/claude-relay';
 import { buildGauges, compactGauges, latestSamples } from '../src/host/limits/model';
@@ -110,12 +112,75 @@ test('relay samples map to claude windows and context drops when stale', () => {
 
 test('Claude gauges without a relay explain how to get data', () => {
   const { main } = buildGauges([{ provider: 'claude-code', profile: 'default' }], [], now);
-  ok(main[0]?.reason.includes('Enable Claude limits'));
+  ok(main[0]?.reason.includes('Refresh limits'));
 });
 
-test('refresh stays disabled until a signed-in probe is verified', () => {
-  const gate = refreshGate();
-  equal(gate.enabled, false);
-  ok(gate.reason.length > 0);
-  equal(refreshGate({ usageReportVerified: true }).enabled, true);
+const rateLimitEvent = {
+  type: 'rate_limit_event',
+  rate_limit_info: {
+    unifiedWindows: {
+      five_hour: { utilization: 0.16, resetsAt: 1_795_445_400, status: 'allowed' },
+      seven_day: { utilization: 0.72, resetsAt: 1_795_741_200, status: 'allowed' },
+    },
+  },
+  session_id: 'fixture-session',
+};
+
+test('the Claude probe parses unified windows and converts reset seconds to milliseconds', () => {
+  deepEqual(parseRateLimitLine(JSON.stringify(rateLimitEvent)), {
+    fiveHour: { usedPercent: 16, resetsAt: 1_795_445_400_000 },
+    sevenDay: { usedPercent: 72, resetsAt: 1_795_741_200_000 },
+  });
+});
+
+test('the Claude probe ignores other event types and malformed JSON', () => {
+  equal(parseRateLimitLine(JSON.stringify({ ...rateLimitEvent, type: 'result', subtype: 'rate_limit_event' })), undefined);
+  equal(parseRateLimitLine('{"type":"rate_limit_event", garbage'), undefined);
+});
+
+test('the Claude probe rejects utilization outside 0–1 without dropping a valid sibling window', () => {
+  const { unifiedWindows } = rateLimitEvent.rate_limit_info;
+  for (const utilization of [-0.01, 1.01]) {
+    const line = JSON.stringify({
+      ...rateLimitEvent,
+      rate_limit_info: { unifiedWindows: { ...unifiedWindows, five_hour: { ...unifiedWindows.five_hour, utilization } } },
+    });
+    deepEqual(parseRateLimitLine(line), {
+      fiveHour: undefined,
+      sevenDay: { usedPercent: 72, resetsAt: 1_795_741_200_000 },
+    });
+  }
+});
+
+test('probe samples map available windows to the requested Claude profile', () => {
+  const fiveHour = { usedPercent: 16, resetsAt: now + minute };
+  const sevenDay = { usedPercent: 72, resetsAt: now + 60 * minute };
+  const expected = [
+    { provider: 'claude-code', profile: 'fixture', minutes: 300, ...fiveHour, at: now },
+    { provider: 'claude-code', profile: 'fixture', minutes: 10080, ...sevenDay, at: now },
+  ];
+  deepEqual(probeSamples({ ok: true, windows: { fiveHour, sevenDay }, at: now }, 'fixture'), expected);
+  deepEqual(probeSamples({ ok: true, windows: { sevenDay }, at: now }, 'fixture'), expected.slice(1));
+});
+
+test('Claude probe environments remove the override for the default home and set it for other homes', () => {
+  const userHome = join('fixtures', 'user');
+  const otherHome = join(userHome, 'other-profile');
+  const env = { PATH: 'fixture-path', CLAUDE_CONFIG_DIR: 'previous-home' };
+  deepEqual(profileEnv(join(userHome, '.claude'), env, userHome), { PATH: env.PATH });
+  deepEqual(profileEnv(otherHome, env, userHome), { PATH: env.PATH, CLAUDE_CONFIG_DIR: otherHome });
+  equal(env.CLAUDE_CONFIG_DIR, 'previous-home');
+});
+
+test('the refresh gate reports availability, progress and retryable errors', () => {
+  const ready = { claudeFound: true, profiles: 1, running: false };
+  deepEqual(refreshGate({ ...ready, claudeFound: false }), {
+    enabled: false, reason: 'Claude Code was not found on PATH, so limits cannot be refreshed.',
+  });
+  deepEqual(refreshGate({ ...ready, profiles: 0 }), { enabled: false, reason: 'No Claude profile is configured.' });
+  deepEqual(refreshGate({ ...ready, running: true }), { enabled: false, reason: 'Refreshing Claude limits…' });
+  deepEqual(refreshGate({ ...ready, error: 'No limit data.' }), { enabled: true, reason: 'Last refresh failed: No limit data.' });
+  const gate = refreshGate(ready);
+  equal(gate.enabled, true);
+  ok(gate.reason.includes('Haiku'));
 });

@@ -106,7 +106,7 @@ export function activate(context: ExtensionContext): SessionStore {
     relay: id => relay.snapshots(id),
     relayViews: () => relay.views(),
     sources,
-    refresh: () => refreshGate(),
+    refresh: () => refreshGate(relay.refreshState()),
     thresholds: () => ({ warnPercent: signalSettings.warnPercent, criticalPercent: signalSettings.criticalPercent }),
   });
   const status = new StatusView('agentLens.openUsage');

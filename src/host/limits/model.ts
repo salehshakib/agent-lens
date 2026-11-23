@@ -4,7 +4,7 @@ import type { Provider } from '../adapters/types';
 export interface LimitSample {
   provider: Provider;
   profile: string;
-  /** Provider bucket name. Claude relay samples are bound to their profile and carry no bucket. */
+  /** Provider bucket name. Claude samples are bound to their profile and carry no bucket. */
   bucket?: string;
   minutes: number;
   usedPercent: number;
@@ -106,7 +106,7 @@ export function buildGauges(scopes: readonly ProfileScope[], samples: readonly L
     const unverifiedNull = own.some(sample => sample.bucket === undefined && sample.provider !== 'claude-code' &&
       !mainBucket(sample, options));
     const missing = scope.provider === 'claude-code'
-      ? 'No Claude limit snapshot yet. Enable Claude limits, then send a message in Claude Code.'
+      ? 'No Claude limit snapshot yet. Use Refresh limits or enable the relay and send a message in Claude Code.'
       : unverifiedNull
         ? 'Only unnamed limit buckets were recorded. Their account scope is not verified, so they are not shown.'
         : 'No Codex limit observation in the recorded sessions.';
