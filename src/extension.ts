@@ -6,7 +6,7 @@ import type { ExtensionContext, WebviewPanel } from 'vscode';
 import { statusTerminal } from './host/accounts/terminal';
 import { profileKey } from './host/accounts/profiles';
 import { adapters } from './host/adapters/registry';
-import { isClaudeSessionId } from './host/adapters/claude-code/chat';
+import { isClaudeSessionId, setChatPermissionMode } from './host/adapters/claude-code/chat';
 import type { Adapter, Provider, Source } from './host/adapters/types';
 import { claimChatWriter } from './host/chat/ownership';
 import { ChatSessions } from './host/chat/session';
@@ -135,6 +135,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     alertsEnabled = enabled;
   }
   readSignalSettings();
+  setChatPermissionMode(configured('chat.permissionMode'));
 
   function privateMode(): boolean {
     return workspace.getConfiguration('agentLens').get<boolean>('privateDisplay', false) === true;
@@ -583,6 +584,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       if (id) await relay.command('uninstall', id);
     }),
     workspace.onDidChangeConfiguration(event => {
+      if (event.affectsConfiguration('agentLens.chat.permissionMode')) setChatPermissionMode(configured('chat.permissionMode'));
       if (event.affectsConfiguration('agentLens.agents')) {
         chat.invalidate('Chat profiles changed. Check the original profile before continuing.');
         refreshConfiguration();

@@ -31,6 +31,16 @@ const args = [
   '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
   '--include-partial-messages', '--replay-user-messages', '--permission-prompts', 'none',
 ] as const;
+/** Claude Code permission modes the chat may start in (agentLens.chat.permissionMode). */
+export const chatPermissionModes = ['auto', 'default', 'acceptEdits', 'plan'] as const;
+export type ChatPermissionMode = typeof chatPermissionModes[number];
+let permissionMode: ChatPermissionMode = 'auto';
+
+/** Applies to chats started or resumed after the call; running workers keep their mode. */
+export function setChatPermissionMode(mode: unknown): void {
+  permissionMode = chatPermissionModes.includes(mode as ChatPermissionMode) ? mode as ChatPermissionMode : 'auto';
+}
+
 const maxInputBytes = 224 * 1024;
 const maxPresence = 16 * 1024;
 const maxPresenceEntries = 4096;
@@ -143,7 +153,7 @@ async function verifiedExecutable(signal: AbortSignal): Promise<string> {
 
 function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEvent) => void, signal: AbortSignal): Promise<ChatConnection> {
   const { identity, resume } = launch;
-  const child = spawn(executable, [...args, resume ? '--resume' : '--session-id', identity.nativeId], {
+  const child = spawn(executable, [...args, '--permission-mode', permissionMode, resume ? '--resume' : '--session-id', identity.nativeId], {
     cwd: identity.cwd, env: profileEnv(identity.home), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const closed = deferred<void>();
