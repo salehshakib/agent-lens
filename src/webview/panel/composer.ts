@@ -1,6 +1,8 @@
 import { maxChatDraft } from '../../shared/protocol';
 import type { ChatView, PanelRequest } from '../../shared/protocol';
 import { button, clean, el } from '../dom';
+import { ChatStatusLine } from './chat-status';
+import { PromptHistory, resolveKey } from './chat-keys';
 import { SlashMenu } from './slash';
 
 const stateLabel: Record<ChatView['state'], string> = {
@@ -26,6 +28,9 @@ export class Composer {
   private readonly resume = button('Continue', () => this.post({ type: 'chatContinue' }));
   private readonly retry = button('Retry send', () => this.post({ type: 'chatRetry' }));
   private readonly scope = button('Choose scope', () => this.post({ type: 'chatChooseScope' }));
+  private readonly statusLine = new ChatStatusLine();
+  private readonly modeNote = el('span', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
+  private readonly history = new PromptHistory();
   private readonly slash = new SlashMenu(this.input, value => {
     this.input.value = value;
     this.saveDraft();
@@ -34,6 +39,7 @@ export class Composer {
     el('div', { cls: 'chat-activity' },
       el('p', { cls: 'chat-status-line', attrs: { role: 'status', 'aria-atomic': 'true' } }, this.status),
       this.interrupt),
+    this.statusLine.element, this.modeNote,
     this.reason,
     el('div', { cls: 'chat-input-frame' },
       this.slash.element,
@@ -41,6 +47,7 @@ export class Composer {
       el('div', { cls: 'chat-composer-footer' }, this.keys,
         el('div', { cls: 'chat-composer-actions' }, this.scope, this.resume, this.retry, this.sendButton))));
 
+  private announcedMode?: string;
   private model?: ChatView;
   private revision = 0;
   private sentRevision?: number;
@@ -51,6 +58,7 @@ export class Composer {
     this.input.spellcheck = false;
     this.input.addEventListener('input', event => {
       if (!this.composing && !(event as InputEvent).isComposing) {
+        if ((event as InputEvent).inputType) this.history.stop();
         this.saveDraft();
         this.slash.inputChanged();
       }
@@ -65,23 +73,41 @@ export class Composer {
       this.slash.inputChanged();
     });
     this.input.addEventListener('keydown', event => {
-      if (event.defaultPrevented || this.composing || event.isComposing || event.keyCode === 229
-        || event.ctrlKey || event.altKey || event.metaKey) return;
+      if (event.defaultPrevented || this.composing || event.isComposing || event.keyCode === 229) return;
       if (this.slash.handleKey(event)) return;
-      if (event.key === 'Enter' && !event.shiftKey) {
-        event.preventDefault();
-        if (!event.repeat) this.send();
-      } else if (event.key === 'Escape' && this.model?.canInterrupt) {
-        event.preventDefault();
+      const action = resolveKey(event, {
+        menuOpen: false, canInterrupt: Boolean(this.model?.canInterrupt), canCycleMode: Boolean(this.model?.canCycleMode),
+        value: this.input.value, selectionStart: this.input.selectionStart, selectionEnd: this.input.selectionEnd,
+        browsingHistory: this.history.browsing, hasHistory: this.history.size > 0,
+      });
+      if (action === 'none') return;
+      event.preventDefault();
+      if (action === 'send') this.send();
+      else if (action === 'interrupt') {
         event.stopPropagation();
-        if (!event.repeat) this.requestInterrupt();
-      }
+        this.requestInterrupt();
+      } else if (action === 'historyPrev') this.recall(this.history.previous(this.input.value));
+      else if (action === 'historyNext') this.recall(this.history.next());
+      else if (action === 'cycleMode') this.post({ type: 'chatCycleMode' });
+      else if (action === 'toggleFolds') this.onToggleFolds?.();
     });
+  }
+
+  /** Set by the chat pane: Ctrl+O toggles eligible folded transcript rows. */
+  onToggleFolds?: () => void;
+
+  private recall(text: string | undefined): void {
+    if (text === undefined) return;
+    this.input.value = text;
+    this.input.setSelectionRange(text.length, text.length);
+    this.saveDraft();
+    this.slash.inputChanged();
   }
 
   update(model: ChatView, first: boolean): void {
     const active = document.activeElement;
     this.model = model;
+    this.history.seed(model.privateMode ? [] : model.rows.filter(row => row.role === 'user' && !row.state).map(row => row.text));
     if (first) {
       this.slash.reset();
       this.revision = model.revision;
@@ -118,13 +144,17 @@ export class Composer {
     this.retry.hidden = !model.canRetry || model.privateMode;
     this.scope.hidden = !model.canChooseScope;
 
+    this.statusLine.update(model.privateMode ? undefined : model.status);
+    const mode = model.privateMode ? undefined : model.status?.items.find(item => item.id === 'mode' && item.known)?.value;
+    if (mode && this.announcedMode !== undefined && mode !== this.announcedMode) this.modeNote.textContent = 'Permission mode: ' + mode;
+    this.announcedMode = mode ?? this.announcedMode;
     const status = stateLabel[model.state] + (model.canInterrupt ? ' · Esc to interrupt' : '');
     if (this.status.textContent !== status) this.status.textContent = status;
     this.status.dataset.state = model.state;
     const reason = model.privateMode ? 'Private display mode hides conversation content.' : clean(model.reason);
     if (this.reason.textContent !== reason) this.reason.textContent = reason;
     this.reason.hidden = !reason;
-    const hint = editable ? model.canSend ? 'Enter to send · / for commands · Shift+Enter for a new line' : '/ for commands' : '';
+    const hint = editable ? model.canSend ? 'Enter to send · Shift+Enter for a new line · Up for earlier prompts · / for commands · @ files: unavailable until attachments ship' : '/ for commands' : '';
     if (this.keys.textContent !== hint) this.keys.textContent = hint;
     this.updateSend();
 
@@ -164,6 +194,7 @@ export class Composer {
     this.input.focus({ preventScroll: true });
     if (this.slash.openForIncomplete()) return;
     this.slash.dismiss();
+    this.history.push(this.input.value);
     this.sentRevision = ++this.revision;
     this.post({ type: 'chatSend', revision: this.sentRevision, text: this.input.value });
     this.updateSend();

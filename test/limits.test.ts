@@ -1,7 +1,7 @@
 import { deepEqual, equal, ok } from 'node:assert/strict';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { parseRateLimitLine, probeArgs, probeSamples, profileEnv, UsageReport } from '../src/host/limits/claude-probe';
+import { claudeSearchDirectories, parseRateLimitLine, parseUsageReport, probeArgs, probeSamples, profileEnv, UsageReport } from '../src/host/limits/claude-probe';
 import { limitSamples, parseSnapshot, projectStatusLine, relayContext, sessionToken } from '../src/host/limits/claude-relay';
 import type { RelaySnapshot } from '../src/host/limits/claude-relay';
 import { buildGauges, compactGauges, latestSamples } from '../src/host/limits/model';
@@ -274,4 +274,37 @@ test('the refresh gate reports availability, progress and retryable errors', () 
   const gate = refreshGate(ready);
   equal(gate.enabled, true);
   ok(gate.reason.includes('/usage'));
+});
+
+test('the structured usage_report is decoded and wins over text', () => {
+  const report = {
+    rate_limits: { limits: [
+      { kind: 'session', percent: 18, resets_at: '2026-11-24T12:30:00.843771+00:00' },
+      { kind: 'weekly_all', percent: 16, resets_at: '2026-11-30T03:00:00.843796+00:00' },
+      { kind: 'weekly_opus', percent: 5, resets_at: '2026-11-30T03:00:00+00:00' },
+    ] },
+  };
+  const windows = parseUsageReport(report);
+  equal(windows?.fiveHour?.usedPercent, 18);
+  equal(windows?.sevenDay?.resetsAt, Date.parse('2026-11-30T03:00:00.843796+00:00'));
+  const reader = new UsageReport();
+  reader.read(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: usageText }] }, usage_report: report }), usageAt);
+  deepEqual(reader.finish(usageAt), { ok: true, windows, at: usageAt });
+});
+
+test('the structured usage_report drops invalid windows independently', () => {
+  const windows = parseUsageReport({ rate_limits: { limits: [
+    { kind: 'session', percent: 140, resets_at: '2026-11-24T12:30:00+00:00' },
+    { kind: 'weekly_all', percent: 16, resets_at: '2026-11-30T03:00:00+00:00' },
+  ] } });
+  equal(windows?.fiveHour, undefined);
+  equal(windows?.sevenDay?.usedPercent, 16);
+  equal(parseUsageReport({ rate_limits: { limits: [] } }), undefined);
+  equal(parseUsageReport(undefined), undefined);
+});
+
+test('Claude is searched in the installer folders even when PATH lacks them (Refresh limits root cause)', () => {
+  const directories = claudeSearchDirectories({ PATH: join('a', 'bin'), APPDATA: join('r', 'Roaming') }, join('h', 'user'));
+  deepEqual(directories, [join('a', 'bin'), join('h', 'user', '.local', 'bin'), join('r', 'Roaming', 'npm')]);
+  deepEqual(claudeSearchDirectories({}, 'h'), [join('h', '.local', 'bin')]);
 });

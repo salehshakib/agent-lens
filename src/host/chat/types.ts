@@ -67,6 +67,10 @@ type ChatUpdate =
   | { kind: 'interruptReceipt'; turnId: string; requestId: string; accepted: boolean }
   | { kind: 'result'; turnId: string; outcome: ChatOutcome; usage?: Tokens; reason?: string;
     compact?: CompactMeasurement; commandText?: string; effortAcknowledged?: boolean; errorKind?: 'limit' }
+  /** Account-wide limit windows from a per-turn `rate_limit_event`, not tied to a turn. */
+  | { kind: 'limits'; windows: import('../limits/claude-probe').ProbeWindows }
+  /** Permission mode the CLI reported in a `system/status` frame. */
+  | { kind: 'mode'; mode: string }
   | { kind: 'exit'; reason?: string };
 
 export type ChatEvent = ChatLaunch & ChatUpdate;
@@ -76,6 +80,8 @@ export interface ChatConnection {
   send(message: ChatSend): Promise<void>;
   interrupt(): Promise<string>;
   setModel?(model: string): Promise<string | undefined>;
+  /** Typed `set_permission_mode` control request. Resolves with the mode the CLI reported, or its error. */
+  setPermissionMode?(mode: string): Promise<{ mode?: string; error?: string }>;
   /** Close only this worker and resolve when it has exited. */
   close(): Promise<void>;
 }

@@ -416,6 +416,35 @@ export interface ChatRow {
   card?: ChatCard;
 }
 
+/** Live, owner-bound facts a chat worker reported. Absent fields are unknown, never guessed. */
+export interface ChatLive {
+  model?: string;
+  permissionMode?: string;
+  fastMode?: string;
+  /** Epoch milliseconds when the active turn was sent. */
+  turnStartedAt?: number;
+  /** Rows still waiting for delivery confirmation. */
+  pending: number;
+}
+
+/** One status-line item. `known` is false when the value is not reported, and `value` then says why. */
+export interface ChatStatusItem {
+  id: 'state' | 'profile' | 'elapsed' | 'model' | 'mode' | 'context' | 'tokens' | 'limit' | 'pending';
+  label: string;
+  value: string;
+  known: boolean;
+  /** Provenance and freshness, shown as a tooltip. */
+  detail?: string;
+  /** For the elapsed item: epoch milliseconds the webview counts from. */
+  since?: number;
+}
+
+export interface ChatStatus {
+  items: readonly ChatStatusItem[];
+  /** Whether the Esc hint applies to the current turn. */
+  interruptHint: boolean;
+}
+
 export interface ChatView {
   key: string;
   title: string;
@@ -433,10 +462,14 @@ export interface ChatView {
   canInterrupt: boolean;
   canRetry: boolean;
   canChooseScope: boolean;
+  /** Shift+Tab can send a verified permission-mode change now. */
+  canCycleMode?: boolean;
   privateMode: boolean;
   commands?: readonly SlashOption[];
   commandScope?: string;
   literalText?: boolean;
+  live?: ChatLive;
+  status?: ChatStatus;
 }
 
 export type PanelModel =
@@ -475,6 +508,7 @@ export type PanelRequest =
   | { type: 'chatCardAction'; id: string; input?: string }
   | { type: 'chatContinue' }
   | { type: 'chatInterrupt' }
+  | { type: 'chatCycleMode' }
   | { type: 'chatRetry' }
   | { type: 'chatChooseScope' }
   | { type: 'panelBack' }
@@ -553,7 +587,7 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   const type = (message as { type?: unknown }).type;
   if (type === 'ready' && shape(message, ['type'])) return { type };
   if (type === 'panelBack' && shape(message, ['type'])) return { type };
-  if ((type === 'chatContinue' || type === 'chatInterrupt' || type === 'chatRetry' || type === 'chatChooseScope')
+  if ((type === 'chatContinue' || type === 'chatInterrupt' || type === 'chatRetry' || type === 'chatChooseScope' || type === 'chatCycleMode')
     && shape(message, ['type'])) return { type };
   if ((type === 'chatDraft' || type === 'chatSend') && shape(message, ['type', 'revision', 'text'])
     && typeof message.revision === 'number' && Number.isSafeInteger(message.revision) && message.revision >= 0

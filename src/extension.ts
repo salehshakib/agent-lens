@@ -282,6 +282,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     recoveries,
     checkDelivery,
     persist: (attempt, remove) => persistAttempt(attemptDirectory, attempt, remove),
+    limits: (identity, windows, at) => relay.recordStream(identity.profile, identity.home, windows, at),
   });
   ownedChat = chat;
 

@@ -9,8 +9,12 @@ import { parseChatInput, slashCatalog } from './commands';
 import { canCheckFast, isVerifiedClaudeChat, normalizeEffortChoice, normalizeModelChoice } from '../adapters/claude-code/chat-settings';
 import { chatWriterKey, ChatOwnership, sameChatIdentity } from './ownership';
 import { ChatLaunchError } from './types';
+import { nextPermissionMode } from '../adapters/claude-code/chat';
+import { supportsClaudeCodeVersion } from '../adapters/claude-code/version';
 import type { ChatAdapter, ChatAttempt, ChatCapabilities, ChatConnection, ChatEvent, ChatIdentity, ChatLaunch, ChatScope,
   ChatSend, ChatSettings, CompactMeasurement } from './types';
+
+import type { ProbeWindows } from '../limits/claude-probe';
 
 export interface ChatSessionDeps {
   adapter(provider: Provider): ChatAdapter | undefined;
@@ -20,6 +24,8 @@ export interface ChatSessionDeps {
   recoveries?: readonly ChatAttempt[];
   checkDelivery(attempt: ChatAttempt): Promise<'confirmed' | 'absent' | 'unknown'>;
   claim?(launch: ChatLaunch): Promise<(() => Promise<void>) | undefined>;
+  /** Limit windows a verified owner's stream reported. The identity binds them to a profile and home. */
+  limits?(identity: ChatIdentity, windows: ProbeWindows, at: number): void;
 }
 
 export interface ChatPresentation {
@@ -36,7 +42,7 @@ export interface ChatPresentation {
 
 export type ChatRequest =
   | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
-  | { type: 'chatContinue' | 'chatInterrupt' | 'chatRetry' };
+  | { type: 'chatContinue' | 'chatInterrupt' | 'chatRetry' | 'chatCycleMode' };
 
 interface LiveRow extends ChatRow {
   truncated?: boolean;
@@ -75,6 +81,7 @@ interface Turn {
   command?: ChatSend['command'];
   effort?: string;
   textRows?: Set<string>;
+  startedAt?: number;
 }
 
 interface Interrupt {
@@ -114,6 +121,8 @@ interface Conversation {
   checking: boolean;
   reason?: string;
   model?: string;
+  /** Permission mode as the CLI last reported it. Never inferred from a request. */
+  reportedMode?: string;
   resolvedModel?: string;
   settings?: ChatSettings;
   compact?: CompactMeasurement;
@@ -418,11 +427,19 @@ export class ChatSessions {
       canContinue: Boolean(!presentation.privateMode && identity && !conversation.armed && !busy && !blockingReason),
       canInterrupt: Boolean(turn?.written && worker?.capabilities?.interrupt && !worker.closing && !worker.interrupt),
       canRetry: Boolean(!presentation.privateMode && turn?.delivery === 'uncertain' && !conversation.checking && !worker),
+      canCycleMode: this.canCycleMode(conversation, presentation.privateMode),
       canChooseScope: conversation.armed && !identity && !busy && !worker,
       privateMode: presentation.privateMode,
       commands: slashCatalog(this.commandState(key).capabilities, busy),
       commandScope: [presentation.project, presentation.provider, presentation.profile].filter(Boolean).join(' · '),
       literalText: !worker?.closing && worker?.capabilities?.literalText,
+      live: presentation.privateMode ? undefined : {
+        model: conversation.resolvedModel ?? (worker?.capabilities ? conversation.model : undefined),
+        permissionMode: worker?.capabilities ? conversation.reportedMode ?? worker.capabilities.permissionMode : undefined,
+        fastMode: worker?.capabilities?.fastMode,
+        turnStartedAt: turn?.written ? turn.startedAt : undefined,
+        pending: [...conversation.rows.values()].filter(row => row.state === 'pending').length,
+      },
     };
   }
 
@@ -445,6 +462,9 @@ export class ChatSessions {
         break;
       case 'chatInterrupt':
         await this.interrupt(conversation);
+        break;
+      case 'chatCycleMode':
+        await this.cycleMode(conversation);
         break;
     }
   }
@@ -618,6 +638,7 @@ export class ChatSessions {
     conversation.frozenHistory ??= new Set(conversation.history);
     conversation.history = [];
     turn.written = true;
+    turn.startedAt = Date.now();
     try {
       await worker.connection.send({ id, text, command });
     } catch {
@@ -677,9 +698,21 @@ export class ChatSessions {
       }
       worker.capabilities = event.capabilities;
       conversation.observedCapabilities = event.capabilities;
+      conversation.reportedMode = event.capabilities.permissionMode ?? conversation.reportedMode;
       conversation.model = event.model;
       conversation.identity = worker.launch.identity;
       this.changed(conversation);
+      return;
+    }
+    if (event.kind === 'mode') {
+      if (worker.capabilities) {
+        conversation.reportedMode = event.mode;
+        this.changed(conversation);
+      }
+      return;
+    }
+    if (event.kind === 'limits') {
+      if (worker.capabilities) this.deps.limits?.(worker.launch.identity, event.windows, Date.now());
       return;
     }
     const turn = conversation.turn;
@@ -783,6 +816,35 @@ export class ChatSessions {
     if (rows.length <= 12) return;
     const oldest = rows.find(row => row.id !== conversation.turn?.rowId);
     if (oldest) conversation.rows.delete(oldest.id);
+  }
+
+  private canCycleMode(conversation: Conversation, privateMode: boolean): boolean {
+    const { worker, turn } = conversation;
+    return Boolean(!privateMode && worker?.connection?.setPermissionMode && worker.capabilities?.nativeCommands
+      && supportsClaudeCodeVersion(worker.capabilities.version) && !worker.closing && !turn && !conversation.checking);
+  }
+
+  /** Shift+Tab. The shown mode changes only when the CLI reports it. */
+  private async cycleMode(conversation: Conversation): Promise<void> {
+    const { worker } = conversation;
+    if (!worker?.connection?.setPermissionMode || !this.canCycleMode(conversation, false)) return;
+    conversation.checking = true;
+    this.changed(conversation);
+    try {
+      const result = await worker.connection.setPermissionMode(nextPermissionMode(conversation.reportedMode));
+      if (conversation.worker !== worker || worker.closing) return;
+      if (result.mode) {
+        conversation.reportedMode = result.mode;
+        conversation.reason = undefined;
+      } else {
+        conversation.reason = result.error ?? 'The permission mode could not be changed.';
+      }
+    } catch {
+      conversation.reason = 'The permission mode could not be changed.';
+    } finally {
+      conversation.checking = false;
+      this.changed(conversation);
+    }
   }
 
   private async interrupt(conversation: Conversation): Promise<void> {

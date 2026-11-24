@@ -83,6 +83,14 @@ export class ChatPane {
     this.element = el('section', { cls: 'chat-pane', attrs: { 'aria-label': 'Conversation' } },
       el('div', { cls: 'chat-reading-pane' }, this.scroller,
         el('div', { cls: 'chat-jump-position' }, this.jump)), this.composer.element, this.updates, this.commandStatus);
+    this.composer.onToggleFolds = () => this.toggleFolds();
+    this.element.addEventListener('keydown', event => {
+      if (!event.defaultPrevented && event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey
+        && !event.isComposing && event.key.toLowerCase() === 'o') {
+        event.preventDefault();
+        this.toggleFolds();
+      }
+    });
     this.scroller.addEventListener('scroll', () => {
       if (this.hidden) return;
       this.following = this.nearBottom();
@@ -183,6 +191,14 @@ export class ChatPane {
 
   private focusInitial(): void {
     if (!this.composer.focus()) this.scroller.focus({ preventScroll: true });
+  }
+
+  /** Ctrl+O: open every eligible folded row, or close them all when each is already open. */
+  private toggleFolds(): void {
+    const folds = [...this.list.querySelectorAll('details')];
+    const open = folds.some(fold => !fold.open);
+    for (const fold of folds) fold.open = open;
+    this.commandStatus.textContent = folds.length ? (open ? 'Folded rows expanded.' : 'Folded rows collapsed.') : 'No folded rows.';
   }
 
   private renderRows(chat: ChatView): number {
