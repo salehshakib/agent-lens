@@ -10,23 +10,11 @@ import { accessError, inspectLocal, localPath, openLocalFile } from '../../disco
 import { profileEnv, resolveClaude } from '../../limits/claude-probe';
 import { record } from '../../privacy/projection';
 import { claudeDiagnostic, ClaudeChatStream, isClaudeSessionId, readClaudeFrames } from './stream';
+import { normalizeModelChoice, normalizeEffortChoice } from './chat-settings';
+import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './version';
 
 export { isClaudeSessionId } from './stream';
 
-/** Oldest version whose stream, resume and interrupt behaviour was verified (docs/plan/m2-compatibility.md). */
-const minVersion = [2, 1, 330] as const;
-const version = minVersion.join('.');
-
-/** Accept the verified version and newer ones: Claude Code updates itself, and the stream contract is additive. */
-function supportedVersion(output: string): boolean {
-  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+][\w.-]*)? \(Claude Code\)$/.exec(output);
-  if (!match) return false;
-  for (let index = 0; index < 3; index++) {
-    const part = Number(match[index + 1]);
-    if (part !== minVersion[index]) return part > minVersion[index]!;
-  }
-  return true;
-}
 const args = [
   '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
   '--include-partial-messages', '--replay-user-messages', '--permission-prompts', 'none',
@@ -128,7 +116,7 @@ async function checkWriter(identity: ChatIdentity): Promise<Writer> {
   }
 }
 
-async function verifiedExecutable(signal: AbortSignal): Promise<string> {
+export async function verifiedExecutable(signal: AbortSignal): Promise<{ path: string; version: string }> {
   const directories = (process.env.PATH ?? process.env.Path ?? '').split(delimiter).map(entry => entry.replace(/^"|"$/g, ''));
   directories.push(join(homedir(), '.local', 'bin'));
   if (process.env.APPDATA) directories.push(join(process.env.APPDATA, 'npm'));
@@ -147,13 +135,46 @@ async function verifiedExecutable(signal: AbortSignal): Promise<string> {
   } catch {
     throw new ChatLaunchError(signal.aborted ? unavailable : 'The installed Claude Code version could not be verified.');
   }
-  if (!supportedVersion(output)) throw new ChatLaunchError(`Agent Lens chat requires Claude Code ${version} or newer.`);
-  return executable;
+  const version = /^(\S+) \(Claude Code\)$/.exec(output)?.[1];
+  if (!version || !supportsClaudeCodeVersion(version)) {
+    throw new ChatLaunchError(`Agent Lens chat requires Claude Code ${minimumClaudeCodeVersion} or newer.`);
+  }
+  return { path: executable, version };
 }
 
-function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEvent) => void, signal: AbortSignal): Promise<ChatConnection> {
+export function modelControlFrame(id: string, model: string): string | undefined {
+  const value = normalizeModelChoice(model);
+  if (!isClaudeSessionId(id) || !value || value === 'default') return undefined;
+  return JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'set_model', model: value } }) + '\n';
+}
+
+export function officialResumeText(executable: string, id: string): string | undefined {
+  if (!isAbsolute(executable) || /[\r\n\0]/u.test(executable) || !isClaudeSessionId(id)) return undefined;
+  return "& '" + executable.replace(/'/g, "''") + "' --resume '" + id + "'";
+}
+
+export function startupSettings(launch: ChatLaunch): string[] {
+  const { model, effort } = launch.settings ?? {};
+  const argv: string[] = [];
+  if (model) {
+    if (normalizeModelChoice(model) !== model || model === 'default') throw new ChatLaunchError('Invalid requested model.');
+    argv.push('--model', model);
+  }
+  if (effort) {
+    if (normalizeEffortChoice(effort) !== effort || effort === 'default') throw new ChatLaunchError('Invalid requested effort.');
+    argv.push('--effort', effort);
+  }
+  return argv;
+}
+
+function openWorker(executable: { path: string; version: string }, launch: ChatLaunch, emit: (event: ChatEvent) => void, signal: AbortSignal): Promise<ChatConnection> {
   const { identity, resume } = launch;
-  const child = spawn(executable, [...args, '--permission-mode', permissionMode, resume ? '--resume' : '--session-id', identity.nativeId], {
+  const overrides = startupSettings(launch);
+  if (overrides.length && !supportsClaudeCodeVersion(executable.version)) {
+    throw new ChatLaunchError(`Startup model and effort overrides require Claude Code ${minimumClaudeCodeVersion} or newer.`);
+  }
+  const child = spawn(executable.path, [...args, '--permission-mode', permissionMode, ...overrides,
+    resume ? '--resume' : '--session-id', identity.nativeId], {
     cwd: identity.cwd, env: profileEnv(identity.home), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
   });
   const closed = deferred<void>();
@@ -170,11 +191,12 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
   let waitingForInterrupt: Promise<void> | undefined;
   let releaseInterrupt: (() => void) | undefined;
   let pendingWrite: { finish: (error?: Error) => void; promise: Promise<void> } | undefined;
+  let finishModelChange: ((model?: string) => void) | undefined;
 
   const stream = new ClaudeChatStream(launch, event => {
     if (event.kind === 'ready') clearTimeout(initializationTimer);
     emit(event);
-  }, close);
+  }, close, executable.version);
 
   function abort(): void { close(); }
 
@@ -185,6 +207,7 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
     clearTimeout(initializationTimer);
     clearTimeout(interruptTimer);
     releaseInterrupt?.();
+    finishModelChange?.();
     if (pendingWrite) {
       pendingWrite.finish(new Error(reason ?? unavailable));
       child.stdin.destroy();
@@ -223,8 +246,9 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
   const connection: ChatConnection = {
     async send(message) {
       if (waitingForInterrupt) await waitingForInterrupt;
-      if (closing || exited || pendingWrite || !child.stdin.writable) throw new Error(unavailable);
+      if (closing || exited || pendingWrite || finishModelChange || !child.stdin.writable) throw new Error(unavailable);
       if (stream.active) throw new Error('Claude Code is still processing the previous message.');
+      if (!stream.permits(message.command)) throw new Error('The command is unavailable on the current Claude Code channel.');
       if (!isClaudeSessionId(message.id) || typeof message.text !== 'string' || !message.text.trim()
           || message.text.length > maxInputBytes) throw new Error('The Claude Code message is empty or too large.');
       const line = JSON.stringify({ type: 'user', uuid: message.id,
@@ -232,7 +256,7 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
         message: { role: 'user', content: message.text },
       }) + '\n';
       if (Buffer.byteLength(line) > maxInputBytes) throw new Error('The Claude Code message is too large.');
-      stream.begin(message.id);
+      stream.begin(message.id, message.command, message.text);
       if (!stream.initialized) {
         initializationTimer = setTimeout(() => close('Claude Code did not initialize the selected conversation.'), 30_000);
         initializationTimer.unref();
@@ -256,6 +280,25 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
       interruptTimer.unref();
       await write(JSON.stringify({ type: 'control_request', request_id: requestId, request: { subtype: 'interrupt' } }) + '\n');
       return requestId;
+    },
+    async setModel(model) {
+      if (closing || exited || pendingWrite || finishModelChange || !child.stdin.writable) return undefined;
+      const id = randomUUID();
+      const frame = modelControlFrame(id, model);
+      if (!frame) return undefined;
+      const result = deferred<string | undefined>();
+      const finish = (resolved?: string) => {
+        if (finishModelChange !== finish) return;
+        finishModelChange = undefined;
+        clearTimeout(timer);
+        result.resolve(resolved);
+      };
+      if (!stream.beginModelChange(id, finish)) return undefined;
+      const timer = setTimeout(() => close('The model change was not confirmed. Check the conversation before retrying.'), 10_000);
+      timer.unref();
+      finishModelChange = finish;
+      await write(frame);
+      return result.promise;
     },
     close() {
       close();
@@ -306,6 +349,7 @@ function openWorker(executable: string, launch: ChatLaunch, emit: (event: ChatEv
     clearTimeout(interruptTimer);
     pendingWrite?.finish(new Error(unavailable));
     releaseInterrupt?.();
+    finishModelChange?.();
     const reason = closedReason ?? (closing ? undefined : stream.failure ?? diagnostics ?? (
       stream.active || ((code !== 0 || exitSignal) && !(code === 1 && stream.lastOutcome === 'interrupted'))
         ? 'Claude Code exited before it could finish the chat.' : undefined

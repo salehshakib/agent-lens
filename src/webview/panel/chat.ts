@@ -1,6 +1,7 @@
 import type { ChatRow, ChatView, PanelRequest } from '../../shared/protocol';
 import { button, clean, el } from '../dom';
 import { Composer } from './composer';
+import { renderChatCard } from './chat-cards';
 
 interface TranscriptRow {
   element: HTMLLIElement;
@@ -9,6 +10,7 @@ interface TranscriptRow {
   body: HTMLParagraphElement;
   content: Text;
   text?: string;
+  card?: { signature: string; element: HTMLElement };
 }
 
 export interface ChatPosition {
@@ -33,7 +35,7 @@ export function parseChatPosition(value: unknown): ChatPosition | undefined {
 }
 
 const roleLabel: Record<ChatRow['role'], string> = {
-  user: 'You', assistant: 'Assistant', tool: 'Tool', notice: 'Notice',
+  user: 'You', assistant: 'Assistant', tool: 'Tool', notice: 'Notice', error: 'Error',
 };
 
 const deliveryLabel: Record<NonNullable<ChatRow['state']>, string> = {
@@ -52,6 +54,8 @@ export class ChatPane {
     cls: 'chat-scroll', attrs: { role: 'region', 'aria-label': 'Conversation transcript', tabindex: 0 },
   }, this.empty, this.list);
   private readonly updates = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
+  private readonly commandStatus = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
+  private readonly announcements = new Map<string, string>();
   private readonly jump = button('Jump to latest', () => {
     this.scroller.focus({ preventScroll: true });
     this.followLatest();
@@ -69,7 +73,7 @@ export class ChatPane {
   private focusedControl?: HTMLElement;
 
   constructor(
-    post: (request: PanelRequest) => void,
+    private readonly post: (request: PanelRequest) => void,
     private readonly onPositionChange?: (position: ChatPosition | undefined) => void,
     initialPosition?: ChatPosition,
   ) {
@@ -77,7 +81,7 @@ export class ChatPane {
     this.startupPosition = this.savedPosition = parseChatPosition(initialPosition);
     this.element = el('section', { cls: 'chat-pane', attrs: { 'aria-label': 'Conversation' } },
       el('div', { cls: 'chat-reading-pane' }, this.scroller,
-        el('div', { cls: 'chat-jump-position' }, this.jump)), this.composer.element, this.updates);
+        el('div', { cls: 'chat-jump-position' }, this.jump)), this.composer.element, this.updates, this.commandStatus);
     this.scroller.addEventListener('scroll', () => {
       if (this.hidden) return;
       this.following = this.nearBottom();
@@ -100,6 +104,8 @@ export class ChatPane {
       this.startupPosition = undefined;
       this.key = chat.key;
       this.rows.clear();
+      this.announcements.clear();
+      this.commandStatus.textContent = '';
       this.list.replaceChildren();
       this.focusedControl = undefined;
       this.following = !this.anchor;
@@ -184,6 +190,7 @@ export class ChatPane {
       if (present.has(id)) continue;
       row.element.remove();
       this.rows.delete(id);
+      this.announcements.delete(id);
     }
     let fresh = 0;
     let before = this.list.firstElementChild;
@@ -204,7 +211,14 @@ export class ChatPane {
       else this.list.insertBefore(rendered.element, before);
 
       const author = row.role === 'assistant' && chat.provider ? clean(chat.provider) : roleLabel[row.role];
-      if (rendered.label.textContent !== author) rendered.label.textContent = author;
+      const label = row.card ? 'Agent Lens' : author;
+      if (rendered.label.textContent !== label) rendered.label.textContent = label;
+      this.updateCard(rendered, chat.privateMode ? undefined : row.card);
+      const announcement = chat.privateMode ? undefined : row.card?.announcement ?? (row.role === 'error' ? row.text : undefined);
+      if (announcement && this.announcements.get(row.id) !== announcement) {
+        this.announcements.set(row.id, announcement);
+        if (!this.hidden) this.commandStatus.textContent = clean(announcement);
+      }
       if (rendered.element.dataset.role !== row.role) rendered.element.dataset.role = row.role;
       const status = row.state ? deliveryLabel[row.state] : '';
       if (rendered.status.textContent !== status) rendered.status.textContent = status;
@@ -222,6 +236,38 @@ export class ChatPane {
       }
     }
     return fresh;
+  }
+
+  private updateCard(row: TranscriptRow, card: ChatRow['card']): void {
+    if (!card) {
+      row.card?.element.remove();
+      row.card = undefined;
+      return;
+    }
+    const signature = JSON.stringify(card);
+    if (row.card?.signature === signature) return;
+    const active = document.activeElement;
+    const element = renderChatCard(card, this.post);
+    if (row.card) {
+      const previous = row.card.element;
+      const key = active instanceof HTMLElement && previous.contains(active) ? active.dataset.key : undefined;
+      for (const input of previous.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input[data-key], textarea[data-key]')) {
+        const next = element.querySelector<HTMLInputElement | HTMLTextAreaElement>('[data-key="' + CSS.escape(input.dataset.key!) + '"]');
+        if (next && next.defaultValue === input.defaultValue) {
+          next.value = input.value;
+          next.setSelectionRange(input.selectionStart, input.selectionEnd);
+        }
+      }
+      previous.replaceWith(element);
+      if (key) {
+        const focus = element.querySelector<HTMLElement>('[data-key="' + CSS.escape(key) + '"]') ?? element;
+        if (focus === element) focus.tabIndex = -1;
+        focus.focus({ preventScroll: true });
+      }
+    } else {
+      row.element.append(element);
+    }
+    row.card = { signature, element };
   }
 
   private nearBottom(): boolean {

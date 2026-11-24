@@ -1,9 +1,10 @@
 import { TextDecoder } from 'node:util';
 import type { Readable } from 'node:stream';
-import type { ChatEvent, ChatLaunch } from '../../chat/types';
+import type { ChatEvent, ChatLaunch, ChatSend, CompactMeasurement } from '../../chat/types';
 import { localPath, pathKey } from '../../discovery/local-path';
 import { count, identifier, record, safeText } from '../../privacy/projection';
 import type { Tokens } from '../types';
+import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './version';
 
 const maxFrame = 1024 * 1024;
 const maxBlockText = 32 * 1024;
@@ -14,7 +15,7 @@ const maxRememberedRecords = 16_384;
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const signInReason = 'Claude Code could not authenticate. Sign in to Claude Code for this profile, then try again.';
-const versionReason = 'This Claude Code executable does not support the verified chat options. Chat requires Claude Code 2.1.330.';
+const versionReason = `This Claude Code executable does not support the chat options. Chat requires Claude Code ${minimumClaudeCodeVersion} or newer.`;
 const turnFailure = 'Claude Code did not complete this turn.';
 
 type Row = Record<string, unknown>;
@@ -111,10 +112,12 @@ function correlates(row: Row, turnId: string): boolean | undefined {
 }
 
 interface TextBlock {
+  messageId: string;
   source: string;
   shown: string;
   complete: boolean;
   lastUpdate: number;
+  heldLimit?: boolean;
 }
 
 interface Turn {
@@ -129,6 +132,16 @@ interface Turn {
   textBytes: number;
   messageId?: string;
   blockIndex?: number;
+  command?: ChatSend['command'];
+  effort?: string;
+  initialized?: boolean;
+  started?: boolean;
+  lifecycleCompleted?: boolean;
+  terminal?: { row: Row; id: string };
+  compacting?: boolean;
+  compactSucceeded?: boolean;
+  compact?: CompactMeasurement;
+  commandReplay?: boolean;
 }
 
 interface Interrupt {
@@ -145,11 +158,17 @@ export class ClaudeChatStream {
   private interruptSupported = false;
   private latestOutcome?: Extract<ChatEvent, { kind: 'result' }>['outcome'];
   private diagnostic?: string;
+  private model?: string;
+  private nativeCommands = false;
+  private fastCheck = false;
+  private modelControl?: { id: string; received: (model?: string) => void };
+  private lastResultId?: string;
 
   constructor(
     private readonly launch: ChatLaunch,
     private readonly emit: (event: ChatEvent) => void,
     private readonly close: (reason: string) => void,
+    private readonly version?: string,
   ) {}
 
   get initialized(): boolean { return this.ready; }
@@ -157,12 +176,17 @@ export class ClaudeChatStream {
   get lastOutcome() { return this.latestOutcome; }
   get failure(): string | undefined { return this.diagnostic; }
 
-  begin(id: string): void {
+  permits(command: ChatSend['command']): boolean {
+    return command === undefined || this.nativeCommands && (command !== 'fast' || this.fastCheck);
+  }
+
+  begin(id: string, command?: ChatSend['command'], input?: string): void {
     this.diagnostic = undefined;
     this.latestOutcome = undefined;
     this.turn = {
       id, acknowledged: false, interrupted: false,
       records: new Set(), blocks: new Map(), tools: new Map(), textBytes: 0,
+      command, effort: command === 'effort' ? input?.slice('/effort '.length) : undefined,
     };
   }
 
@@ -170,6 +194,12 @@ export class ClaudeChatStream {
     if (!this.turn || !this.interruptSupported || this.control) return false;
     this.turn.interruptRequested = true;
     this.control = { id, turnId: this.turn.id, received };
+    return true;
+  }
+
+  beginModelChange(id: string, received: (model?: string) => void): boolean {
+    if (!this.ready || !this.nativeCommands || this.turn || this.control || this.modelControl || !isClaudeSessionId(id)) return false;
+    this.modelControl = { id, received };
     return true;
   }
 
@@ -196,6 +226,10 @@ export class ClaudeChatStream {
     }
     const turn = this.turn;
     if (!turn || row.parent_tool_use_id) return;
+    if (row.type === 'command_lifecycle') {
+      if (row.session_id === undefined || row.session_id === this.launch.identity.nativeId) this.lifecycle(turn, row);
+      return;
+    }
     const isInit = row.type === 'system' && row.subtype === 'init';
     if (row.session_id !== this.launch.identity.nativeId) {
       if (isInit) this.close('Claude Code opened a different session. Verify the selected conversation before retrying.');
@@ -208,11 +242,26 @@ export class ClaudeChatStream {
     const match = correlates(row, turn.id);
     if (match === false) return;
     if (isInit) {
-      this.initialize(row);
+      this.initialize(turn, row);
       return;
     }
     if (!this.ready) {
       if (row.type === 'result' && row.is_error === true) this.close(this.resultError(row) ?? turnFailure);
+      return;
+    }
+    if (this.nativeCommands && turn.initialized && row.type === 'system' && (turn.started || turn.acknowledged)) {
+      this.compactFrame(turn, row);
+      return;
+    }
+    if (row.type === 'user' && row.isReplay === true && row.uuid === turn.id) {
+      this.user(turn, row);
+      return;
+    }
+    if (this.nativeCommands && turn.initialized && row.type === 'result') {
+      const id = isClaudeSessionId(row.uuid) ? row.uuid : turn.id;
+      if (id === this.lastResultId || !(match || turn.started || turn.acknowledged || limitReason(row.result))) return;
+      if (match || turn.lifecycleCompleted) this.result(turn, row, id);
+      else turn.terminal ??= { row, id };
       return;
     }
     const frameId = isClaudeSessionId(row.uuid) ? row.uuid : undefined;
@@ -234,24 +283,46 @@ export class ClaudeChatStream {
     }
   }
 
-  private initialize(row: Row): void {
+  private initialize(turn: Turn, row: Row): void {
     const cwd = localPath(row.original_cwd ?? row.cwd);
     const effective = localPath(row.cwd);
     if (!cwd || !effective || pathKey(cwd) !== pathKey(this.launch.identity.cwd) || pathKey(effective) !== pathKey(cwd)) {
       this.close('Claude Code opened a different project folder. Verify the selected workspace before retrying.');
       return;
     }
-    const interrupt = Array.isArray(row.capabilities) && row.capabilities.slice(0, 256).includes('interrupt_receipt_v1');
+    const capabilities = Array.isArray(row.capabilities) ? row.capabilities.slice(0, 256) : [];
+    const interrupt = capabilities.includes('interrupt_receipt_v1');
+    const supportedExecutable = supportsClaudeCodeVersion(this.version);
+    const verified = supportedExecutable && supportsClaudeCodeVersion(row.claude_code_version)
+      && capabilities.includes('msg_lifecycle_v1') && Array.isArray(row.terminal_slash_commands);
+    this.nativeCommands = verified;
+    this.fastCheck = verified && row.fast_mode_state === 'off' && row.fast_mode_disabled_reason === 'extra_usage_disabled';
+    turn.initialized = true;
     this.ready = true;
     this.interruptSupported = interrupt;
     const model = identifier(row.model);
+    this.model = model;
     this.publish({ kind: 'ready', nativeId: this.launch.identity.nativeId,
-      capabilities: { send: true, interrupt, commands: names(row.slash_commands), skills: names(row.skills) },
+      capabilities: { send: true, interrupt, commands: names(row.slash_commands), skills: names(row.skills),
+        version: this.version, literalText: supportedExecutable, nativeCommands: verified,
+        terminalCommands: verified ? names(row.terminal_slash_commands) : undefined,
+        permissionMode: identifier(row.permissionMode),
+        effortActive: verified && row.per_turn_effort_active === true,
+        ultrathinkAvailable: verified && row.ultrathink_available === true,
+        fastMode: verified ? identifier(row.fast_mode_state) : undefined,
+        fastDisabledReason: verified ? identifier(row.fast_mode_disabled_reason) : undefined },
       ...(model ? { model } : {}),
     });
+    if (verified && turn.started) this.acknowledge(turn);
   }
 
   private receipt(response: Row | undefined): void {
+    const model = this.modelControl;
+    if (model && response?.request_id === model.id && (response.subtype === 'success' || response.subtype === 'error')) {
+      this.modelControl = undefined;
+      model.received(response.subtype === 'success' ? identifier(record(response.response)?.model) : undefined);
+      return;
+    }
     const control = this.control;
     if (!control || response?.request_id !== control.id || (response.subtype !== 'success' && response.subtype !== 'error')) return;
     this.control = undefined;
@@ -259,14 +330,49 @@ export class ClaudeChatStream {
     this.publish({ kind: 'interruptReceipt', turnId: control.turnId, requestId: control.id, accepted: response.subtype === 'success' });
   }
 
+  private acknowledge(turn: Turn): void {
+    if (turn.acknowledged) return;
+    turn.acknowledged = true;
+    this.publish({ kind: 'ack', turnId: turn.id, messageId: turn.id });
+  }
+
+  private lifecycle(turn: Turn, row: Row): void {
+    if (!supportsClaudeCodeVersion(this.version) || row.command_uuid !== turn.id) return;
+    if (row.state === 'started') {
+      turn.started = true;
+      if (turn.initialized && this.nativeCommands) this.acknowledge(turn);
+    } else if (row.state === 'completed') {
+      turn.lifecycleCompleted = true;
+      if (turn.initialized && this.nativeCommands && turn.terminal && turn.acknowledged) {
+        this.result(turn, turn.terminal.row, turn.terminal.id);
+      }
+    }
+  }
+
+  private compactFrame(turn: Turn, row: Row): void {
+    if (turn.command !== 'compact') return;
+    if (row.subtype === 'status') {
+      if (row.status === 'compacting') turn.compacting = true;
+      if (turn.compacting && row.status === null && row.compact_result === 'success') turn.compactSucceeded = true;
+    } else if (row.subtype === 'compact_boundary' && turn.compactSucceeded) {
+      const metadata = record(row.compact_metadata);
+      const preTokens = count(metadata?.pre_tokens);
+      const postTokens = count(metadata?.post_tokens);
+      if (metadata?.trigger === 'manual' && preTokens !== undefined && postTokens !== undefined) {
+        turn.compact = { preTokens, postTokens, at: Date.now() };
+      }
+    }
+  }
+
   private user(turn: Turn, row: Row): void {
     const message = record(row.message);
     if (message?.role !== 'user') return;
     if (row.isReplay === true) {
-      if (!turn.acknowledged && row.uuid === turn.id) {
-        turn.acknowledged = true;
-        this.publish({ kind: 'ack', turnId: turn.id, messageId: turn.id });
-      }
+      if (row.uuid !== turn.id) return;
+      if (turn.effort && typeof message.content === 'string'
+        && message.content.includes('<command-name>/effort</command-name>')
+        && message.content.includes('<command-args>' + turn.effort + '</command-args>')) turn.commandReplay = true;
+      this.acknowledge(turn);
       return;
     }
     if (!Array.isArray(message.content)) return;
@@ -333,6 +439,11 @@ export class ClaudeChatStream {
     const message = record(row.message);
     const messageId = identifier(message?.id);
     if (!messageId || message?.role !== 'assistant' || !Array.isArray(message.content)) return;
+    const model = identifier(message.model);
+    if (model && model !== this.model) {
+      this.model = model;
+      this.publish({ kind: 'model', turnId: turn.id, model });
+    }
     // Claude sends a complete assistant record per block while streaming, including later block indices.
     const firstIndex = message.content.length === 1 && turn.messageId === messageId ? turn.blockIndex ?? 0 : 0;
     for (const [offset, item] of message.content.slice(0, maxBlocks).entries()) {
@@ -349,7 +460,7 @@ export class ClaudeChatStream {
     if (block?.complete) return;
     if (!block) {
       if (turn.blocks.size >= maxBlocks) return;
-      block = { source: '', shown: '', complete: false, lastUpdate: 0 };
+      block = { messageId, source: '', shown: '', complete: false, lastUpdate: 0 };
       turn.blocks.set(key, block);
     }
     const source = complete ? value : block.source + value;
@@ -369,13 +480,20 @@ export class ClaudeChatStream {
     if (block) this.showText(turn, messageId, key, block, Date.now());
   }
 
-  private showText(turn: Turn, messageId: string, blockId: string, block: TextBlock, at: number): void {
+  private showText(turn: Turn, messageId: string, blockId: string, block: TextBlock, at: number, releaseLimit = false): void {
     const text = safeText(block.source.replace(/[\uD800-\uDBFF]$/, ''), maxBlockText) ?? '';
     block.lastUpdate = at;
+    if (!releaseLimit && text && (limitReason(text) || (!block.complete
+      && ("You've hit your 5-hour limit".startsWith(text) || 'You’ve hit your 5-hour limit'.startsWith(text))))) {
+      block.heldLimit = true;
+      return;
+    }
+    block.heldLimit = false;
     if (text === block.shown) return;
     const append = text.startsWith(block.shown);
     const update = append ? text.slice(block.shown.length) : text;
     block.shown = text;
+    if (turn.command && turn.command !== 'native') return;
     this.publish({ kind: 'text', turnId: turn.id, messageId, blockId, mode: append ? 'append' : 'replace', text: update });
   }
 
@@ -394,6 +512,8 @@ export class ClaudeChatStream {
   }
 
   private resultError(row: Row): string | undefined {
+    const limited = limitReason(row.result);
+    if (limited) return limited;
     const errors = Array.isArray(row.errors) ? row.errors.slice(0, 16) : [];
     for (const value of [row.error, row.result, ...errors]) {
       const error = record(value);
@@ -413,16 +533,37 @@ export class ClaudeChatStream {
       }
     }
     if (turn.messageId && turn.blockIndex !== undefined) this.flushText(turn, turn.messageId, turn.blockIndex);
-    const completed = row.subtype === 'success' && row.is_error !== true;
+    if (turn.command && turn.command !== 'native' && ![...turn.blocks.values()].some(block => block.shown)) {
+      this.text(turn, frameId, 0, row.result, true);
+    }
+    const compact = turn.command === 'compact' ? turn.compact : undefined;
+    const completed = row.subtype === 'success' && row.is_error !== true && (turn.command !== 'compact' || Boolean(compact));
+    if (completed) {
+      for (const [key, block] of turn.blocks) {
+        if (block.heldLimit) this.showText(turn, block.messageId, key, block, Date.now(), true);
+      }
+    }
     const reason = completed ? undefined : this.resultError(row) ?? turn.failure ?? this.diagnostic;
     const outcome = completed ? 'completed' : turn.interrupted ? 'interrupted' : 'failed';
     const usage = resultUsage(row.usage);
+    const commandText = turn.command && turn.command !== 'native'
+      ? safeText([...turn.blocks.values()].map(block => block.shown).filter(Boolean).join('\n'), 1000) : undefined;
+    const effortAcknowledged = completed && turn.commandReplay && row.num_turns === 0 && turn.effort
+      && commandText?.startsWith('Set effort level to ' + turn.effort + ' (this session only)');
     // Some successful native commands return only a result string and no assistant blocks.
     if (completed && ![...turn.blocks.values()].some(block => block.shown)) this.text(turn, frameId, 0, row.result, true);
     this.latestOutcome = outcome;
+    this.lastResultId = frameId;
     this.turn = undefined;
-    this.publish({ kind: 'result', turnId: turn.id, outcome, ...(usage ? { usage } : {}),
-      ...(outcome === 'failed' ? { reason: reason ?? turnFailure } : {}),
+    this.publish({ kind: 'result', turnId: turn.id, outcome, usage, commandText, effortAcknowledged: Boolean(effortAcknowledged),
+      compact: completed ? compact : undefined, errorKind: row.is_error === true && limitReason(row.result) ? 'limit' : undefined,
+      ...(outcome === 'failed' ? { reason: reason ?? (turn.command === 'compact'
+        ? 'Compaction did not report a verified context measurement.' : turnFailure) } : {}),
     });
   }
+}
+
+function limitReason(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^You['’]ve hit your 5-hour limit\b/u.test(value)) return undefined;
+  return safeText(value, 220);
 }

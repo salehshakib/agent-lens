@@ -1,26 +1,28 @@
 import { basename } from 'node:path';
 import type { Provider } from '../adapters/types';
-import type { ChatScope } from '../chat/types';
+import type { ChatScope, CompactMeasurement } from '../chat/types';
 import type { ChatPresentation } from '../chat/session';
 import { safeText } from '../privacy/projection';
 import { profileKey } from '../accounts/profiles';
 import { buildAccounts, profileOptions } from '../accounts/view';
-import { relayContext } from '../limits/claude-relay';
+import { limitSamples as relaySamples, relayContext } from '../limits/claude-relay';
 import type { RelaySnapshot } from '../limits/claude-relay';
 import { buildGauges } from '../limits/model';
 import type { Gauge, LimitSample } from '../limits/model';
 import type { RefreshGate } from '../limits/refresh';
 import type { Session } from '../sessions/types';
+import { pathKey } from '../discovery/local-path';
 import type { Thresholds } from './signal-models';
 import type { UsageTotal } from '../usage/ledger';
 import type {
-  ChatRow, ChatView, Filters, GaugeView, PanelModel, ParentInfo, RelayView, SessionRow, SidebarModel, SourceView,
+  ChatRow, ChatView, Filters, GaugeView, PanelModel, ParentInfo, RelayView, SessionDetail, SessionRow, SidebarModel, SourceView,
   UsageFilters, UsageModel,
 } from '../../shared/protocol';
 import {
   buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, namesFor, providerLabels,
 } from './models';
 import { laneContext, parentInfo } from './signal-models';
+import { chatContextEvidence } from './chat-cards';
 import type { ContextCandidate } from './alerts';
 
 export interface ProfileInfo {
@@ -75,6 +77,36 @@ export class LensData {
   private views(gauges: readonly Gauge[]): GaugeView[] {
     const labels = new Map(this.deps.profiles().map(profile => [profile.provider + '\n' + profile.id, profile.label]));
     return gauges.map(gauge => ({ ...gaugeView(gauge), profile: labels.get(gauge.provider + '\n' + gauge.profile) ?? gauge.profile }));
+  }
+
+  chatGauges(scope: ChatScope | undefined, session: Session | undefined): GaugeView[] {
+    const provider = session ? session.provider : scope?.provider;
+    const id = session ? session.profile : scope?.profile;
+    const profile = this.deps.profiles().find(item => item.provider === provider && item.id === id
+      && (!scope || (scope.provider === item.provider && scope.profile === item.id && pathKey(scope.home) === pathKey(item.home))));
+    if (!profile) return [];
+    const observed = this.deps.limitSamples().filter(sample => sample.provider === profile.provider && sample.profile === profile.id);
+    const relay = profile.provider === 'claude-code' ? this.deps.relay(profile.id) : undefined;
+    const statusLine = relay ? relaySamples(relay.snapshots, profile.id) : [];
+    const { main } = buildGauges([{ provider: profile.provider, profile: profile.id }], [...observed, ...relay?.samples ?? []], this.deps.now());
+    return main.map(gauge => {
+      const match = (sample: LimitSample) => sample.minutes === gauge.minutes && sample.at === gauge.observedAt
+        && sample.resetsAt === gauge.resetsAt && (gauge.percent === undefined || sample.usedPercent === gauge.percent);
+      const source = gauge.observedAt === undefined ? undefined : statusLine.some(match) ? 'Status-line relay'
+        : observed.some(match) ? 'Recorded runtime observation' : 'Agent Lens limits refresh';
+      return { ...gaugeView(gauge), profile: profile.label, source };
+    });
+  }
+
+  chatContext(session: Session, detail: SessionDetail, scope: ChatScope | undefined, laneId?: string, compact?: CompactMeasurement) {
+    const lane = laneId ? session.lanes.find(item => item.id === laneId) : session.lanes[0];
+    if (!lane) return undefined;
+    const profile = this.deps.profiles().find(item => item.provider === 'claude-code' && item.id === session.profile);
+    const relay = session.provider === 'claude-code' && lane === session.lanes[0] && profile
+      && (!scope || pathKey(scope.home) === pathKey(profile.home))
+      ? relayContext(this.deps.relay(profile.id).snapshots, session.nativeId, this.deps.now()) : undefined;
+    return chatContextEvidence(session, lane, detail.lanes.find(item => item.id === lane.id)?.label ?? 'Main lane',
+      relay, this.deps.thresholds?.(), compact);
   }
 
   /** Providers shown in the quota rows. A provider without a profile is skipped. */

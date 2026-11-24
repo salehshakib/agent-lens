@@ -12,6 +12,7 @@ export interface GaugeView {
   percent?: number;
   resetsAt?: number;
   observedAt?: number;
+  source?: string;
   reason: string;
   bucket?: string;
 }
@@ -355,11 +356,46 @@ export interface UsageModel {
   refresh: { enabled: boolean; reason: string };
 }
 
+export interface SlashOption {
+  name: string;
+  description: string;
+  arguments?: string;
+  route: 'Local' | 'Native' | 'Official terminal';
+  reason?: string;
+}
+
+export interface ChatCardAction {
+  id: string;
+  label: string;
+  input?: { label: string; value?: string; maxLength: number; multiline?: boolean };
+}
+
+export interface ChatCardEntry {
+  title: string;
+  detail?: string;
+  actions?: readonly ChatCardAction[];
+}
+
+export interface ChatCard {
+  title: string;
+  scope: string;
+  state: 'loading' | 'ready' | 'empty' | 'unavailable' | 'denied' | 'changed';
+  message?: string;
+  /** Announce completed or failed results without announcing each live update. */
+  announcement?: string;
+  entries?: readonly ChatCardEntry[];
+  actions?: readonly ChatCardAction[];
+  gauges?: readonly GaugeView[];
+  usage?: UsageView;
+  diff?: readonly { heading: string; lines: readonly { text: string; before?: number; after?: number }[] }[];
+}
+
 export interface ChatRow {
   id: string;
-  role: 'user' | 'assistant' | 'tool' | 'notice';
+  role: 'user' | 'assistant' | 'tool' | 'notice' | 'error';
   text: string;
   state?: 'pending' | 'failed' | 'uncertain';
+  card?: ChatCard;
 }
 
 export interface ChatView {
@@ -380,6 +416,9 @@ export interface ChatView {
   canRetry: boolean;
   canChooseScope: boolean;
   privateMode: boolean;
+  commands?: readonly SlashOption[];
+  commandScope?: string;
+  literalText?: boolean;
 }
 
 export type PanelModel =
@@ -395,7 +434,8 @@ export type PanelTab = 'chat' | 'timeline' | 'map' | 'files' | 'usage' | 'tasks'
 export type HostMessage =
   | { type: 'sidebar'; model: SidebarModel }
   /** `tab` is set only when the host opens the panel on a specific tab. `focus` is set when Open parent targets a row. */
-  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean };
+  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean;
+    files?: { search: string; kind: 'all' | 'changed' | 'read' | 'mentioned' } };
 
 export type SidebarRequest =
   | { type: 'ready' }
@@ -414,6 +454,7 @@ export type SidebarRequest =
 export type PanelRequest =
   | { type: 'ready' }
   | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
+  | { type: 'chatCardAction'; id: string; input?: string }
   | { type: 'chatContinue' }
   | { type: 'chatInterrupt' }
   | { type: 'chatRetry' }
@@ -499,6 +540,11 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   if ((type === 'chatDraft' || type === 'chatSend') && shape(message, ['type', 'revision', 'text'])
     && typeof message.revision === 'number' && Number.isSafeInteger(message.revision) && message.revision >= 0
     && text(message.text, maxChatDraft)) return { type, revision: message.revision, text: message.text };
+  if (type === 'chatCardAction' && (shape(message, ['type', 'id']) || shape(message, ['type', 'id', 'input']))
+    && typeof message.id === 'string' && actionId.test(message.id)) {
+    if (!('input' in message)) return { type, id: message.id };
+    if (text(message.input, maxChatDraft)) return { type, id: message.id, input: message.input };
+  }
   if ((type === 'openFile' || type === 'openDiff') && shape(message, ['type', 'id']) && typeof message.id === 'string'
     && actionId.test(message.id)) return { type, id: message.id };
   if (type === 'openTranscript' && shape(message, ['type', 'session', 'lane']) && typeof message.session === 'string'

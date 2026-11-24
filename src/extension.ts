@@ -1,3 +1,4 @@
+import { createHmac, randomUUID } from 'node:crypto';
 import { mkdir, opendir, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -6,10 +7,16 @@ import type { ExtensionContext, WebviewPanel } from 'vscode';
 import { statusTerminal } from './host/accounts/terminal';
 import { profileKey } from './host/accounts/profiles';
 import { adapters } from './host/adapters/registry';
-import { isClaudeSessionId, setChatPermissionMode } from './host/adapters/claude-code/chat';
+import { isClaudeSessionId, officialResumeText, setChatPermissionMode, verifiedExecutable } from './host/adapters/claude-code/chat';
+import { canCheckFast, claudeChatSettings } from './host/adapters/claude-code/chat-settings';
+import type { ChatSettingCommand } from './host/adapters/claude-code/chat-settings';
+import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './host/adapters/claude-code/version';
 import type { Adapter, Provider, Source } from './host/adapters/types';
+import { parseChatInput, slashCatalog, slashSuggestions, terminalHandoffReason } from './host/chat/commands';
+import { codexLinkedRuns, codexStartReason, unverifiedCodexRun } from './host/chat/codex-launch';
 import { claimChatWriter } from './host/chat/ownership';
 import { ChatSessions } from './host/chat/session';
+import type { LocalChatRow } from './host/chat/session';
 import type { ChatAttempt, ChatIdentity, ChatLaunch, ChatScope } from './host/chat/types';
 import { accessError, inspectLocal, localPath, openLocalFile, pathKey } from './host/discovery/local-path';
 import { RootObservation } from './host/discovery/observation';
@@ -17,23 +24,47 @@ import { SourceReader } from './host/discovery/reader';
 import { configureRoots } from './host/discovery/roots';
 import type { RootConfiguration } from './host/discovery/roots';
 import { registerFileActions } from './host/files/actions';
+import { profileEnv } from './host/limits/claude-probe';
 import { RelayManager } from './host/limits/manager';
 import type { RelayProfile } from './host/limits/manager';
 import { refreshGate } from './host/limits/refresh';
+import { safeText } from './host/privacy/projection';
 import { claudeTaskRoot } from './host/sessions/delegation';
 import { key as sessionKey, sourceSessionId } from './host/sessions/evidence';
+import { resolveProject } from './host/sessions/project';
 import { defaultSignalSettings, parseSignalSettings } from './host/sessions/signals';
 import type { SignalSettings } from './host/sessions/signals';
 import { SessionStore } from './host/sessions/store';
-import type { Session } from './host/sessions/types';
+import type { RowRef, Session } from './host/sessions/types';
 import { alertText, ContextAlerts } from './host/views/alerts';
+import { compactChatCard, compactContextEvidence, projectChatCard } from './host/views/chat-cards';
+import type { ChatCardTarget, InspectionCommand } from './host/views/chat-cards';
 import { LensData } from './host/views/data';
 import type { ProfileInfo } from './host/views/data';
+import { namesFor, projectLabel, providerLabels } from './host/views/models';
 import { PanelView } from './host/views/panel';
 import type { ChatPanelRequest, PanelTarget } from './host/views/panel';
 import { SidebarView } from './host/views/sidebar';
 import { StatusView } from './host/views/status';
-import type { PanelTab, SourceView } from './shared/protocol';
+import { maxSearch } from './shared/protocol';
+import type { ChatCard, ChatCardAction, ChatCardEntry, ChatView, PanelTab, SessionDetail, SourceView } from './shared/protocol';
+
+type CommandTarget = ChatCardTarget
+  | { kind: 'allProjects' | 'moreHistory' | 'historySearch' | 'chooseProject' | 'sendAsText' | 'openAllProjects' }
+  | { kind: 'releaseTerminal' | 'openTerminal'; command: string }
+  | { kind: 'applySetting'; setting: ChatSettingCommand; value: string }
+  | { kind: 'continue'; session: string }
+  | { kind: 'parked'; key: string }
+  | { kind: 'codexOrigin'; origin: RowRef }
+  | { kind: 'codexFollow'; target: RowRef; origin: RowRef; turn: string };
+
+interface CommandGrant {
+  row: string;
+  target: CommandTarget;
+  input?: ChatCardAction['input'];
+}
+
+const inspectionCommands = new Set<string>(['usage', 'context', 'agents', 'files', 'diff', 'tasks', 'status']);
 
 const catalogKey = /^[a-f0-9]{32}$/;
 const chatProvider: Provider = 'claude-code';
@@ -346,15 +377,16 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     return profiles().filter(profile => profile.provider === chatProvider);
   }
 
-  function newChat(): void {
+  function newChat(preferredCwd?: string): void {
     const workspaces = workspaceChoices();
     const active = window.activeTextEditor?.document.uri;
     const activeFolder = active && workspace.getWorkspaceFolder(active);
-    const folder = workspaces.length === 1 ? workspaces[0]
+    const preferred = preferredCwd && workspace.isTrusted && workspace.getWorkspaceFolder(Uri.file(preferredCwd))?.uri.scheme === 'file';
+    const folder = preferred ? { cwd: preferredCwd } : workspaces.length === 1 ? workspaces[0]
       : workspaces.find(item => activeFolder && pathKey(item.cwd) === pathKey(activeFolder.uri.fsPath));
     const eligible = chatProfiles();
     const profile = eligible.find(item => item.id === 'default') ?? (eligible.length === 1 ? eligible[0] : undefined);
-    const scope = folder && profile ? { provider: profile.provider, profile: profile.id, home: profile.home, cwd: folder.cwd } : undefined;
+    const scope = folder?.cwd && profile ? { provider: profile.provider, profile: profile.id, home: profile.home, cwd: folder.cwd } : undefined;
     panel.show({ kind: 'chat', key: chat.create(scope), tab: 'chat' });
   }
 
@@ -370,11 +402,420 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     if (profile) chat.setScope(key, { provider: profile.provider, profile: profile.id, home: profile.home, cwd: folder.cwd });
   }
 
-  function chatRequest(key: string, request: ChatPanelRequest): void {
-    if (request.type === 'chatChooseScope') {
-      void chooseScope(key);
-    } else if (request.type === 'chatInterrupt' || !privateMode()) {
+
+  const actionSecret = randomUUID();
+  const cardGrants = new Map<string, Map<string, CommandGrant>>();
+  const runningCardActions = new Set<string>();
+  let commandGeneration = 0;
+
+  function commandScope(view: ChatView): string {
+    return view.commandScope || 'Current conversation';
+  }
+
+  function handoffState(key: string) {
+    const identity = chat.identity(key);
+    const state = chat.commandState(key);
+    return {
+      trusted: workspace.isTrusted,
+      exactSession: identity?.provider === 'claude-code' && isClaudeSessionId(identity.nativeId),
+      approvedProfile: Boolean(identity && approvedProfile(identity)),
+      localProject: Boolean(identity && workspace.getWorkspaceFolder(Uri.file(identity.cwd))?.uri.scheme === 'file'),
+      owner: Boolean(state.owner),
+      busy: state.busy,
+    };
+  }
+
+  async function openOfficialTerminal(key: string, generation: number): Promise<string | undefined> {
+    return chat.prepareTerminal(key, async launch => {
+      if (process.platform !== 'win32') return 'The verified official terminal route requires Windows.';
+      const systemRoot = process.env.SystemRoot;
+      const shell = systemRoot && localPath(join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'));
+      if (!shell) return 'Windows PowerShell is unavailable for the official terminal.';
+      await inspectLocal(shell, 'file');
+      const executable = await verifiedExecutable(AbortSignal.timeout(8_000));
+      if (!supportsClaudeCodeVersion(executable.version)) return `The official terminal handoff requires Claude Code ${minimumClaudeCodeVersion} or newer.`;
+      const text = officialResumeText(executable.path, launch.identity.nativeId);
+      if (!text) return 'The official executable or exact session could not be verified.';
+      const writer = await adapterFor(launch.identity.provider)?.chat?.checkWriter?.(launch.identity);
+      if (privateMode() || generation !== commandGeneration) return 'The chat scope changed before the terminal could open.';
+      const reason = terminalHandoffReason({ ...handoffState(key), busy: false, writer });
+      if (reason) return reason;
+      const env = { CLAUDE_CONFIG_DIR: profileEnv(launch.identity.home, {}).CLAUDE_CONFIG_DIR ?? null };
+      const terminal = window.createTerminal({ name: 'Agent Lens: Official terminal', cwd: launch.identity.cwd,
+        env, shellPath: shell, shellArgs: ['-NoLogo', '-NoProfile'] });
+      terminal.sendText(text, false);
+      terminal.show();
+      return undefined;
+    });
+  }
+
+  function resumeCard(key: string, command: LocalChatRow, scope: ChatScope | undefined, project: string | undefined,
+    sessions: readonly Session[], label: string, action: (target: CommandTarget, name: string, input?: ChatCardAction['input']) => ChatCardAction): ChatCard {
+    const actions = [action({ kind: 'historySearch' }, 'Search history', {
+      label: 'Title or project', value: command.argument, maxLength: maxSearch,
+    })];
+    if (!command.allProjects) actions.push(action({ kind: 'allProjects' }, 'All projects'));
+    if (!project || command.allProjects) actions.push(action({ kind: 'chooseProject' }, 'Choose workspace folder'));
+    const names = namesFor(false);
+    const filter = command.argument.toLowerCase();
+    const matches = (title: string, path: string) => !filter || (title + '\n' + path).toLowerCase().includes(filter);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const entries: ChatCardEntry[] = [];
+    if (!command.allProjects && !project) {
+      return { title: 'Resume', scope: label, state: 'empty', message: 'Choose a workspace folder or browse All projects.', actions };
+    }
+    const projectCwd = command.resumeFolder?.cwd ?? scope?.cwd;
+    for (const parked of chat.parked(key)) {
+      const cwd = parked.scope?.cwd;
+      if ((!command.allProjects && (!cwd || !projectCwd || pathKey(cwd) !== pathKey(projectCwd)))
+        || !matches('New chat draft', cwd ?? '')) continue;
+      entries.push({ title: 'New chat draft', detail: safeText(cwd, 160),
+        actions: [action({ kind: 'parked', key: parked.key }, 'Open draft')] });
+      if (entries.length >= 12) break;
+    }
+    const candidates = sessions.filter(session => (command.allProjects || session.project === project)
+      && !session.parents.some(parent => parent.relation === 'child' || parent.relation === 'agent')
+      && matches(names.session(session), session.cwd ?? projectLabel(session)));
+    const group = (session: Session) => session.status === 'Live' || session.status === 'Waiting' || session.status === 'Writer present'
+      ? 'Live' : session.updatedAt && session.updatedAt >= today.getTime() && session.updatedAt < tomorrow.getTime() ? 'Today' : 'Earlier';
+    const groups = new Map(candidates.map(session => [session.id, group(session)]));
+    const rank = ['Live', 'Today', 'Earlier'];
+    candidates.sort((a, b) => rank.indexOf(groups.get(a.id)!) - rank.indexOf(groups.get(b.id)!)
+      || (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+    const limit = command.resumeLimit ?? 20;
+    const available = profiles();
+    for (const session of candidates.slice(0, limit)) {
+      const identity = identityFor(session);
+      const owningProfile = available.find(item => item.provider === session.provider && item.id === session.profile);
+      const owned = identity && chat.keyFor(identity);
+      const reason = !workspace.isTrusted ? 'Trust the workspace to continue.'
+        : !identity ? 'Exact continuation is unavailable for this provider or profile.'
+        : !workspace.getWorkspaceFolder(Uri.file(identity.cwd)) ? 'Open the recorded project in this workspace to continue.'
+        : group(session) === 'Live' && !owned ? 'The recorded session has a live or waiting writer.'
+        : undefined;
+      const rowActions = [action({ kind: 'session', session: session.id }, 'Open conversation')];
+      if (!reason) rowActions.push(action({ kind: 'continue', session: session.id }, 'Continue'));
+      entries.push({
+        title: names.session(session),
+        detail: [groups.get(session.id), providerLabels[session.provider], owningProfile?.label ?? 'Profile unknown',
+          safeText(session.cwd, 160) ?? projectLabel(session), session.status,
+          session.updatedAt ? new Date(session.updatedAt).toLocaleString('en') : undefined, reason].filter(Boolean).join(' · '),
+        actions: rowActions,
+      });
+    }
+    if (candidates.length > limit && limit < 200) actions.push(action({ kind: 'moreHistory' }, 'Load older'));
+    return {
+      title: 'Resume', scope: command.allProjects ? 'All projects' : command.resumeFolder?.label ?? label,
+      state: entries.length ? 'ready' : 'empty',
+      message: entries.length ? undefined : 'No conversations match this project and search.',
+      entries, actions,
+    };
+  }
+
+  async function commandCards(key: string, id: string | undefined, view: ChatView, detail?: SessionDetail) {
+    const rows = chat.localRows(key);
+    const grants = new Map<string, CommandGrant>();
+    const cards = new Map<string, ChatCard>();
+    if (!rows.length || view.privateMode) return { cards, grants };
+    const generation = commandGeneration;
+    const scope = chat.scope(key);
+    const sessions = await store.sessions();
+    const session = id ? sessions.find(item => item.id === id) : undefined;
+    const project = session?.project ?? (rows.some(row => row.command.name === 'resume') && scope
+      ? (await resolveProject(scope.cwd)).key : undefined);
+    const state = chat.commandState(key);
+    const scopeStamp = chat.commandScopeStamp(key, id);
+    const label = commandScope(view);
+    const options = slashCatalog(state.capabilities, state.busy);
+    const ownsProfile = scope && approvedProfile(scope);
+    const cwd = scope?.cwd ?? session?.cwd;
+    const refreshLimits = workspace.isTrusted && scope?.provider === 'claude-code' && ownsProfile && refreshGate(relay.refreshState()).enabled;
+    const gauges = data.chatGauges(scope, session);
+    const files = new Map(session?.files.map(file => [file.id, file]));
+    for (const { id: row, command } of rows) {
+      const action = (target: CommandTarget, label: string, input?: ChatCardAction['input']): ChatCardAction => {
+        const boundTurn = target.kind === 'interrupt' || target.kind === 'releaseTerminal' || target.kind === 'openTerminal'
+          || target.kind === 'applySetting' ? [state.owner, state.turn] : undefined;
+        const boundRevision = target.kind === 'sendAsText' ? state.revision : undefined;
+        const file = target.kind === 'file' || target.kind === 'diff' || target.kind === 'previewDiff'
+          ? files.get(target.id) : undefined;
+        const evidence = file
+          ? [file.path, file.movePath, file.cwd, file.projectRoot, file.status, target.kind === 'file' ? undefined : file.diff]
+          : target.kind === 'parent' ? detail?.agents.find(agent => agent.sessionId === target.session && agent.laneId === target.lane)?.parentInfo.targets
+            : target.kind === 'transcript' ? store.transcriptSource(target.session, target.lane)?.key : undefined;
+        const id = createHmac('sha256', actionSecret).update(JSON.stringify(
+          [key, scope, session?.id, session?.profile, generation, row, command, target, evidence, boundTurn, boundRevision],
+        )).digest('hex');
+        grants.set(id, { row, target, input });
+        return { id, label, input };
+      };
+      let card: ChatCard;
+      if (command.scopeStamp !== scopeStamp) {
+        card = { title: command.name ? '/' + command.name : 'Command', scope: 'Original conversation scope',
+          state: 'changed', message: 'The project or profile changed. Submit the command again for the current scope.' };
+      } else if (command.terminalName) {
+        const gate = handoffState(key);
+        const reason = terminalHandoffReason(gate, true);
+        const canRelease = gate.owner && !gate.busy && gate.trusted && gate.exactSession && gate.approvedProfile && gate.localProject;
+        card = { title: '/' + command.terminalName, scope: label, state: reason ? 'unavailable' : 'ready',
+          message: reason ?? 'Open the official terminal, press Enter to resume, then enter /' + command.terminalName + '.',
+          actions: canRelease ? [action({ kind: 'releaseTerminal', command: command.terminalName }, 'Release chat owner')]
+            : !reason ? [action({ kind: 'openTerminal', command: command.terminalName }, 'Open official terminal')] : undefined };
+      } else if (command.reason) {
+        card = {
+          title: command.name ? '/' + command.name : 'Command', scope: label,
+          state: command.name ? 'unavailable' : 'denied', message: command.reason,
+          entries: command.name ? undefined : slashSuggestions(command.argument, options).map(item => ({
+            title: '/' + item.name, detail: item.description,
+          })),
+          actions: command.canSendAsText && view.canSend && state.revision === command.revision && state.capabilities?.literalText
+            ? [action({ kind: 'sendAsText' }, 'Send as text')] : undefined,
+        };
+      } else if (inspectionCommands.has(command.name)) {
+        const diff = command.diffId ? files.get(command.diffId) : undefined;
+        card = projectChatCard(command.name as InspectionCommand, {
+          scope: label, argument: command.argument, detail, loading: Boolean(id && !detail && session),
+          privateMode: view.privateMode, now: Date.now(), gauges,
+          context: session && detail ? data.chatContext(session, detail, scope, command.contextLane, state.compact)
+            : state.compact && !command.contextLane ? compactContextEvidence('Main lane', state.compact) : undefined,
+          contextLanes: detail?.lanes, selectedContextLane: command.contextLane ?? session?.lanes[0]?.id,
+          status: { channel: view.state, reason: view.reason, owner: state.owner ? 'Agent Lens' : undefined,
+            model: state.model ?? detail?.model, effort: state.capabilities?.effortActive ? undefined : detail?.effort,
+            queued: 0, canInterrupt: view.canInterrupt },
+          fileKind: command.fileKind, selectedDiff: diff ? { action: diff, title: diff.label } : undefined,
+          refreshLimits, action,
+        });
+        if (command.diffId && !diff) card = { ...card, state: 'changed', message: 'This recorded change is no longer available.' };
+      } else {
+        switch (command.name) {
+          case 'help': {
+            const exact = options.find(item => item.route === 'Local'
+              ? item.name === command.argument.toLowerCase() : item.name === command.argument);
+            const entries = (exact ? [exact] : options).map(item => ({
+              title: '/' + item.name + (item.arguments ? ' ' + item.arguments : ''),
+              detail: [item.route, item.description, item.reason].filter(Boolean).join(' · '),
+            }));
+            card = { title: 'Help', scope: label, state: 'ready', entries,
+              message: [
+                command.argument && !exact ? 'No exact match. Similar entries: ' +
+                  (slashSuggestions(command.argument, options).map(item => '/' + item.name).join(', ') || 'None') + '.' : '',
+                state.capabilities?.version ? 'Provider catalog from version ' + state.capabilities.version + '.'
+                  : 'Provider catalog is pending a verified chat connection.',
+                state.owner ? 'Agent Lens owns the chat channel.' : 'No Agent Lens chat channel is open.',
+              ].filter(Boolean).join(' ') };
+            break;
+          }
+          case 'resume':
+            card = resumeCard(key, command, scope, command.resumeFolder?.project ?? project, sessions, label, action);
+            break;
+          case 'model': case 'effort': case 'fast':
+            const setting = command.name;
+            const canSet = workspace.isTrusted && Boolean(scope && ownsProfile && workspace.getWorkspaceFolder(Uri.file(scope.cwd))
+              && scope.provider === 'claude-code');
+            card = claudeChatSettings(setting, label, command.argument, { model: state.model ?? detail?.model }, {
+              requested: state.settings, capabilities: canSet ? state.capabilities : undefined, busy: state.busy,
+              canStage: canSet && !state.owner, resolvedModel: state.resolvedModel, pending: command.result?.state === 'pending',
+              status: command.result?.message,
+              action: canSet ? (value, name, input) => action({ kind: 'applySetting', setting, value }, name, input) : undefined,
+            });
+            if (command.result?.message && command.result.state !== 'pending') {
+              card = { ...card, ...(command.result.state === 'failed' ? { state: 'denied' } : {}),
+                announcement: command.result.message };
+            }
+            break;
+          case 'compact':
+            card = compactChatCard(label, command.result?.state === 'completed' && command.result.compact
+              ? { state: 'completed', measurement: command.result.compact }
+              : command.result?.state === 'pending' ? { state: 'pending' } : { state: 'failed', reason: command.result?.message });
+            break;
+          case 'clear':
+            card = { title: 'Clear', scope: label, state: 'ready', message: 'Opened a fresh tab. This conversation is still available.' };
+            break;
+          case 'codex': {
+            const runs = command.codexMode === 'start' ? [] : codexLinkedRuns(session, sessions, command.argument, false);
+            const reason = command.codexMode === 'follow' ? undefined
+              : codexStartReason(cwd, profiles().some(item => item.provider === 'codex'), workspace.isTrusted);
+            card = {
+              title: command.codexMode === 'start' ? 'Start Codex run' : 'Linked Codex runs', scope: label,
+              state: runs.length ? 'ready' : reason ? 'unavailable' : 'empty',
+              message: [reason, command.codexMode === 'start' ? undefined : unverifiedCodexRun].filter(Boolean).join(' '),
+              actions: command.codexMode === 'start' ? undefined : [action({ kind: 'openAllProjects' }, 'Open All projects')],
+              entries: runs.map(run => ({
+                title: run.title, detail: run.detail,
+                actions: run.target ? [
+                  action({ kind: 'codexFollow', target: run.target, origin: run.origin, turn: run.turn }, 'Open run'),
+                  action({ kind: 'codexOrigin', origin: run.origin }, 'Open launch evidence'),
+                ] : undefined,
+              })),
+            };
+            break;
+          }
+          default:
+            card = { title: 'Command', scope: label, state: 'unavailable', message: 'This action is unavailable.' };
+        }
+      }
+      cards.set(row, command.actionIssue ? { ...card, state: 'changed', message: command.actionIssue } : card);
+    }
+    return { cards, grants };
+  }
+
+  async function runCardAction(key: string, id: string | undefined, request: Extract<ChatPanelRequest, { type: 'chatCardAction' }>): Promise<void> {
+    const grant = cardGrants.get(key)?.get(request.id);
+    if (!grant || runningCardActions.has(request.id)) return;
+    runningCardActions.add(request.id);
+    const issue = (actionIssue: string) => chat.updateLocal(key, grant.row, { actionIssue });
+    try {
+      const generation = commandGeneration;
+      const scope = chat.scope(key);
+      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation));
+      if (model.mode !== 'chat') return;
+      const { grants } = await commandCards(key, id, model.chat, model.session);
+      const current = grants.get(request.id);
+      if (privateMode() || commandGeneration !== generation || !current) {
+        issue('The scope or evidence changed. Submit the command again.');
+        return;
+      }
+      const { target, input, row } = current;
+      if (input ? typeof request.input !== 'string' || request.input.length > input.maxLength || /[\r\n\u2028\u2029\0]/u.test(request.input)
+        : request.input !== undefined) {
+        issue('Enter a single line within the search limit.');
+        return;
+      }
+      const command = chat.localRows(key).find(item => item.id === row)?.command;
+      if (!command) return;
+      const update = (change: Partial<LocalChatRow>) => chat.updateLocal(key, row, { ...change, actionIssue: undefined });
+      switch (target.kind) {
+        case 'releaseTerminal': {
+          const reason = await chat.releaseForTerminal(key);
+          if (reason) issue(reason);
+          else update({});
+          break;
+        }
+        case 'openTerminal': {
+          const reason = await openOfficialTerminal(key, generation);
+          if (reason) issue(reason);
+          else update({});
+          break;
+        }
+        case 'applySetting':
+          await chat.applySetting(key, row, target.setting, target.value === ':custom' ? request.input ?? '' : target.value);
+          break;
+        case 'allProjects': update({ allProjects: true, resumeLimit: 20, resumeFolder: undefined }); break;
+        case 'openAllProjects': await commands.executeCommand('agentLens.sessions.focus'); break;
+        case 'moreHistory': update({ resumeLimit: (command.resumeLimit ?? 20) + 20 }); break;
+        case 'historySearch': update({ argument: request.input!.trim(), resumeLimit: 20 }); break;
+        case 'contextLane': update({ contextLane: target.lane }); break;
+        case 'filterFiles':
+          update({ fileKind: target.fileKind ?? command.fileKind, argument: request.input?.trim() ?? command.argument, diffId: undefined });
+          break;
+        case 'previewDiff': update({ diffId: target.id }); break;
+        case 'backgroundTasks': update({ argument: 'background' }); break;
+        case 'chooseProject': {
+          const folders = workspaceChoices();
+          const folder = folders.length === 1 ? folders[0]
+            : await window.showQuickPick(folders, { placeHolder: 'Choose a workspace folder for history' });
+          if (!folder) break;
+          const project = await resolveProject(folder.cwd);
+          if (commandGeneration === generation && chat.localRows(key).find(item => item.id === row)?.command === command) {
+            update({ allProjects: false, resumeFolder: { cwd: folder.cwd, project: project.key,
+              label: safeText(folder.label, 100) ?? 'Selected project' }, resumeLimit: 20 });
+          }
+          break;
+        }
+        case 'parked': panel.show({ kind: 'chat', key: target.key, tab: 'chat', from: key }); break;
+        case 'session': case 'continue': await openSession(target.session, 'chat', undefined, key, target.kind === 'continue'); break;
+        case 'parent': await openParent(target.session, target.lane, key); break;
+        case 'transcript': openTranscript(target.session, target.lane); break;
+        case 'view':
+          if (target.view === 'allTasks' || (!id && target.view === 'tasks')) panel.show({ kind: 'tasks' });
+          else if (!id && target.view === 'usage') panel.show({ kind: 'usage' });
+          else if (id) panel.show({ kind: 'chat', key, id, tab: target.view,
+            files: target.view === 'files' ? { search: safeText(command.argument, maxSearch) ?? '',
+              kind: command.name === 'diff' ? 'changed' : command.fileKind ?? 'all' } : undefined });
+          break;
+        case 'file': case 'diff':
+          if (!await commands.executeCommand('agentLens.files.' + (target.kind === 'file' ? 'open' : 'diff'), target.id)) {
+            issue('The file or recorded diff is no longer available.');
+          }
+          break;
+        case 'refreshLimits':
+          if (workspace.isTrusted && scope && approvedProfile(scope) && refreshGate(relay.refreshState()).enabled) {
+            await relay.command('refresh', scope.profile);
+          }
+          break;
+        case 'interrupt': await chat.handle(key, { type: 'chatInterrupt' }); break;
+        case 'sendAsText': await chat.sendAsText(key, command.revision); break;
+        case 'codexFollow': {
+          const sessions = await store.sessions();
+          const run = codexLinkedRuns(sessions.find(item => item.id === id), sessions, command.argument, false)
+            .find(item => item.target?.sessionId === target.target.sessionId && item.target.laneId === target.target.laneId
+              && item.target.rowId === target.target.rowId && item.origin.rowId === target.origin.rowId
+              && item.origin.laneId === target.origin.laneId && item.turn === target.turn);
+          if (!run?.target || privateMode() || commandGeneration !== generation) issue('The linked run evidence is no longer available.');
+          else await openSession(run.target.sessionId, 'timeline', { lane: run.target.laneId, row: run.target.rowId }, key);
+          break;
+        }
+        case 'codexOrigin':
+          await openSession(target.origin.sessionId, 'timeline', { lane: target.origin.laneId, row: target.origin.rowId }, key);
+          break;
+      }
+    } catch {
+      issue('Could not complete the action. Check the current scope and try again.');
+    } finally {
+      runningCardActions.delete(request.id);
+    }
+  }
+
+  function openTranscript(session: string, lane: string): void {
+    if (privateMode()) {
+      void window.showInformationMessage('Transcripts are hidden in private display mode.');
+      return;
+    }
+    const source = store.transcriptSource(session, lane);
+    if (!source) {
+      void window.showInformationMessage('This transcript is no longer available.');
+      return;
+    }
+    void commands.executeCommand('vscode.open', Uri.file(source.path));
+  }
+
+  function chatRequest(key: string, request: ChatPanelRequest, id?: string): void {
+    if (request.type === 'chatInterrupt') { void chat.handle(key, request); return; }
+    if (privateMode()) return;
+    if (request.type === 'chatChooseScope') { void chooseScope(key); return; }
+    if (request.type === 'chatCardAction') { void runCardAction(key, id, request); return; }
+    chat.inspect(key);
+    if (request.type !== 'chatSend') { void chat.handle(key, request); return; }
+    const state = chat.commandState(key);
+    const parsed = parseChatInput(request.text, state.capabilities, state.busy);
+    if (parsed.kind === 'text' || parsed.kind === 'literal'
+      || (parsed.kind === 'native' && parsed.route === 'Native' && !parsed.reason)) {
       void chat.handle(key, request);
+      return;
+    }
+    if (parsed.kind === 'incomplete') return;
+    const command = parsed.kind === 'local' ? parsed
+      : parsed.kind === 'native' ? { name: safeText(parsed.name, 160) ?? 'Native command', argument: '', reason: parsed.reason,
+        terminalName: parsed.route === 'Official terminal' && !parsed.reason ? parsed.name : undefined }
+      : { name: '', argument: /^\/([A-Za-z0-9_.:-]+)/u.exec(request.text.trimStart())?.[1]?.slice(0, 160) ?? '',
+        reason: parsed.reason, canSendAsText: parsed.canSendAsText };
+    const preserve = command.name === 'codex' && parsed.kind === 'local' && parsed.codexMode === 'start'
+      ? codexStartReason(chat.scope(key)?.cwd, profiles().some(profile => profile.provider === 'codex'), workspace.isTrusted)
+      : undefined;
+    if (!chat.local(key, request.revision, request.text, { ...command, scopeStamp: chat.commandScopeStamp(key, id) },
+      Boolean(preserve || ('terminalName' in command && command.terminalName)))) return;
+    if (command.name === 'fast' && command.argument === '' && !state.busy && canCheckFast(state.capabilities)) {
+      const row = chat.localRows(key).at(-1)?.id;
+      if (row) void chat.applySetting(key, row, 'fast', '');
+    }
+    if (command.name === 'clear' && !command.reason) {
+      const cwd = chat.scope(key)?.cwd;
+      if (cwd || !id) newChat(cwd);
+      else void store.sessions().then(sessions => newChat(localPath(sessions.find(session => session.id === id)?.cwd ?? '')))
+        .catch(() => newChat());
     }
   }
 
@@ -397,30 +838,26 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       if (id && !chat.scope(key) && exactSources(id, chatProvider).length === 1 && !chat.identity(key)) {
         await resolveSessionEditor(id);
       }
+      chat.inspect(key);
       const scope = chat.scope(key);
       const reason = !scope ? id ? 'Continue requires an exact local session and its original chat profile.'
         : !workspaceChoices().length ? 'Open a local workspace folder to start a chat.'
           : !chatProfiles().length ? 'Enable a local chat profile to start a chat.' : 'Choose the workspace and profile for this chat.'
         : !workspace.isTrusted ? 'Trust this workspace to use chat.' : undefined;
-      return data.chat(key, id, scope, presentation => chat.view(key, presentation), reason);
+      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation), reason);
+      if (model.mode !== 'chat') return model;
+      const { cards, grants } = await commandCards(key, id, model.chat, model.session);
+      if (grants.size) cardGrants.set(key, grants);
+      else cardGrants.delete(key);
+      return { ...model, chat: { ...model.chat,
+        rows: model.chat.rows.map(row => cards.has(row.id) ? { ...row, card: cards.get(row.id) } : row) } };
     },
     chatRequest,
     sessionId: editorSession,
     openSession: (id, tab, focus, from) => void openSession(id, tab, focus, from),
     openFile: id => void commands.executeCommand('agentLens.files.open', id),
     openDiff: id => void commands.executeCommand('agentLens.files.diff', id),
-    openTranscript: (session, lane) => {
-      if (privateMode()) {
-        void window.showInformationMessage('Transcripts are hidden in private display mode.');
-        return;
-      }
-      const source = store.transcriptSource(session, lane);
-      if (!source) {
-        void window.showInformationMessage('This transcript is no longer available.');
-        return;
-      }
-      void commands.executeCommand('vscode.open', Uri.file(source.path));
-    },
+    openTranscript,
     openParent: (session, lane, from) => void openParent(session, lane, from),
     openSettings: () => void commands.executeCommand('workbench.action.openSettings', '@ext:salehshakib.agent-lens'),
     relay: (command, profile) => void relay.command(command, profile),
@@ -560,7 +997,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
   context.subscriptions.push(
     window.registerWebviewViewProvider(SidebarView.viewType, sidebar),
     window.registerWebviewPanelSerializer(PanelView.viewType, { deserializeWebviewPanel: restoreEditor }),
-    commands.registerCommand('agentLens.newChat', newChat),
+    commands.registerCommand('agentLens.newChat', () => newChat()),
     commands.registerCommand('agentLens.openUsage', () => panel.show({ kind: 'usage' })),
     commands.registerCommand('agentLens.openTasks', () => panel.show({ kind: 'tasks' })),
     commands.registerCommand('agentLens.openParent', () => {
@@ -586,20 +1023,28 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('agentLens.chat.permissionMode')) setChatPermissionMode(configured('chat.permissionMode'));
       if (event.affectsConfiguration('agentLens.agents')) {
+        commandGeneration++;
         chat.invalidate('Chat profiles changed. Check the original profile before continuing.');
         refreshConfiguration();
       }
-      else if (event.affectsConfiguration('agentLens.privateDisplay')) refreshViews();
+      else if (event.affectsConfiguration('agentLens.privateDisplay')) {
+        commandGeneration++;
+        refreshViews();
+      }
       else if (event.affectsConfiguration('agentLens.signals') || event.affectsConfiguration('agentLens.context')) {
         readSignalSettings();
         refreshViews();
       }
     }),
     workspace.onDidChangeWorkspaceFolders(event => {
+      commandGeneration++;
       if (event.removed.length) chat.invalidate('The workspace folders changed. Check the original folder before continuing.');
       refreshViews();
     }),
-    workspace.onDidGrantWorkspaceTrust(refreshViews),
+    workspace.onDidGrantWorkspaceTrust(() => {
+      commandGeneration++;
+      refreshViews();
+    }),
     { dispose: disposeObservers },
     { dispose: () => { chat.dispose(); relay.dispose(); panel.dispose(); status.dispose(); } },
   );
