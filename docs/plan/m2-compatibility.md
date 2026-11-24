@@ -59,3 +59,7 @@ The orchestrator supplied scrubbed results from the native Windows Claude Code 2
 | Terminal handoff | Installed help verified the interactive exact resume form `claude --resume <session-id>`. The observed terminal-only list was `doctor`, `color`, `focus` and `reload-plugins`. | After the Phase B released-writer check, prepare the exact quoted command in a scoped VS Code terminal and leave Enter to the user. The original draft stays in Agent Lens. |
 
 No connected Codex launch evidence was supplied. Connected Start stays gated. Exact observed Codex launches remain available through Follow.
+
+## To-do tool availability (Phase D)
+
+A live stream-json chat probe against Claude Code 2.1.330 asked the model to find and use a to-do tool. The model searched for TodoWrite and for TaskCreate, TaskUpdate, TaskList and TaskGet, and none of them exist in this CLI build. No recorded transcript on the test machine contains a to-do tool call either. The CLI exposes no structured to-do tool in stream-json chat, so Phase D builds no to-do checklist projection. `/tasks` keeps showing background tasks only. Re-check when a later CLI version records a to-do payload.

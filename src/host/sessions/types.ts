@@ -93,6 +93,8 @@ export type FileAction = {
 
 export type TimelineRow = {
   id: string;
+  /** Opaque hashes of exact provider identities (prompt uuid, response id, call id) for live reconciliation. */
+  nativeKeys?: string[];
   laneId: string;
   turnId?: string;
   at?: number;

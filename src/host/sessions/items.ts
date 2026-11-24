@@ -1,5 +1,5 @@
 import type { Event } from '../adapters/types';
-import { isKind, key } from './evidence';
+import { identityKey, isKind, key } from './evidence';
 import type { Kind, Positioned } from './evidence';
 import type { TimelineRow } from './types';
 
@@ -144,12 +144,22 @@ const messageKind: Record<Kind<'message'>['role'], TimelineRow['kind']> = {
   attachment: 'system', error: 'system', plan: 'assistant',
 };
 
+function nativeKeysOf(event: Event): string[] | undefined {
+  const keys: string[] = [];
+  if (event.kind === 'message' && event.role === 'user' && event.recordId) keys.push(identityKey('user', event.recordId));
+  else if (event.kind === 'message' && event.responseId && (event.role === 'assistant' || event.role === 'final')) {
+    keys.push(identityKey('response', event.responseId));
+  } else if (event.kind === 'call') keys.push(identityKey('call', event.callId));
+  return keys.length ? keys : undefined;
+}
+
 export function rowFor(item: Positioned): TimelineRow | undefined {
   const { event, laneId, turnId, currentBranch, ambiguous } = item;
   const base = {
     id: key(laneId, item.rowKey ?? event.id), laneId, turnId, at: event.at, currentBranch, ambiguous,
     parentRecordId: event.parentId,
     responseId: event.responseId ? key(laneId, event.responseId) : undefined,
+    nativeKeys: nativeKeysOf(event),
   };
   switch (event.kind) {
     case 'message':

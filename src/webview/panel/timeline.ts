@@ -1,7 +1,7 @@
 import type { RowView } from '../../shared/protocol';
 import { formatClock, formatDuration } from '../../shared/format';
 import { announce, badge, button, el, navigate, signalBadge } from '../dom';
-import { goTo, peekLanding, takeLanding } from './nav';
+import { goTo, parentAction, peekLanding, takeLanding } from './nav';
 import type { Landing } from './nav';
 import type { SessionModel, Ui } from './state';
 import { saveUi } from './state';
@@ -227,6 +227,8 @@ export function timelineTab(session: SessionModel, ui: Ui, rerender: () => void)
     select('Filter by event type', ui.kind, [['', 'All events'], ['conversation', 'Conversation'], ['tools', 'Tools and results'],
       ['reasoning', 'Reasoning'], ['agents', 'Agents and tasks'], ['signals', 'Signals']],
       value => { ui.kind = value; highlighted = undefined; gap = undefined; saveUi(ui); manual = true; rerender(); }));
+  const selected = ui.lane ? session.lanes.find(lane => lane.id === ui.lane) : undefined;
+  const laneHeader = selected ? parentAction(session.id, selected.id, selected.parent, 'lane-' + selected.id.slice(0, 16)) : undefined;
   const list = el('ol', { cls: 'timeline', attrs: { 'aria-label': 'Session timeline' } },
     ...items(rows).map(item => Array.isArray(item) ? groupNode(item, ui, session.lanes.length > 1, rerender)
       : rowNode(item, ui, session.lanes.length > 1, rerender)));
@@ -235,6 +237,7 @@ export function timelineTab(session: SessionModel, ui: Ui, rerender: () => void)
     on: { click: () => { toBottom(); followed = true; pending = 0; updateJump(); } } });
   const section = el('section', { cls: 'timeline-tab' },
     toolbar,
+    laneHeader ? el('div', { cls: 'lane-header' }, el('strong', { text: selected!.label }), laneHeader) : undefined,
     gap ? el('p', { cls: 'notice', attrs: { role: 'status' }, text: gap }) : undefined,
     session.rowsOmitted ? el('p', { cls: 'muted', text: session.rowsOmitted + ' older events are not shown.' }) : undefined,
     rows.length ? list : el('p', { cls: 'empty', text: session.rows.length ? 'No events match these filters.' : 'No events recorded yet.' }),

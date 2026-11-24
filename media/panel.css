@@ -170,3 +170,4 @@ body.chat-open { block-size: 100dvh; overflow: hidden; }
 /* Agent map signals. */
 .agent-signals { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px; }
 .signal-list { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0; padding: 0; list-style: none; }
+.lane-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0; }

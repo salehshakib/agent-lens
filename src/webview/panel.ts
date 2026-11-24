@@ -20,7 +20,7 @@ let model: PanelModel | undefined;
 const chatPane = new ChatPane(request => api.postMessage(request), position => {
   ui.chatPosition = position;
   saveUi(ui);
-}, ui.chatPosition);
+}, ui.chatPosition, tab => select(tab));
 let peerBack = false;
 let inspectionScroll = 0;
 

@@ -22,6 +22,8 @@ import {
   buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, namesFor, providerLabels,
 } from './models';
 import { laneContext, parentInfo } from './signal-models';
+import { projectTranscript } from './chat-transcript';
+import type { TranscriptRow } from './chat-transcript';
 import { chatContextEvidence } from './chat-cards';
 import type { ContextCandidate } from './alerts';
 
@@ -184,30 +186,19 @@ export class LensData {
     const detail = id ? await this.detail(id) : undefined;
     const session = detail?.mode === 'session' ? detail.session : undefined;
     const privateMode = this.deps.privateMode();
-    const main = session?.agents.find(agent => agent.kind === 'main')?.laneId;
-    const history: ChatRow[] = [];
-    if (main) {
-      for (const row of session!.rows) {
-        if (row.laneId !== main) continue;
-        if (row.kind === 'user' || row.kind === 'assistant' || row.kind === 'final') {
-          const text = row.text ?? (privateMode ? 'Hidden in private display mode' : undefined);
-          if (text) history.push({ id: row.id, role: row.kind === 'user' ? 'user' : 'assistant', text });
-        } else if (row.kind === 'tool') {
-          history.push({ id: row.id, role: 'tool', text: row.label });
-        }
-      }
-    }
+    const raw = id ? (await this.deps.sessions()).find(item => item.id === id) : undefined;
+    const history: TranscriptRow[] = session ? projectTranscript(session, raw?.files ?? [], privateMode) : [];
     const profile = scope && this.deps.profiles().find(item => item.provider === scope.provider && item.id === scope.profile);
     const presentation: ChatPresentation = {
       title: session?.title ?? (id ? 'Session' : 'New chat'),
       project: session?.project ?? (scope ? safeText(basename(scope.cwd), 100) : undefined),
       provider: session?.provider ?? (scope ? providerLabels[scope.provider] : undefined),
       profile: profile?.label ?? session?.profile,
-      privateMode, history, reason,
+      privateMode, history, reason, sessionId: id,
     };
     const chat = view(presentation) ?? {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider, profile: presentation.profile,
-      privateMode, rows: history, draft: '', revision: 0, state: 'view-only',
+      privateMode, rows: history.map(({ keys: _keys, ...row }) => row), draft: '', revision: 0, state: 'view-only',
       reason: reason ?? (detail?.mode === 'empty' ? detail.message : 'This recorded session is available for inspection.'),
       canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
     };

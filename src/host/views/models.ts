@@ -213,7 +213,7 @@ function rowView(row: TimelineRow, lanes: ReadonlyMap<string, Lane>, privateMode
     label: safeText(row.label, 80) ?? 'Event', text: text.text, textTruncated: text.truncated || undefined,
     output: output.text, outputTruncated: output.truncated || undefined, status: row.status,
     command: privateMode ? undefined : safeText(row.command, 2000), exitCode: row.exitCode,
-    durationMs: row.durationMs, file: row.file,
+    durationMs: row.durationMs, file: row.file, nativeKeys: row.nativeKeys,
   };
 }
 
@@ -428,7 +428,8 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     rows, rowsOmitted: Math.max(0, merged.length - rows.length), agents,
     files: fileGroups(session.files, lanes, privateMode), usage: usageView(session),
     tasks: buildTasks([session], privateMode),
-    lanes: session.lanes.map(lane => ({ id: lane.id, label: safeText(lane.title, 60) ?? 'Agent' })),
+    lanes: session.lanes.map(lane => ({ id: lane.id, label: safeText(lane.title, 60) ?? 'Agent',
+      parent: parentInfo(session, lane, byId, names) })),
     privateMode, partial: session.coverage === 'partial',
     note: session.coverage === 'partial' ? 'Some evidence for this session is partial or still loading.' : undefined,
   };

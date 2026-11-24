@@ -262,21 +262,8 @@ function changeEntries(group: FileGroup, input: ChatCardInput): ChatCardEntry[] 
   return entries.length ? entries : [fileEntry(group, input)];
 }
 
-function diffPreview(card: ChatCard, groups: FileGroup[], input: ChatCardInput): ChatCard {
-  const action = input.selectedDiff?.action;
-  if (!action) return card;
-  const group = groups.find(candidate => candidate.diffId === action.id
-    || candidate.items.some(item => item.actionId === action.id && item.hasDiff));
-  if (input.privateMode) return { ...card, state: 'denied', message: 'Diffs are hidden in private display mode.' };
-  if (!group) return { ...card, state: 'changed', message: 'The selected change is no longer available in this scope.' };
-  const hunks = recordedHunks(action.diff);
-  if (!hunks) {
-    const empty = safeFileText(action.diff) === '';
-    return {
-      ...card, state: empty ? 'empty' : 'unavailable',
-      message: empty ? 'The recorded change has no text lines.' : 'No eligible recorded hunks are available for this action.',
-    };
-  }
+/** Bounded hunks for an inline or card preview. `clipped` tells the reader to open the full diff. */
+export function previewHunks(hunks: NonNullable<ReturnType<typeof recordedHunks>>): { diff: NonNullable<ChatCard['diff']>[number][]; clipped: boolean } {
   let remaining = maxDiffLines;
   const diff: NonNullable<ChatCard['diff']>[number][] = [];
   for (const hunk of hunks.slice(0, maxDiffHunks)) {
@@ -294,6 +281,25 @@ function diffPreview(card: ChatCard, groups: FileGroup[], input: ChatCardInput):
   }
   const clipped = diff.length < hunks.length || hunks.some((hunk, index) => hunk.lines.length !== diff[index]?.lines.length
     || hunk.lines.some(line => line.text.length > maxLineText));
+  return { diff, clipped };
+}
+
+function diffPreview(card: ChatCard, groups: FileGroup[], input: ChatCardInput): ChatCard {
+  const action = input.selectedDiff?.action;
+  if (!action) return card;
+  const group = groups.find(candidate => candidate.diffId === action.id
+    || candidate.items.some(item => item.actionId === action.id && item.hasDiff));
+  if (input.privateMode) return { ...card, state: 'denied', message: 'Diffs are hidden in private display mode.' };
+  if (!group) return { ...card, state: 'changed', message: 'The selected change is no longer available in this scope.' };
+  const hunks = recordedHunks(action.diff);
+  if (!hunks) {
+    const empty = safeFileText(action.diff) === '';
+    return {
+      ...card, state: empty ? 'empty' : 'unavailable',
+      message: empty ? 'The recorded change has no text lines.' : 'No eligible recorded hunks are available for this action.',
+    };
+  }
+  const { diff, clipped } = previewHunks(hunks);
   return {
     ...card, title: 'Recorded diff · ' + group.path, diff,
     message: clipped ? 'Preview limited. Open the recorded diff for the full evidence.' : card.message,
