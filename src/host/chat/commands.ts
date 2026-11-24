@@ -211,7 +211,7 @@ export function parseChatInput(text: string, capabilities?: ChatCapabilities, bu
     return literal ? { kind: 'literal', text } : { kind: 'invalid', reason: escapedReason };
   }
   if (input.startsWith('!')) {
-    return { kind: 'invalid', reason: 'Leading ! requires a verified native shell command route. This chat has no such route.' };
+    return { kind: 'invalid', reason: 'Leading ! requires a verified native shell command route. This chat has no such route, and Agent Lens never runs it in a host shell. Open the official Claude Code terminal to run it.' };
   }
   if (!input.startsWith('/')) return { kind: 'text', text };
 

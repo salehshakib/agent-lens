@@ -3,6 +3,7 @@ import { window, workspace } from 'vscode';
 import type { Memento } from 'vscode';
 import type { RelayCommand, RelayView } from '../../shared/protocol';
 import { formatAge } from '../../shared/format';
+import type { ProbeWindows } from './claude-probe';
 import { probeClaudeLimits, probeSamples, resolveClaude } from './claude-probe';
 import { limitSamples, readSnapshots } from './claude-relay';
 import type { RelaySnapshot } from './claude-relay';
@@ -81,6 +82,20 @@ export class RelayManager {
     const cached = this.cache.get(profileId);
     const probed = this.probes.get(profileId);
     return { snapshots: cached?.snapshots ?? [], samples: [...cached?.samples ?? [], ...probed?.samples ?? []] };
+  }
+
+  /**
+   * Record windows a chat stream reported. The sample is bound to the profile whose home the chat owner used,
+   * and merges through the same latest-sample path as a refresh. A missing window keeps its prior sample.
+   */
+  recordStream(profileId: string, home: string, windows: ProbeWindows, at: number): void {
+    const profile = this.profiles.find(item => item.id === profileId && item.home === home);
+    if (!profile || this.disposed) return;
+    const entry = this.probes.get(profile.id) ?? { attemptedAt: 0, samples: [] };
+    const fresh = probeSamples({ ok: true, windows, at }, profile.id).map(sample => ({ ...sample, source: 'chat' as const }));
+    entry.samples = latestSamples([...entry.samples, ...fresh]);
+    this.probes.set(profile.id, entry);
+    this.changed();
   }
 
   refreshState(): RefreshState {

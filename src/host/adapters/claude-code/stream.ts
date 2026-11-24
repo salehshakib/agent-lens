@@ -3,6 +3,7 @@ import type { Readable } from 'node:stream';
 import type { ChatEvent, ChatLaunch, ChatSend, CompactMeasurement } from '../../chat/types';
 import { localPath, pathKey } from '../../discovery/local-path';
 import { count, identifier, record, safeText } from '../../privacy/projection';
+import { rateLimitWindows } from '../../limits/claude-probe';
 import type { Tokens } from '../types';
 import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './version';
 
@@ -161,6 +162,7 @@ export class ClaudeChatStream {
   private model?: string;
   private nativeCommands = false;
   private fastCheck = false;
+  private modeControl?: { id: string; received: (value: { mode?: string; error?: string }) => void };
   private modelControl?: { id: string; received: (model?: string) => void };
   private lastResultId?: string;
 
@@ -197,6 +199,13 @@ export class ClaudeChatStream {
     return true;
   }
 
+  beginModeChange(id: string, received: (value: { mode?: string; error?: string }) => void): boolean {
+    if (!this.ready || !this.nativeCommands || this.turn || this.control || this.modelControl || this.modeControl
+      || !isClaudeSessionId(id)) return false;
+    this.modeControl = { id, received };
+    return true;
+  }
+
   beginModelChange(id: string, received: (model?: string) => void): boolean {
     if (!this.ready || !this.nativeCommands || this.turn || this.control || this.modelControl || !isClaudeSessionId(id)) return false;
     this.modelControl = { id, received };
@@ -223,6 +232,15 @@ export class ClaudeChatStream {
     if (row.type === 'control_request') {
       if (record(row.request)?.subtype === 'can_use_tool') this.close('Claude Code requested approval outside the available permission channel.');
       return;
+    }
+    if (row.type === 'rate_limit_event' && this.ready && !row.parent_tool_use_id) {
+      const windows = rateLimitWindows(row);
+      if (windows) this.publish({ kind: 'limits', windows });
+      return;
+    }
+    if (row.type === 'system' && row.subtype === 'status' && this.ready && !row.parent_tool_use_id) {
+      const mode = identifier(row.permissionMode);
+      if (mode) this.publish({ kind: 'mode', mode });
     }
     const turn = this.turn;
     if (!turn || row.parent_tool_use_id) return;
@@ -317,6 +335,19 @@ export class ClaudeChatStream {
   }
 
   private receipt(response: Row | undefined): void {
+    const modeChange = this.modeControl;
+    if (modeChange && response?.request_id === modeChange.id && (response.subtype === 'success' || response.subtype === 'error')) {
+      this.modeControl = undefined;
+      const mode = identifier(record(response.response)?.mode);
+      if (response.subtype === 'success' && mode) {
+        this.publish({ kind: 'mode', mode });
+        modeChange.received({ mode });
+      } else {
+        modeChange.received({ error: safeText(typeof response.error === 'string' ? response.error : undefined, 160)
+          ?? 'Claude Code did not accept the permission mode.' });
+      }
+      return;
+    }
     const model = this.modelControl;
     if (model && response?.request_id === model.id && (response.subtype === 'success' || response.subtype === 'error')) {
       this.modelControl = undefined;

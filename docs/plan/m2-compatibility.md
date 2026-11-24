@@ -63,3 +63,12 @@ No connected Codex launch evidence was supplied. Connected Start stays gated. Ex
 ## To-do tool availability (Phase D)
 
 A live stream-json chat probe against Claude Code 2.1.330 asked the model to find and use a to-do tool. The model searched for TodoWrite and for TaskCreate, TaskUpdate, TaskList and TaskGet, and none of them exist in this CLI build. No recorded transcript on the test machine contains a to-do tool call either. The CLI exposes no structured to-do tool in stream-json chat, so Phase D builds no to-do checklist projection. `/tasks` keeps showing background tasks only. Re-check when a later CLI version records a to-do payload.
+
+## Permission mode control (Phase E)
+
+Claude Code 2.1.330, stream-json with the chat flags. The orchestrator's live probe, scrubbed:
+
+- `control_request` with `request.subtype: "set_permission_mode"` and `mode: "plan"` returned `control_response` `success` with `response.mode: "plan"`. The CLI then emitted `system/status` with `status: null` and `permissionMode: "plan"`. `acceptEdits` behaved the same.
+- An invalid mode returned `control_response` `error` with `error_code: "invalid_mode"` and a message listing `acceptEdits, auto, bypassPermissions, default, dontAsk, plan`.
+- It ran with no model call and worked before the first user turn.
+- Agent Lens cycles only `default, acceptEdits, plan, auto`. It never sends `bypassPermissions` or `dontAsk`, gates on `supportsClaudeCodeVersion` and an initialized owned channel, and shows only the mode the CLI reports (init, the response mode, or a status frame). Because the stream reads init inside the first turn, the control is offered once the channel is initialized and idle.

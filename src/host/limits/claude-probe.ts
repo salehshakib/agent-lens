@@ -48,6 +48,11 @@ export function parseRateLimitLine(line: string): ProbeWindows | undefined {
   }
   const event = record(parsed);
   if (event?.type !== 'rate_limit_event') return undefined;
+  return rateLimitWindows(event);
+}
+
+/** Validate `five_hour` and `seven_day` of one `rate_limit_event` independently. */
+export function rateLimitWindows(event: Record<string, unknown>): ProbeWindows | undefined {
   const windows = record(record(event.rate_limit_info)?.unifiedWindows);
   if (!windows) return undefined;
   const result: ProbeWindows = { fiveHour: window(windows.five_hour), sevenDay: window(windows.seven_day) };
@@ -97,6 +102,22 @@ function parseReset(reset: string, at: number): number | undefined {
   return undefined;
 }
 
+/** Decode the structured `usage_report.rate_limits.limits` the CLI attaches to its local `/usage` record. */
+export function parseUsageReport(value: unknown): ProbeWindows | undefined {
+  const limits = record(record(value)?.rate_limits)?.limits;
+  if (!Array.isArray(limits)) return undefined;
+  const windows: ProbeWindows = {};
+  for (const item of limits) {
+    const row = record(item);
+    const key = row?.kind === 'session' ? 'fiveHour' : row?.kind === 'weekly_all' ? 'sevenDay' : undefined;
+    const percent = row?.percent;
+    const reset = typeof row?.resets_at === 'string' ? Date.parse(row.resets_at) : NaN;
+    if (!key || windows[key] || typeof percent !== 'number' || !Number.isFinite(percent) || percent < 0 || percent > 100 || !Number.isFinite(reset)) continue;
+    windows[key] = { usedPercent: percent, resetsAt: reset };
+  }
+  return windows.fiveHour || windows.sevenDay ? windows : undefined;
+}
+
 function readUsageWindows(text: string, at: number): ProbeWindows | undefined {
   const windows: ProbeWindows = {};
   for (const line of text.split('\n')) {
@@ -117,9 +138,10 @@ function readUsageWindows(text: string, at: number): ProbeWindows | undefined {
 export class UsageReport {
   private resultWindows?: ProbeWindows;
   private assistantWindows?: ProbeWindows;
+  private structuredWindows?: ProbeWindows;
 
   read(line: string, at: number): void {
-    if (this.resultWindows || line.length > maxLineChars) return;
+    if (this.structuredWindows || this.resultWindows || line.length > maxLineChars) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(line.trim());
@@ -127,6 +149,8 @@ export class UsageReport {
       return;
     }
     const event = record(parsed);
+    if (event && 'usage_report' in event) this.structuredWindows ??= parseUsageReport(event.usage_report);
+    if (this.structuredWindows) return;
     if (event?.type === 'result' && typeof event.result === 'string') {
       this.resultWindows = readUsageWindows(event.result, at);
     } else if (event?.type === 'assistant' && !this.assistantWindows) {
@@ -139,7 +163,7 @@ export class UsageReport {
   }
 
   finish(at: number): ProbeResult {
-    const windows = this.resultWindows ?? this.assistantWindows;
+    const windows = this.structuredWindows ?? this.resultWindows ?? this.assistantWindows;
     return windows
       ? { ok: true, windows, at }
       : { ok: false, message: 'Claude Code usage report format was not recognized.' };
@@ -154,6 +178,17 @@ export function probeSamples(result: Extract<ProbeResult, { ok: true }>, profile
   return samples;
 }
 
+/**
+ * PATH entries plus the folders Claude Code's installers use. VS Code started from a launcher often lacks
+ * `~/.local/bin` and the npm folder, which made Refresh limits report "not found" although chat could find Claude.
+ */
+export function claudeSearchDirectories(env: NodeJS.ProcessEnv, userHome: string): string[] {
+  const fromPath = (env.PATH ?? env.Path ?? '').split(delimiter).map(entry => entry.replace(/^"|"$/g, '')).filter(Boolean);
+  const extra = [join(userHome, '.local', 'bin')];
+  if (env.APPDATA) extra.push(join(env.APPDATA, 'npm'));
+  return [...new Set([...fromPath, ...extra])];
+}
+
 async function isFile(path: string): Promise<boolean> {
   try {
     return (await stat(path)).isFile();
@@ -166,8 +201,8 @@ async function isFile(path: string): Promise<boolean> {
  * Find the native Claude executable. On Windows the npm `claude.cmd` shim cannot be spawned without a shell,
  * so resolve the `claude.exe` it points to.
  */
-export async function resolveClaude(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): Promise<string | undefined> {
-  const directories = (env.PATH ?? env.Path ?? '').split(delimiter).filter(Boolean);
+export async function resolveClaude(env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform, userHome: string = homedir()): Promise<string | undefined> {
+  const directories = claudeSearchDirectories(env, userHome);
   if (platform !== 'win32') {
     for (const directory of directories) if (await isFile(join(directory, 'claude'))) return join(directory, 'claude');
     return undefined;

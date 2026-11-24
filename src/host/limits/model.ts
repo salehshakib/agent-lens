@@ -10,6 +10,8 @@ export interface LimitSample {
   usedPercent: number;
   resetsAt: number;
   at: number;
+  /** Where the sample came from when it is not the status-line relay or a refresh. */
+  source?: 'chat';
 }
 
 export type GaugeState = 'fresh' | 'stale' | 'expired' | 'missing';

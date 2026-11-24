@@ -1,6 +1,7 @@
 import { basename } from 'node:path';
 import type { Provider } from '../adapters/types';
 import type { ChatScope, CompactMeasurement } from '../chat/types';
+import { projectChatStatus } from './chat-status';
 import type { ChatPresentation } from '../chat/session';
 import { safeText } from '../privacy/projection';
 import { profileKey } from '../accounts/profiles';
@@ -94,8 +95,9 @@ export class LensData {
     return main.map(gauge => {
       const match = (sample: LimitSample) => sample.minutes === gauge.minutes && sample.at === gauge.observedAt
         && sample.resetsAt === gauge.resetsAt && (gauge.percent === undefined || sample.usedPercent === gauge.percent);
+      const fromChat = relay?.samples.some(sample => sample.source === 'chat' && match(sample));
       const source = gauge.observedAt === undefined ? undefined : statusLine.some(match) ? 'Status-line relay'
-        : observed.some(match) ? 'Recorded runtime observation' : 'Agent Lens limits refresh';
+        : observed.some(match) ? 'Recorded runtime observation' : fromChat ? 'Chat turn event' : 'Agent Lens limits refresh';
       return { ...gaugeView(gauge), profile: profile.label, source };
     });
   }
@@ -202,6 +204,11 @@ export class LensData {
       reason: reason ?? (detail?.mode === 'empty' ? detail.message : 'This recorded session is available for inspection.'),
       canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
     };
+    chat.status = projectChatStatus({
+      chat, gauges: this.chatGauges(scope, raw), now: this.deps.now(),
+      context: raw && session ? this.chatContext(raw, session, scope) : undefined,
+      tokens: raw?.usage?.total, tokensScope: raw?.usageScope ? 'Scope: ' + raw.usageScope : undefined,
+    });
     return { mode: 'chat', chat, id, session };
   }
 

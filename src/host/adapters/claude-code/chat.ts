@@ -142,6 +142,19 @@ export async function verifiedExecutable(signal: AbortSignal): Promise<{ path: s
   return { path: executable, version };
 }
 
+/** The Shift+Tab cycle. `bypassPermissions` and `dontAsk` are never part of it. */
+export const permissionCycle = ['default', 'acceptEdits', 'plan', 'auto'] as const;
+
+export function nextPermissionMode(current: string | undefined): string {
+  const index = permissionCycle.indexOf(current as typeof permissionCycle[number]);
+  return permissionCycle[index < 0 ? 0 : (index + 1) % permissionCycle.length]!;
+}
+
+export function permissionModeFrame(id: string, mode: string): string | undefined {
+  if (!isClaudeSessionId(id) || !permissionCycle.includes(mode as typeof permissionCycle[number])) return undefined;
+  return JSON.stringify({ type: 'control_request', request_id: id, request: { subtype: 'set_permission_mode', mode } }) + '\n';
+}
+
 export function modelControlFrame(id: string, model: string): string | undefined {
   const value = normalizeModelChoice(model);
   if (!isClaudeSessionId(id) || !value || value === 'default') return undefined;
@@ -192,6 +205,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
   let releaseInterrupt: (() => void) | undefined;
   let pendingWrite: { finish: (error?: Error) => void; promise: Promise<void> } | undefined;
   let finishModelChange: ((model?: string) => void) | undefined;
+  let finishModeChange: ((value: { mode?: string; error?: string }) => void) | undefined;
 
   const stream = new ClaudeChatStream(launch, event => {
     if (event.kind === 'ready') clearTimeout(initializationTimer);
@@ -208,6 +222,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
     clearTimeout(interruptTimer);
     releaseInterrupt?.();
     finishModelChange?.();
+    finishModeChange?.({ error: 'The chat closed before the mode change was confirmed.' });
     if (pendingWrite) {
       pendingWrite.finish(new Error(reason ?? unavailable));
       child.stdin.destroy();
@@ -246,7 +261,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
   const connection: ChatConnection = {
     async send(message) {
       if (waitingForInterrupt) await waitingForInterrupt;
-      if (closing || exited || pendingWrite || finishModelChange || !child.stdin.writable) throw new Error(unavailable);
+      if (closing || exited || pendingWrite || finishModelChange || finishModeChange || !child.stdin.writable) throw new Error(unavailable);
       if (stream.active) throw new Error('Claude Code is still processing the previous message.');
       if (!stream.permits(message.command)) throw new Error('The command is unavailable on the current Claude Code channel.');
       if (!isClaudeSessionId(message.id) || typeof message.text !== 'string' || !message.text.trim()
@@ -297,6 +312,25 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
       const timer = setTimeout(() => close('The model change was not confirmed. Check the conversation before retrying.'), 10_000);
       timer.unref();
       finishModelChange = finish;
+      await write(frame);
+      return result.promise;
+    },
+    async setPermissionMode(mode) {
+      if (closing || exited || pendingWrite || finishModeChange || !child.stdin.writable) return { error: 'Claude Code is not ready for a mode change.' };
+      const id = randomUUID();
+      const frame = permissionModeFrame(id, mode);
+      if (!frame) return { error: 'That permission mode cannot be selected here.' };
+      const result = deferred<{ mode?: string; error?: string }>();
+      const finish = (value: { mode?: string; error?: string }) => {
+        if (finishModeChange !== finish) return;
+        finishModeChange = undefined;
+        clearTimeout(timer);
+        result.resolve(value);
+      };
+      if (!stream.beginModeChange(id, finish)) return { error: 'Claude Code cannot change the mode right now.' };
+      const timer = setTimeout(() => close('The mode change was not confirmed. Check the conversation before retrying.'), 10_000);
+      timer.unref();
+      finishModeChange = finish;
       await write(frame);
       return result.promise;
     },
