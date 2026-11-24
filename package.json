@@ -2,6 +2,8 @@
   "name": "agent-lens",
   "displayName": "Agent Lens",
   "description": "Observe local coding agent activity in VS Code.",
+  "license": "MIT",
+  "icon": "media/icon.png",
   "version": "0.1.1",
   "publisher": "salehshakib",
   "private": true,
