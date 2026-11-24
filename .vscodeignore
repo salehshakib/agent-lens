@@ -5,6 +5,8 @@
 !dist/relay/relay.js
 !dist/webview/sidebar.js
 !dist/webview/panel.js
+!LICENSE
+!media/icon.png
 !media/activity.svg
 !media/lens.css
 !media/sidebar.css
