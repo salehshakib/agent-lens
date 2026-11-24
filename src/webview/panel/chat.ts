@@ -76,6 +76,7 @@ export class ChatPane {
     private readonly post: (request: PanelRequest) => void,
     private readonly onPositionChange?: (position: ChatPosition | undefined) => void,
     initialPosition?: ChatPosition,
+    private readonly openTab?: (tab: 'map' | 'files') => void,
   ) {
     this.composer = new Composer(post);
     this.startupPosition = this.savedPosition = parseChatPosition(initialPosition);
@@ -247,9 +248,10 @@ export class ChatPane {
     const signature = JSON.stringify(card);
     if (row.card?.signature === signature) return;
     const active = document.activeElement;
-    const element = renderChatCard(card, this.post);
+    const element = renderChatCard(card, this.post, this.openTab);
     if (row.card) {
       const previous = row.card.element;
+      if (previous instanceof HTMLDetailsElement && element instanceof HTMLDetailsElement) element.open = previous.open;
       const key = active instanceof HTMLElement && previous.contains(active) ? active.dataset.key : undefined;
       for (const input of previous.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input[data-key], textarea[data-key]')) {
         const next = element.querySelector<HTMLInputElement | HTMLTextAreaElement>('[data-key="' + CSS.escape(input.dataset.key!) + '"]');

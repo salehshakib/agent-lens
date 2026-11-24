@@ -30,6 +30,11 @@ export function key(...parts: (string | undefined)[]): string {
   return createHash('sha256').update(JSON.stringify(parts)).digest('hex').slice(0, 32);
 }
 
+/** Opaque exact-identity key shared by recorded rows and provisional stream rows. */
+export function identityKey(kind: 'user' | 'response' | 'call', id: string): string {
+  return key('identity', kind, id);
+}
+
 export function sourceSessionId(source: Source, nativeId = source.sessionId): string {
   return key(source.provider, sourceIdentityHome(source), nativeId.toLowerCase());
 }

@@ -105,6 +105,11 @@ export interface FilterOption {
   label: string;
 }
 
+/** A lane filter entry with its existing parent projection, for the Timeline lane header Open parent action. */
+export interface LaneOption extends FilterOption {
+  parent: ParentInfo;
+}
+
 export interface SourceView {
   label: string;
   state: string;
@@ -181,6 +186,8 @@ export interface RowView {
   durationMs?: number;
   file?: string;
   turnId?: string;
+  /** Opaque exact-identity hashes used to match provisional stream rows. Never shown. */
+  nativeKeys?: string[];
   /** Membership of a repeated-call streak. The first row of a streak carries the group head. */
   loop?: { id: string; tool: string; count: number; live: boolean };
   signals?: SignalView[];
@@ -312,7 +319,7 @@ export interface SessionDetail {
   files: FileGroup[];
   usage: UsageView;
   tasks: TaskView[];
-  lanes: FilterOption[];
+  lanes: LaneOption[];
   privateMode: boolean;
   partial: boolean;
   /** The recorded evidence stopped growing before the session was fully read. */
@@ -370,14 +377,25 @@ export interface ChatCardAction {
   input?: { label: string; value?: string; maxLength: number; multiline?: boolean };
 }
 
+/** A transcript link that reuses an existing panel route. Without a `request` or `tab` it is shown as an unavailable reason. */
+export interface CardLink {
+  label: string;
+  request?: Extract<PanelRequest, { type: 'openDiff' | 'openTranscript' | 'goto' }>;
+  tab?: 'map' | 'files';
+  reason?: string;
+}
+
 export interface ChatCardEntry {
   title: string;
   detail?: string;
+  links?: readonly CardLink[];
   actions?: readonly ChatCardAction[];
 }
 
 export interface ChatCard {
   title: string;
+  /** Render as a collapsed block with the title as its summary. Used for folded tool activity and agent groups. */
+  folded?: boolean;
   scope: string;
   state: 'loading' | 'ready' | 'empty' | 'unavailable' | 'denied' | 'changed';
   message?: string;

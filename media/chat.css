@@ -271,3 +271,5 @@
     padding-block-end: 6px;
   }
 }
+.chat-card-fold > summary { cursor: pointer; font-weight: 600; }
+.chat-card-fold { max-width: 72ch; }

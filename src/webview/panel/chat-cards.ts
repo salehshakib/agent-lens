@@ -1,5 +1,5 @@
 import { formatAge, formatReset, formatTokens } from '../../shared/format';
-import type { ChatCard, ChatCardAction, GaugeView, PanelRequest, TokenRow, UsageView } from '../../shared/protocol';
+import type { CardLink, ChatCard, ChatCardAction, GaugeView, PanelRequest, TokenRow, UsageView } from '../../shared/protocol';
 import { button, clean, el, gaugeBlock, visuallyHidden } from '../dom';
 
 type Post = (request: PanelRequest) => void;
@@ -91,13 +91,35 @@ const stateLabels: Record<ChatCard['state'], string> = {
   changed: 'The target has changed.',
 };
 
-export function renderChatCard(card: ChatCard, post: Post): HTMLElement {
+let openTab: ((tab: 'map' | 'files') => void) | undefined;
+
+function renderLinks(links: readonly CardLink[] | undefined, post: Post): HTMLElement | undefined {
+  if (!links?.length) return undefined;
+  return el('div', { cls: 'chat-card-actions' }, ...links.map(link => {
+    if (!link.request && !link.tab) {
+      return el('span', { cls: 'muted', text: link.label + ' unavailable: ' + (link.reason ?? 'not recorded') + '.' });
+    }
+    return button(link.label, () => {
+      if (link.request) post(link.request);
+      else if (link.tab) openTab?.(link.tab);
+    });
+  }));
+}
+
+export function renderChatCard(card: ChatCard, post: Post, tabOpener?: (tab: 'map' | 'files') => void): HTMLElement {
+  openTab = tabOpener;
+  if (!card.folded) return renderCardBody(card, post);
+  const block = el('details', { cls: 'chat-card-fold' }, el('summary', { text: card.title }), renderCardBody({ ...card, title: '' }, post));
+  return block;
+}
+
+function renderCardBody(card: ChatCard, post: Post): HTMLElement {
   const now = Date.now();
   const message = card.message ?? stateLabels[card.state];
   return el('section', { cls: 'chat-card', attrs: {
     'aria-label': clean(card.title), 'aria-busy': card.state === 'loading' ? 'true' : undefined, 'data-state': card.state,
   } },
-    el('h3', { cls: 'chat-card-title', text: card.title }),
+    card.title ? el('h3', { cls: 'chat-card-title', text: card.title }) : undefined,
     card.scope ? el('p', { cls: 'chat-card-scope', text: card.scope }) : undefined,
     message ? el('p', { cls: 'chat-card-message', text: message }) : undefined,
     renderActions(card.actions, post),
@@ -107,6 +129,6 @@ export function renderChatCard(card: ChatCard, post: Post): HTMLElement {
     card.entries?.length ? el('ul', { cls: 'chat-card-entries' }, ...card.entries.map(entry => el('li', { cls: 'chat-card-entry' },
       el('strong', { text: entry.title }),
       entry.detail ? el('p', { cls: 'chat-card-detail', text: entry.detail }) : undefined,
-      renderActions(entry.actions, post, entry.title)))) : undefined,
+      renderActions(entry.actions, post, entry.title), renderLinks(entry.links, post)))) : undefined,
     card.diff?.length ? renderDiff(card.diff) : undefined);
 }

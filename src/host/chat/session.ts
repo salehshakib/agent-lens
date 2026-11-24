@@ -1,3 +1,5 @@
+import { reconcileRows, scopeSessionId } from './reconcile';
+import type { ProvisionalRow } from './reconcile';
 import { randomUUID } from 'node:crypto';
 import { maxChatDraft } from '../../shared/protocol';
 import type { ChatRow, ChatView } from '../../shared/protocol';
@@ -27,7 +29,9 @@ export interface ChatPresentation {
   profile?: string;
   privateMode: boolean;
   reason?: string;
-  history?: readonly ChatRow[];
+  history?: readonly (ChatRow & { keys?: readonly string[] })[];
+  /** Recorded session id the history came from. Live rows merge into it only when the conversation's verified scope derives it. */
+  sessionId?: string;
 }
 
 export type ChatRequest =
@@ -39,6 +43,7 @@ interface LiveRow extends ChatRow {
   toolName?: string;
   projected?: string;
   local?: LocalChatRow;
+  identity?: ProvisionalRow['identity'];
 }
 
 export interface LocalChatRow {
@@ -400,9 +405,11 @@ export class ChatSessions {
     const history = presentation.history ?? [];
     const frozen = conversation.frozenHistory;
     if (!frozen) conversation.history = history.map(row => row.id);
-    const rows = [...(frozen ? history.filter(row => frozen.has(row.id)) : history)]
-      .concat([...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local)
-        .map(row => displayRow(row, presentation.privateMode)));
+    const recorded = frozen ? history.filter(row => frozen.has(row.id)) : history;
+    const verified = Boolean(identity && presentation.sessionId && presentation.sessionId === scopeSessionId(identity));
+    const live = reconcileRows(recorded, [...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local), verified).live;
+    const rows = recorded.map(({ keys: _keys, ...row }) => row as ChatRow)
+      .concat(live.map(row => displayRow(row, presentation.privateMode)));
     return {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider,
       profile: presentation.profile, state, reason, rows,
@@ -574,7 +581,7 @@ export class ChatSessions {
         name: 'compact', argument: '', revision: conversation.revision, scopeStamp: this.commandScopeStamp(conversation.key),
         result: { state: 'pending' },
       });
-    } else if (!setting) this.addRow(conversation, { id: rowId, role: 'user', text, state: 'pending' });
+    } else if (!setting) this.addRow(conversation, { id: rowId, role: 'user', text, state: 'pending', identity: { kind: 'user', id } });
     this.changed(conversation);
 
     let worker = conversation.worker;
@@ -743,7 +750,8 @@ export class ChatSessions {
     if (event.mode === 'append' && previous?.truncated) return;
     const base = event.mode === 'append' ? previous?.text ?? '' : '';
     const text = base + event.text.slice(0, maxBlock - base.length);
-    this.addRow(conversation, { id, role: 'assistant', text, truncated: base.length + event.text.length > maxBlock });
+    this.addRow(conversation, { id, role: 'assistant', text, truncated: base.length + event.text.length > maxBlock,
+      identity: { kind: 'response', id: event.messageId } });
     (turn.textRows ??= new Set()).add(id);
     this.changed(conversation);
   }
@@ -754,7 +762,7 @@ export class ChatSessions {
     const toolName = event.kind === 'tool' ? safeText(event.name, 80) ?? 'Tool' : previous?.toolName ?? 'Tool';
     const text = event.kind === 'tool' ? toolName
       : toolName + ' · ' + (event.outcome === 'needs-approval' ? approvalsLater : event.outcome === 'completed' ? 'Completed' : 'Failed');
-    this.addRow(conversation, { id, role: 'tool', text, toolName });
+    this.addRow(conversation, { id, role: 'tool', text, toolName, identity: { kind: 'call', id: event.callId } });
     this.changed(conversation);
   }
 
