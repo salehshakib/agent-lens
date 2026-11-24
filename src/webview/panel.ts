@@ -208,6 +208,10 @@ window.addEventListener('message', event => {
       if (!arrival) ui.history = [];
     }
     if (message.tab) ui.tab = message.tab;
+    if (message.tab === 'files' && message.files && next.session && !next.session.privateMode) {
+      ui.fileSearch = message.files.search;
+      ui.fileKind = message.files.kind === 'all' ? '' : message.files.kind;
+    }
     if (next.mode === 'chat') ui.chatKey = next.chat.key;
     ui.view = undefined;
   } else {

@@ -6,15 +6,16 @@ import type { LensData } from './data';
 import { render, resourceRoots } from './html';
 
 type Focus = { lane: string; row: string };
+type FilesFocus = Extract<HostMessage, { type: 'panel' }>['files'];
 export type ChatPanelRequest = Extract<PanelRequest, { type: `chat${string}` }>;
 export type PanelTarget =
-  | { kind: 'chat'; key: string; id?: string; tab?: PanelTab; focus?: Focus; from?: string }
+  | { kind: 'chat'; key: string; id?: string; tab?: PanelTab; focus?: Focus; from?: string; files?: FilesFocus }
   | { kind: 'usage' }
   | { kind: 'tasks' };
 
 export interface PanelActions {
   chat(key: string, id?: string): Promise<PanelModel>;
-  chatRequest(key: string, request: ChatPanelRequest): void;
+  chatRequest(key: string, request: ChatPanelRequest, id?: string): void;
   sessionId(key: string): string | undefined;
   openSession(id: string, tab: PanelTab, focus?: Focus, from?: string): void;
   openFile(id: string): void;
@@ -35,6 +36,7 @@ interface Editor {
   timer?: NodeJS.Timeout;
   tab?: PanelTab;
   focus?: Focus;
+  files?: FilesFocus;
   back?: string;
   usageFilters: UsageFilters;
 }
@@ -61,6 +63,7 @@ export class PanelView {
         existing.target = target;
         existing.tab = target.tab;
         existing.focus = target.focus;
+        existing.files = target.files;
         if (target.from && target.from !== key) existing.back = target.from;
       }
       this.reveal(existing);
@@ -93,6 +96,7 @@ export class PanelView {
     if (target.kind === 'chat') {
       editor.tab = target.tab;
       editor.focus = target.focus;
+      editor.files = target.files;
       if (target.from !== key) editor.back = target.from;
     }
     this.editors.set(key, editor);
@@ -142,7 +146,8 @@ export class PanelView {
         this.refresh(editor);
         break;
       case 'chatDraft': case 'chatSend': case 'chatContinue': case 'chatInterrupt': case 'chatRetry': case 'chatChooseScope':
-        if (editor.target.kind === 'chat') this.actions.chatRequest(editor.key, request);
+      case 'chatCardAction':
+        if (editor.target.kind === 'chat') this.actions.chatRequest(editor.key, request, this.sessionId(editor));
         break;
       case 'openFile': this.actions.openFile(request.id); break;
       case 'openDiff': this.actions.openDiff(request.id); break;
@@ -198,10 +203,11 @@ export class PanelView {
     void this.model(editor).then(model => {
       if (sequence !== editor.sequence || this.editors.get(editor.key) !== editor) return;
       if (model.mode === 'chat') editor.panel.title = 'Agent Lens: ' + model.chat.title;
-      const message: HostMessage = { type: 'panel', model, tab: editor.tab, focus: editor.focus,
+      const message: HostMessage = { type: 'panel', model, tab: editor.tab, focus: editor.focus, files: editor.files,
         back: Boolean(editor.back && this.editors.has(editor.back)) };
       editor.tab = undefined;
       editor.focus = undefined;
+      editor.files = undefined;
       return editor.panel.webview.postMessage(message);
     }).catch(() => undefined);
   }

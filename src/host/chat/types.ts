@@ -17,6 +17,18 @@ export interface ChatLaunch {
   /** Unique for each owned connection, including a later resume of the same conversation. */
   owner: string;
   resume: boolean;
+  settings?: ChatSettings;
+}
+
+export interface ChatSettings {
+  model?: string;
+  effort?: string;
+}
+
+export interface CompactMeasurement {
+  preTokens: number;
+  postTokens: number;
+  at: number;
 }
 
 export interface ChatCapabilities {
@@ -24,12 +36,23 @@ export interface ChatCapabilities {
   interrupt: boolean;
   commands: readonly string[];
   skills: readonly string[];
+  /** Observed executable version, bound to this owner and its immutable scope. */
+  version?: string;
+  literalText?: boolean;
+  nativeCommands?: boolean;
+  terminalCommands?: readonly string[];
+  permissionMode?: string;
+  effortActive?: boolean;
+  ultrathinkAvailable?: boolean;
+  fastMode?: string;
+  fastDisabledReason?: string;
 }
 
 export interface ChatSend {
   /** Local UUID placed on the provider envelope and returned in replay. */
   id: string;
   text: string;
+  command?: 'native' | 'compact' | 'effort' | 'fast';
 }
 
 export type ChatOutcome = 'completed' | 'interrupted' | 'failed';
@@ -37,11 +60,13 @@ export type ChatOutcome = 'completed' | 'interrupted' | 'failed';
 type ChatUpdate =
   | { kind: 'ready'; nativeId: string; capabilities: ChatCapabilities; model?: string }
   | { kind: 'ack'; turnId: string; messageId: string }
+  | { kind: 'model'; turnId: string; model: string }
   | { kind: 'text'; turnId: string; messageId: string; blockId: string; mode: 'append' | 'replace'; text: string }
   | { kind: 'tool'; turnId: string; callId: string; name: string }
   | { kind: 'toolResult'; turnId: string; callId: string; outcome: 'completed' | 'failed' | 'needs-approval' }
   | { kind: 'interruptReceipt'; turnId: string; requestId: string; accepted: boolean }
-  | { kind: 'result'; turnId: string; outcome: ChatOutcome; usage?: Tokens; reason?: string }
+  | { kind: 'result'; turnId: string; outcome: ChatOutcome; usage?: Tokens; reason?: string;
+    compact?: CompactMeasurement; commandText?: string; effortAcknowledged?: boolean; errorKind?: 'limit' }
   | { kind: 'exit'; reason?: string };
 
 export type ChatEvent = ChatLaunch & ChatUpdate;
@@ -50,6 +75,7 @@ export interface ChatConnection {
   /** A successful write leaves delivery pending until acknowledged. */
   send(message: ChatSend): Promise<void>;
   interrupt(): Promise<string>;
+  setModel?(model: string): Promise<string | undefined>;
   /** Close only this worker and resolve when it has exited. */
   close(): Promise<void>;
 }

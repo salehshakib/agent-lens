@@ -3,9 +3,12 @@ import { maxChatDraft } from '../../shared/protocol';
 import type { ChatRow, ChatView } from '../../shared/protocol';
 import type { Provider } from '../adapters/types';
 import { safeText } from '../privacy/projection';
+import { parseChatInput, slashCatalog } from './commands';
+import { canCheckFast, isVerifiedClaudeChat, normalizeEffortChoice, normalizeModelChoice } from '../adapters/claude-code/chat-settings';
 import { chatWriterKey, ChatOwnership, sameChatIdentity } from './ownership';
 import { ChatLaunchError } from './types';
-import type { ChatAdapter, ChatAttempt, ChatCapabilities, ChatConnection, ChatEvent, ChatIdentity, ChatLaunch, ChatScope } from './types';
+import type { ChatAdapter, ChatAttempt, ChatCapabilities, ChatConnection, ChatEvent, ChatIdentity, ChatLaunch, ChatScope,
+  ChatSend, ChatSettings, CompactMeasurement } from './types';
 
 export interface ChatSessionDeps {
   adapter(provider: Provider): ChatAdapter | undefined;
@@ -35,6 +38,26 @@ interface LiveRow extends ChatRow {
   truncated?: boolean;
   toolName?: string;
   projected?: string;
+  local?: LocalChatRow;
+}
+
+export interface LocalChatRow {
+  name: string;
+  argument: string;
+  reason?: string;
+  canSendAsText?: boolean;
+  allProjects?: boolean;
+  codexMode?: 'start' | 'follow';
+  revision: number;
+  scopeStamp?: string;
+  fileKind?: 'all' | 'changed' | 'read' | 'mentioned';
+  diffId?: string;
+  resumeLimit?: number;
+  resumeFolder?: { cwd: string; project: string; label: string };
+  contextLane?: string;
+  actionIssue?: string;
+  terminalName?: string;
+  result?: { state: 'pending' | 'completed' | 'failed'; message?: string; compact?: CompactMeasurement };
 }
 
 interface Turn {
@@ -44,6 +67,9 @@ interface Turn {
   written: boolean;
   delivery: 'pending' | 'acknowledged' | 'uncertain';
   journal?: Promise<void>;
+  command?: ChatSend['command'];
+  effort?: string;
+  textRows?: Set<string>;
 }
 
 interface Interrupt {
@@ -70,6 +96,9 @@ interface Conversation {
   indexed?: string;
   draft: string;
   revision: number;
+  submitted?: number;
+  parkedDraft?: { text: string; revision: number };
+  cleared?: boolean;
   armed: boolean;
   rows: Map<string, LiveRow>;
   retryRow?: string;
@@ -79,6 +108,11 @@ interface Conversation {
   turn?: Turn;
   checking: boolean;
   reason?: string;
+  model?: string;
+  resolvedModel?: string;
+  settings?: ChatSettings;
+  compact?: CompactMeasurement;
+  observedCapabilities?: ChatCapabilities;
   conflict?: string;
   recoveryQueue: ChatAttempt[];
 }
@@ -98,15 +132,6 @@ function makeConversation(key: string, scope: ChatScope | undefined, armed: bool
   return {
     key, scope, armed, draft: '', revision: 0, rows: new Map(), history: [], checking: false, recoveryQueue: [],
   };
-}
-
-function messageForDraft(draft: string): string | undefined {
-  if (!draft.trim()) return 'Enter a message.';
-  if (/^[!/]/.test(draft.trimStart())) {
-    return 'Slash commands and leading ! are not available in chat yet. Use \\/ for a literal leading slash.';
-  }
-  if (draft.includes('\0')) return 'Remove the null character from the draft before sending.';
-  return undefined;
 }
 
 function displayRow(row: LiveRow, privateMode: boolean): ChatRow {
@@ -147,7 +172,10 @@ export class ChatSessions {
       }
       return existing.key;
     }
-    const conversation = makeConversation(this.conversations.has(keyHint) ? randomUUID() : keyHint, identity, false);
+    const pending = this.conversations.get(keyHint);
+    const conversation = pending && !pending.scope && !pending.armed ? pending
+      : makeConversation(pending ? randomUUID() : keyHint, identity, false);
+    conversation.scope = identity;
     conversation.identity = identity;
     this.conversations.set(conversation.key, conversation);
     this.index(conversation, identity);
@@ -157,6 +185,172 @@ export class ChatSessions {
 
   keyFor(identity: ChatIdentity): string | undefined {
     return this.canonical.get(chatWriterKey(identity))?.key;
+  }
+
+  inspect(key: string): void {
+    if (!this.conversations.has(key)) this.conversations.set(key, makeConversation(key, undefined, false));
+  }
+
+  localRows(key: string): readonly { id: string; command: LocalChatRow }[] {
+    return [...(this.conversations.get(key)?.rows.values() ?? [])]
+      .flatMap(row => row.local ? [{ id: row.id, command: row.local }] : []);
+  }
+
+  commandState(key: string) {
+    const conversation = this.conversations.get(key);
+    const activeCapabilities = conversation?.worker?.closing ? undefined : conversation?.worker?.capabilities;
+    const last = conversation?.observedCapabilities;
+    return {
+      capabilities: activeCapabilities ?? (last ? { ...last, send: false, nativeCommands: false, literalText: false } : undefined),
+      owner: conversation?.worker?.launch.owner,
+      turn: conversation?.turn?.record.id,
+      busy: conversation ? this.busy(conversation) : false,
+      model: conversation?.model,
+      resolvedModel: conversation?.resolvedModel,
+      settings: conversation?.settings,
+      compact: conversation?.compact,
+      revision: conversation?.revision,
+    };
+  }
+
+  async applySetting(key: string, row: string, kind: 'model' | 'effort' | 'fast', selection: string): Promise<void> {
+    const conversation = this.conversations.get(key);
+    if (!conversation || conversation.scope?.provider !== 'claude-code' || conversation.conflict || this.disposed) return;
+    const worker = conversation.worker;
+    const value = kind === 'model' ? normalizeModelChoice(selection) : kind === 'effort' ? normalizeEffortChoice(selection) : selection;
+    const setResult = (state: 'pending' | 'completed' | 'failed', message?: string) =>
+      this.updateLocal(key, row, { result: { state, message }, actionIssue: undefined });
+    if (this.busy(conversation) || value === undefined || (kind === 'fast' && value !== '')) {
+      setResult('failed', 'The setting needs a valid selection at an idle boundary.');
+      return;
+    }
+    if (!worker && kind !== 'fast') {
+      conversation.settings = { ...conversation.settings, [kind]: value === 'default' ? undefined : value };
+      if (kind === 'model') conversation.resolvedModel = undefined;
+      setResult('completed', 'Saved for the next chat start or exact resume.');
+      return;
+    }
+    if (!worker?.connection || !isVerifiedClaudeChat(worker.capabilities) || value === 'default'
+      || (kind === 'fast' && !canCheckFast(worker.capabilities))
+      || (kind === 'effort' && !worker.capabilities?.effortActive)) {
+      setResult('failed', 'This setting is unavailable on the current chat channel.');
+      return;
+    }
+    if (kind === 'effort' || kind === 'fast') {
+      setResult('pending');
+      await this.send(conversation, { row, command: kind, text: kind === 'fast' ? '/fast' : '/effort ' + value,
+        effort: kind === 'effort' ? value : undefined });
+      return;
+    }
+    conversation.checking = true;
+    setResult('pending', 'Waiting for the provider to acknowledge the requested model.');
+    try {
+      const reason = await this.check(worker.launch, true);
+      if (reason || conversation.worker !== worker || worker.closing) {
+        setResult('failed', reason ?? 'The chat owner changed.');
+        return;
+      }
+      const resolved = await worker.connection.setModel?.(value);
+      if (!resolved || conversation.worker !== worker || worker.closing) {
+        setResult('failed', 'The provider did not confirm the model change.');
+        return;
+      }
+      conversation.settings = { ...conversation.settings, model: value };
+      conversation.resolvedModel = resolved;
+      setResult('completed', 'The provider acknowledged the request. The next turn will report the effective model.');
+    } catch {
+      setResult('failed', 'The model change could not be confirmed.');
+    } finally {
+      conversation.checking = false;
+      this.changed(conversation);
+    }
+  }
+
+  async releaseForTerminal(key: string): Promise<string | undefined> {
+    const conversation = this.conversations.get(key);
+    if (!conversation?.identity || !conversation.worker || this.busy(conversation) || conversation.conflict) {
+      return 'The current chat owner cannot be released while work is active or the session is uncertain.';
+    }
+    const close = this.close(conversation, conversation.worker);
+    this.changed(conversation);
+    if (!await close) return 'Could not verify that Agent Lens released this conversation.';
+    conversation.armed = false;
+    this.changed(conversation);
+    return undefined;
+  }
+
+  async prepareTerminal(key: string, open: (launch: ChatLaunch) => Promise<string | undefined>): Promise<string | undefined> {
+    const conversation = this.conversations.get(key);
+    const identity = conversation?.identity;
+    if (!conversation || !identity || conversation.worker || this.busy(conversation) || conversation.conflict || this.disposed) {
+      return 'Release the idle chat owner before opening the official terminal.';
+    }
+    const launch = { identity, owner: randomUUID(), resume: true };
+    if (!this.ownership.claim(launch)) return writerPresent;
+    conversation.checking = true;
+    this.changed(conversation);
+    let release: (() => Promise<void>) | undefined;
+    try {
+      if (this.deps.claim && !(release = await this.deps.claim(launch))) return writerPresent;
+      const reason = await this.check(launch);
+      if (reason || this.disposed) return reason ?? 'The chat was closed.';
+      const failure = await open(launch);
+      if (!failure) conversation.armed = false;
+      return failure;
+    } finally {
+      try { await release?.(); }
+      finally {
+        this.ownership.release(launch);
+        conversation.checking = false;
+        this.changed(conversation);
+      }
+    }
+  }
+
+  commandScopeStamp(key: string, sessionId?: string): string {
+    const scope = this.scope(key);
+    return scope ? JSON.stringify([scope.provider, scope.profile, scope.home, scope.cwd]) : sessionId ?? '';
+  }
+
+  parked(exclude: string): readonly { key: string; scope?: ChatScope }[] {
+    return [...this.conversations.values()].flatMap(item =>
+      item.key !== exclude && !item.identity && item.armed && (item.cleared || item.draft.trim() || item.worker)
+        ? [{ key: item.key, scope: item.scope }] : []);
+  }
+
+  local(key: string, revision: number, text: string, command: Omit<LocalChatRow, 'revision'>, preserveDraft = false): boolean {
+    const conversation = this.conversations.get(key);
+    if (!conversation || this.disposed || !this.submitDraft(conversation, revision, text)) {
+      if (conversation) this.changed(conversation);
+      return false;
+    }
+    if (!command.reason && !preserveDraft) {
+      conversation.draft = conversation.parkedDraft?.text ?? '';
+      conversation.parkedDraft = undefined;
+    }
+    if (command.name === 'clear' && !command.reason) conversation.cleared = true;
+    const id = randomUUID();
+    this.addLocalRow(conversation, id, { ...command, revision });
+    this.changed(conversation);
+    return true;
+  }
+
+  updateLocal(key: string, id: string, change: Partial<LocalChatRow>): void {
+    const conversation = this.conversations.get(key);
+    const row = conversation?.rows.get(id);
+    if (!conversation || !row?.local) return;
+    row.local = { ...row.local, ...change };
+    this.changed(conversation);
+  }
+
+  async sendAsText(key: string, revision: number): Promise<void> {
+    const conversation = this.conversations.get(key);
+    if (!conversation || revision !== conversation.revision || this.busy(conversation)) return;
+    const escaped = conversation.draft.replace(/^(\s*)\//u, '$1\\/');
+    if (escaped.length > maxChatDraft || parseChatInput(escaped, this.commandState(key).capabilities).kind !== 'literal') return;
+    // The explicit action changes the draft in place, so the composer uses the same revision sequence.
+    conversation.draft = escaped;
+    await this.send(conversation);
   }
 
   scope(key: string): ChatScope | undefined {
@@ -186,7 +380,7 @@ export class ChatSessions {
 
   setScope(key: string, scope: ChatScope): void {
     const conversation = this.conversations.get(key);
-    if (!conversation || conversation.identity || this.busy(conversation)) return;
+    if (!conversation?.armed || conversation.identity || this.busy(conversation) || conversation.worker) return;
     conversation.scope = scope;
     conversation.armed = true;
     conversation.reason = undefined;
@@ -207,7 +401,8 @@ export class ChatSessions {
     const frozen = conversation.frozenHistory;
     if (!frozen) conversation.history = history.map(row => row.id);
     const rows = [...(frozen ? history.filter(row => frozen.has(row.id)) : history)]
-      .concat([...conversation.rows.values()].map(row => displayRow(row, presentation.privateMode)));
+      .concat([...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local)
+        .map(row => displayRow(row, presentation.privateMode)));
     return {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider,
       profile: presentation.profile, state, reason, rows,
@@ -216,8 +411,11 @@ export class ChatSessions {
       canContinue: Boolean(!presentation.privateMode && identity && !conversation.armed && !busy && !blockingReason),
       canInterrupt: Boolean(turn?.written && worker?.capabilities?.interrupt && !worker.closing && !worker.interrupt),
       canRetry: Boolean(!presentation.privateMode && turn?.delivery === 'uncertain' && !conversation.checking && !worker),
-      canChooseScope: !identity && !busy && !worker,
+      canChooseScope: conversation.armed && !identity && !busy && !worker,
       privateMode: presentation.privateMode,
+      commands: slashCatalog(this.commandState(key).capabilities, busy),
+      commandScope: [presentation.project, presentation.provider, presentation.profile].filter(Boolean).join(' · '),
+      literalText: !worker?.closing && worker?.capabilities?.literalText,
     };
   }
 
@@ -229,7 +427,7 @@ export class ChatSessions {
         this.updateDraft(conversation, request.revision, request.text);
         break;
       case 'chatSend':
-        if (this.updateDraft(conversation, request.revision, request.text)) await this.send(conversation);
+        if (this.submitDraft(conversation, request.revision, request.text)) await this.send(conversation);
         else this.changed(conversation);
         break;
       case 'chatContinue':
@@ -298,8 +496,21 @@ export class ChatSessions {
   private updateDraft(conversation: Conversation, revision: number, text: string): boolean {
     if (!Number.isSafeInteger(revision) || revision < conversation.revision || text.length > maxChatDraft) return false;
     if (revision === conversation.revision) return text === conversation.draft;
+    const leadingSlash = text.trimStart().startsWith('/');
+    if (leadingSlash && !conversation.draft.trimStart().startsWith('/') && conversation.draft.trim()) {
+      conversation.parkedDraft = { text: conversation.draft, revision: conversation.revision };
+    } else if (!leadingSlash) {
+      conversation.parkedDraft = undefined;
+    }
     conversation.revision = revision;
     conversation.draft = text;
+    return true;
+  }
+
+  private submitDraft(conversation: Conversation, revision: number, text: string): boolean {
+    if (conversation.submitted !== undefined && revision <= conversation.submitted) return false;
+    if (!this.updateDraft(conversation, revision, text)) return false;
+    conversation.submitted = revision;
     return true;
   }
 
@@ -327,33 +538,43 @@ export class ChatSessions {
     this.changed(conversation);
   }
 
-  private async send(conversation: Conversation): Promise<void> {
+  private async send(conversation: Conversation, setting?: { row: string; command: 'effort' | 'fast'; text: string; effort?: string }): Promise<void> {
     const { scope, identity } = conversation;
     if (!scope || !conversation.armed || conversation.conflict || this.busy(conversation) || this.disposed) {
+      if (setting) this.updateLocal(conversation.key, setting.row, { result: { state: 'failed', message: 'The chat is unavailable.' } });
       this.changed(conversation);
       return;
     }
-    const text = conversation.draft;
+    const parsed = parseChatInput(conversation.draft, conversation.worker?.capabilities);
+    const native = parsed.kind === 'native' && parsed.route === 'Native' && !parsed.reason ? parsed : undefined;
+    const command: ChatSend['command'] = setting?.command ?? (native ? native.name === 'compact' ? 'compact' : 'native' : undefined);
+    const text = setting?.text ?? (parsed.kind === 'text' || parsed.kind === 'literal' ? parsed.text : native?.text);
     const launch = conversation.worker?.launch ?? {
       identity: identity ?? { ...scope, nativeId: randomUUID() }, owner: randomUUID(), resume: !!identity,
+      settings: conversation.settings,
     };
     const adapter = this.deps.adapter(scope.provider);
-    const reason = messageForDraft(text) ?? (!adapter ? 'Chat is unavailable for this provider.' : undefined);
-    if (reason || !adapter) {
-      conversation.reason = reason;
+    if (!text?.trim() || !adapter) {
+      conversation.reason = 'reason' in parsed && parsed.reason ? parsed.reason
+        : !adapter ? 'Chat is unavailable for this provider.' : 'Enter a message.';
       this.changed(conversation);
       return;
     }
     const id = randomUUID();
-    const rowId = conversation.retryRow && conversation.rows.get(conversation.retryRow)?.text === text ? conversation.retryRow : id;
+    const rowId = setting?.row ?? (conversation.retryRow && conversation.rows.get(conversation.retryRow)?.text === text ? conversation.retryRow : id);
     const turn: Turn = {
       record: { identity: launch.identity, id, acknowledged: false, conversation: conversation.key },
-      rowId, revision: conversation.revision, written: false, delivery: 'pending',
+      rowId, revision: setting ? undefined : conversation.revision, written: false, delivery: 'pending', command, effort: setting?.effort,
     };
     conversation.retryRow = undefined;
     conversation.turn = turn;
     conversation.reason = undefined;
-    this.addRow(conversation, { id: rowId, role: 'user', text, state: 'pending' });
+    if (command === 'compact') {
+      this.addLocalRow(conversation, rowId, {
+        name: 'compact', argument: '', revision: conversation.revision, scopeStamp: this.commandScopeStamp(conversation.key),
+        result: { state: 'pending' },
+      });
+    } else if (!setting) this.addRow(conversation, { id: rowId, role: 'user', text, state: 'pending' });
     this.changed(conversation);
 
     let worker = conversation.worker;
@@ -391,7 +612,7 @@ export class ChatSessions {
     conversation.history = [];
     turn.written = true;
     try {
-      await worker.connection.send({ id, text });
+      await worker.connection.send({ id, text, command });
     } catch {
       if (this.current(conversation, worker, turn)) {
         await this.disconnect(conversation, worker, 'The chat connection stopped while submitting the message.');
@@ -448,6 +669,8 @@ export class ChatSessions {
         return;
       }
       worker.capabilities = event.capabilities;
+      conversation.observedCapabilities = event.capabilities;
+      conversation.model = event.model;
       conversation.identity = worker.launch.identity;
       this.changed(conversation);
       return;
@@ -455,11 +678,15 @@ export class ChatSessions {
     const turn = conversation.turn;
     if (!worker.capabilities || !turn?.written || event.turnId !== turn.record.id) return;
     switch (event.kind) {
+      case 'model':
+        conversation.model = event.model;
+        this.changed(conversation);
+        break;
       case 'ack':
         if (event.messageId === turn.record.id) this.acknowledge(conversation, turn);
         break;
       case 'text':
-        this.text(conversation, event);
+        this.text(conversation, event, turn);
         break;
       case 'tool':
       case 'toolResult':
@@ -474,10 +701,18 @@ export class ChatSessions {
           void this.disconnect(conversation, worker, 'The turn ended before message delivery was confirmed.');
           return;
         }
-        if (event.outcome !== 'completed') {
+        if (turn.command === 'compact' || turn.command === 'effort' || turn.command === 'fast') {
+          if (event.compact) conversation.compact = event.compact;
+          if (turn.effort && event.effortAcknowledged) conversation.settings = { ...conversation.settings, effort: turn.effort };
+          const completed = event.outcome === 'completed' && (turn.command !== 'effort' || event.effortAcknowledged);
+          this.updateLocal(conversation.key, turn.rowId, { result: { state: completed ? 'completed' : 'failed',
+            compact: event.compact, message: event.reason ?? event.commandText
+              ?? (completed ? undefined : 'The provider did not confirm the command.') } });
+        } else if (event.outcome !== 'completed') {
+          if (event.errorKind === 'limit') for (const id of turn.textRows ?? []) conversation.rows.delete(id);
           const text = safeText(event.reason, 220)
             ?? (event.outcome === 'interrupted' ? 'Turn interrupted.' : 'The provider reported a failed turn.');
-          this.addRow(conversation, { id: randomUUID(), role: 'notice', text });
+          this.addRow(conversation, { id: randomUUID(), role: event.errorKind === 'limit' ? 'error' : 'notice', text });
         }
         this.finish(conversation, turn);
         break;
@@ -493,17 +728,23 @@ export class ChatSessions {
     void turn.journal.catch(() => undefined);
     const row = conversation.rows.get(turn.rowId);
     if (row) row.state = undefined;
-    if (conversation.revision === turn.revision) conversation.draft = '';
+    if (conversation.revision === turn.revision) {
+      conversation.draft = conversation.parkedDraft?.revision !== turn.revision ? conversation.parkedDraft?.text ?? '' : '';
+      conversation.parkedDraft = undefined;
+    } else if (conversation.parkedDraft?.revision === turn.revision) {
+      conversation.parkedDraft = undefined;
+    }
     this.changed(conversation);
   }
 
-  private text(conversation: Conversation, event: Extract<ChatEvent, { kind: 'text' }>): void {
+  private text(conversation: Conversation, event: Extract<ChatEvent, { kind: 'text' }>, turn: Turn): void {
     const id = JSON.stringify([event.turnId, event.messageId, event.blockId]);
     const previous = conversation.rows.get(id);
     if (event.mode === 'append' && previous?.truncated) return;
     const base = event.mode === 'append' ? previous?.text ?? '' : '';
     const text = base + event.text.slice(0, maxBlock - base.length);
     this.addRow(conversation, { id, role: 'assistant', text, truncated: base.length + event.text.length > maxBlock });
+    (turn.textRows ??= new Set()).add(id);
     this.changed(conversation);
   }
 
@@ -526,6 +767,14 @@ export class ChatSessions {
         return;
       }
     }
+  }
+
+  private addLocalRow(conversation: Conversation, id: string, command: LocalChatRow): void {
+    this.addRow(conversation, { id, role: 'notice', text: '', local: command });
+    const rows = this.localRows(conversation.key);
+    if (rows.length <= 12) return;
+    const oldest = rows.find(row => row.id !== conversation.turn?.rowId);
+    if (oldest) conversation.rows.delete(oldest.id);
   }
 
   private async interrupt(conversation: Conversation): Promise<void> {
@@ -576,6 +825,9 @@ export class ChatSessions {
       turn.delivery = 'uncertain';
       const row = conversation.rows.get(turn.rowId);
       if (row) row.state = 'uncertain';
+      if (row?.local?.result?.state === 'pending') {
+        this.updateLocal(conversation.key, turn.rowId, { result: { state: 'failed', message: deliveryUncertain } });
+      }
       conversation.reason = conversation.reason ? conversation.reason + ' ' + deliveryUncertain : deliveryUncertain;
       this.changed(conversation);
     } else {
@@ -615,6 +867,9 @@ export class ChatSessions {
 
   private finish(conversation: Conversation, turn: Turn, reason?: string): void {
     conversation.turn = undefined;
+    if (reason && conversation.rows.get(turn.rowId)?.local?.result?.state === 'pending') {
+      this.updateLocal(conversation.key, turn.rowId, { result: { state: 'failed', message: reason } });
+    }
     conversation.reason = reason;
     void this.removeRecovery(turn);
     if (!this.nextRecovery(conversation)) this.changed(conversation);
