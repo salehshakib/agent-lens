@@ -2,6 +2,7 @@ import type { ChatRow, ChatView, PanelRequest } from '../../shared/protocol';
 import { button, clean, el } from '../dom';
 import { Composer } from './composer';
 import { renderChatCard } from './chat-cards';
+import { renderApproval } from './chat-approvals';
 
 interface TranscriptRow {
   element: HTMLLIElement;
@@ -11,6 +12,7 @@ interface TranscriptRow {
   content: Text;
   text?: string;
   card?: { signature: string; element: HTMLElement };
+  approval?: { signature: string; element: HTMLElement };
 }
 
 export interface ChatPosition {
@@ -231,6 +233,7 @@ export class ChatPane {
       const label = row.card ? 'Agent Lens' : author;
       if (rendered.label.textContent !== label) rendered.label.textContent = label;
       this.updateCard(rendered, chat.privateMode ? undefined : row.card);
+      this.updateApproval(rendered, row.approval);
       const announcement = chat.privateMode ? undefined : row.card?.announcement ?? (row.role === 'error' ? row.text : undefined);
       if (announcement && this.announcements.get(row.id) !== announcement) {
         this.announcements.set(row.id, announcement);
@@ -253,6 +256,32 @@ export class ChatPane {
       }
     }
     return fresh;
+  }
+
+  private updateApproval(row: TranscriptRow, approval: ChatRow['approval']): void {
+    if (!approval) {
+      row.approval?.element.remove();
+      row.approval = undefined;
+      return;
+    }
+    const signature = JSON.stringify(approval);
+    if (row.approval?.signature === signature) return;
+    const element = renderApproval(approval, this.post);
+    if (row.approval) {
+      const previous = row.approval.element;
+      const active = document.activeElement;
+      const key = active instanceof HTMLElement && previous.contains(active) ? active.dataset.key : undefined;
+      previous.replaceWith(element);
+      // Move focus only when it was already inside the card, never from the composer.
+      if (key) {
+        const focus = element.querySelector<HTMLElement>('[data-key="' + CSS.escape(key) + '"]:not(:disabled)') ?? element;
+        if (focus === element) element.tabIndex = -1;
+        focus.focus({ preventScroll: true });
+      }
+    } else {
+      row.element.append(element);
+    }
+    row.approval = { signature, element };
   }
 
   private updateCard(row: TranscriptRow, card: ChatRow['card']): void {

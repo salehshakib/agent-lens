@@ -146,7 +146,7 @@ export class PanelView {
         this.refresh(editor);
         break;
       case 'chatDraft': case 'chatSend': case 'chatContinue': case 'chatInterrupt': case 'chatRetry': case 'chatChooseScope':
-      case 'chatCardAction':
+      case 'chatCardAction': case 'chatApproval':
         if (editor.target.kind === 'chat') this.actions.chatRequest(editor.key, request, this.sessionId(editor));
         break;
       case 'openFile': this.actions.openFile(request.id); break;

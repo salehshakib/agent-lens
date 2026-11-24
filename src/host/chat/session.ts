@@ -7,6 +7,8 @@ import type { Provider } from '../adapters/types';
 import { safeText } from '../privacy/projection';
 import { parseChatInput, slashCatalog } from './commands';
 import { canCheckFast, isVerifiedClaudeChat, normalizeEffortChoice, normalizeModelChoice } from '../adapters/claude-code/chat-settings';
+import { ApprovalLedger } from './approvals';
+import type { ApprovalDecision } from './approvals';
 import { chatWriterKey, ChatOwnership, sameChatIdentity } from './ownership';
 import { ChatLaunchError } from './types';
 import { nextPermissionMode } from '../adapters/claude-code/chat';
@@ -42,7 +44,8 @@ export interface ChatPresentation {
 
 export type ChatRequest =
   | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
-  | { type: 'chatContinue' | 'chatInterrupt' | 'chatRetry' | 'chatCycleMode' };
+  | { type: 'chatContinue' | 'chatInterrupt' | 'chatRetry' | 'chatCycleMode' }
+  | { type: 'chatApproval'; id: string; decision: ApprovalDecision };
 
 interface LiveRow extends ChatRow {
   truncated?: boolean;
@@ -148,16 +151,32 @@ function makeConversation(key: string, scope: ChatScope | undefined, armed: bool
   };
 }
 
+const approvalRefusals: Record<string, string> = {
+  unknown: 'This permission request is no longer pending.',
+  duplicate: 'This permission request was already decided.',
+  panel: 'This permission request belongs to another conversation.',
+  owner: 'The chat connection changed. This request can no longer be answered.',
+  turn: 'The turn changed. This request can no longer be answered.',
+  closed: 'The chat connection has closed.',
+  interrupted: 'The turn was interrupted. This request was denied.',
+  expired: 'This request timed out and was denied.',
+  write: 'The chat connection stopped accepting answers. This request was denied.',
+};
+
 function displayRow(row: LiveRow, privateMode: boolean): ChatRow {
   const hidden = privateMode && (row.role === 'user' || row.role === 'assistant');
   const text = hidden ? 'Hidden in private mode.'
     : (row.projected ??= (safeText(row.text.replace(/[\uD800-\uDBFF]$/, ''), maxBlock) ?? '') + (row.truncated ? '…' : ''));
-  return { id: row.id, role: row.role, text, state: row.state };
+  const approval = row.approval && privateMode && row.approval.state === 'pending'
+    ? { ...row.approval, preview: '', description: undefined, note: 'Hidden in private display mode. Leave private mode to decide, or the request is denied when it times out.' }
+    : row.approval;
+  return { id: row.id, role: row.role, text, state: row.state, ...(approval ? { approval } : {}) };
 }
 
 /** Owns conversations across editor lifetimes. Each worker gets a fresh owner token. */
 export class ChatSessions {
   private readonly ownership = new ChatOwnership();
+  private readonly approvals = new ApprovalLedger();
   private readonly conversations = new Map<string, Conversation>();
   private readonly canonical = new Map<string, Conversation>();
   private readonly saved: ChatAttempt[];
@@ -463,6 +482,9 @@ export class ChatSessions {
       case 'chatInterrupt':
         await this.interrupt(conversation);
         break;
+      case 'chatApproval':
+        this.decideApproval(conversation, request.id, request.decision);
+        break;
       case 'chatCycleMode':
         await this.cycleMode(conversation);
         break;
@@ -732,6 +754,12 @@ export class ChatSessions {
       case 'toolResult':
         this.tool(conversation, event);
         break;
+      case 'approval':
+        this.approval(conversation, worker, event);
+        break;
+      case 'approvalEnd':
+        this.endApproval(conversation, event.turnId, event.toolUseId, event.requestId, event.state, event.message);
+        break;
       case 'interruptReceipt':
         this.receipt(conversation, worker, event.requestId, event.accepted);
         break;
@@ -756,6 +784,72 @@ export class ChatSessions {
         }
         this.finish(conversation, turn);
         break;
+    }
+  }
+
+  private toolRow(conversation: Conversation, turnId: string, callId: string, toolName: string): LiveRow {
+    const id = JSON.stringify([turnId, callId, 'tool']);
+    let row = conversation.rows.get(id);
+    if (!row) {
+      this.addRow(conversation, { id, role: 'tool', text: toolName, toolName, identity: { kind: 'call', id: callId } });
+      row = conversation.rows.get(id)!;
+    }
+    return row;
+  }
+
+  private approval(conversation: Conversation, worker: Worker, event: Extract<ChatEvent, { kind: 'approval' }>): void {
+    const entry = this.approvals.add({ requestId: event.requestId, toolUseId: event.toolUseId, key: conversation.key,
+      owner: worker.launch.owner, turnId: event.turnId });
+    const row = this.toolRow(conversation, event.turnId, event.toolUseId, event.toolName);
+    row.approval = { id: entry.id, toolName: event.toolName, description: event.description, preview: event.preview, state: 'pending' };
+    this.changed(conversation);
+  }
+
+  private endApproval(conversation: Conversation, turnId: string, toolUseId: string, requestId: string,
+    state: 'allowed' | 'denied' | 'expired' | 'closed' | 'interrupted', message?: string): void {
+    const entry = this.approvals.findByRequest(requestId);
+    if (entry) this.approvals.settle(entry.id);
+    const row = conversation.rows.get(JSON.stringify([turnId, toolUseId, 'tool']));
+    if (row?.approval && row.approval.state === 'pending') {
+      row.approval = { ...row.approval, state, ...(message && state !== 'allowed' && state !== 'denied' ? { note: safeText(message, 220) } : {}) };
+      this.changed(conversation);
+    }
+  }
+
+  /** Retire every card still waiting. Used when the turn or the channel ends. */
+  private retireApprovals(conversation: Conversation, state: 'closed' | 'interrupted' = 'closed'): void {
+    this.approvals.settleAll(conversation.key);
+    let changed = false;
+    for (const row of conversation.rows.values()) {
+      if (row.approval?.state === 'pending') {
+        row.approval = { ...row.approval, state, note: 'This request is no longer pending.' };
+        changed = true;
+      }
+    }
+    if (changed) this.changed(conversation);
+  }
+
+  /** A decision from this conversation's own panel. Every check is repeated here and again in the adapter. */
+  private decideApproval(conversation: Conversation, id: string, decision: ApprovalDecision): void {
+    const { worker, turn } = conversation;
+    const claim = this.approvals.claim(id, { key: conversation.key, owner: worker && !worker.closing ? worker.launch.owner : undefined,
+      turnId: turn?.written ? turn.record.id : undefined });
+    const row = [...conversation.rows.values()].find(item => item.approval?.id === id);
+    if ('refused' in claim) {
+      // A refused decision leaves a live request pending unless it can never be answered again.
+      if (row?.approval && row.approval.state === 'pending' && (claim.refused === 'owner' || claim.refused === 'turn')) {
+        this.retireApprovals(conversation);
+      } else if (row?.approval?.state === 'pending') {
+        row.approval = { ...row.approval, note: approvalRefusals[claim.refused] };
+        this.changed(conversation);
+      }
+      return;
+    }
+    const { entry } = claim;
+    const result = worker?.connection?.decideApproval?.(entry.requestId, decision, { epoch: entry.owner, turnId: entry.turnId })
+      ?? { ok: false as const, reason: 'closed' };
+    if (!result.ok) {
+      this.endApproval(conversation, entry.turnId, entry.toolUseId, entry.requestId, 'closed', approvalRefusals[result.reason] ?? approvalRefusals.closed);
     }
   }
 
@@ -885,6 +979,7 @@ export class ChatSessions {
   private async disconnect(conversation: Conversation, worker: Worker, reason?: string): Promise<void> {
     if (worker.closing || conversation.worker !== worker) return;
     const closed = this.close(conversation, worker);
+    this.retireApprovals(conversation);
     const turn = conversation.turn;
     conversation.reason = safeText(reason, 220);
     if (!turn) {
@@ -937,6 +1032,7 @@ export class ChatSessions {
 
   private finish(conversation: Conversation, turn: Turn, reason?: string): void {
     conversation.turn = undefined;
+    this.retireApprovals(conversation);
     if (reason && conversation.rows.get(turn.rowId)?.local?.result?.state === 'pending') {
       this.updateLocal(conversation.key, turn.rowId, { result: { state: 'failed', message: reason } });
     }

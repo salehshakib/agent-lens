@@ -4,7 +4,7 @@
   "description": "Observe local coding agent activity in VS Code.",
   "license": "MIT",
   "icon": "media/icon.png",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "salehshakib",
   "private": true,
   "repository": {

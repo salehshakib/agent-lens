@@ -11,13 +11,14 @@ import { profileEnv, resolveClaude } from '../../limits/claude-probe';
 import { record } from '../../privacy/projection';
 import { claudeDiagnostic, ClaudeChatStream, isClaudeSessionId, readClaudeFrames } from './stream';
 import { normalizeModelChoice, normalizeEffortChoice } from './chat-settings';
+import { ApprovalBridge, permissionPromptArgs } from './approval-bridge';
 import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './version';
 
 export { isClaudeSessionId } from './stream';
 
 const args = [
   '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-  '--include-partial-messages', '--replay-user-messages', '--permission-prompts', 'none',
+  '--include-partial-messages', '--replay-user-messages',
 ] as const;
 /** Claude Code permission modes the chat may start in (agentLens.chat.permissionMode). */
 export const chatPermissionModes = ['auto', 'default', 'acceptEdits', 'plan'] as const;
@@ -186,7 +187,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
   if (overrides.length && !supportsClaudeCodeVersion(executable.version)) {
     throw new ChatLaunchError(`Startup model and effort overrides require Claude Code ${minimumClaudeCodeVersion} or newer.`);
   }
-  const child = spawn(executable.path, [...args, '--permission-mode', permissionMode, ...overrides,
+  const child = spawn(executable.path, [...args, ...permissionPromptArgs(executable.version), '--permission-mode', permissionMode, ...overrides,
     resume ? '--resume' : '--session-id', identity.nativeId], {
     cwd: identity.cwd, env: profileEnv(identity.home), shell: false, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -207,15 +208,33 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
   let finishModelChange: ((model?: string) => void) | undefined;
   let finishModeChange: ((value: { mode?: string; error?: string }) => void) | undefined;
 
-  const stream = new ClaudeChatStream(launch, event => {
+  const bridge: ApprovalBridge | undefined = supportsClaudeCodeVersion(executable.version) ? new ApprovalBridge({
+    epoch: launch.owner,
+    write: writeNow,
+    turn: (): string | undefined => stream.turnId,
+    emit: event => emit({ ...launch, ...event }),
+  }) : undefined;
+  const stream: ClaudeChatStream = new ClaudeChatStream(launch, event => {
     if (event.kind === 'ready') clearTimeout(initializationTimer);
     emit(event);
-  }, close, executable.version);
+  }, close, executable.version, bridge);
+
+  /** Approval answers bypass the single-slot input queue: the CLI is blocked waiting for them. */
+  function writeNow(line: string): boolean {
+    if (closing || exited || !child.stdin.writable) return false;
+    try {
+      child.stdin.write(line, error => { if (error) close(lostInput); });
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   function abort(): void { close(); }
 
   function close(reason?: string): void {
     if (closing || exited) return;
+    bridge?.close(!exited && child.stdin.writable);
     closing = true;
     closedReason = reason;
     clearTimeout(initializationTimer);
@@ -289,6 +308,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
         waitingForInterrupt = undefined;
         receipt.resolve();
       })) throw new Error('Claude Code cannot interrupt the current turn.');
+      bridge?.interrupted();
       releaseInterrupt = receipt.resolve;
       waitingForInterrupt = receipt.promise;
       interruptTimer = setTimeout(() => close('Claude Code did not acknowledge the interrupt request.'), 10_000);
@@ -334,6 +354,7 @@ function openWorker(executable: { path: string; version: string }, launch: ChatL
       await write(frame);
       return result.promise;
     },
+    decideApproval: bridge ? (requestId, decision, context) => bridge.decide(requestId, decision, context) : undefined,
     close() {
       close();
       return closed.promise;

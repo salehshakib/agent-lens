@@ -171,10 +171,12 @@ export class ClaudeChatStream {
     private readonly emit: (event: ChatEvent) => void,
     private readonly close: (reason: string) => void,
     private readonly version?: string,
+    private readonly approvals?: { receive(row: Record<string, unknown>): boolean; turnEnded(): void },
   ) {}
 
   get initialized(): boolean { return this.ready; }
   get active(): boolean { return this.turn !== undefined; }
+  get turnId(): string | undefined { return this.turn?.id; }
   get lastOutcome() { return this.latestOutcome; }
   get failure(): string | undefined { return this.diagnostic; }
 
@@ -230,7 +232,10 @@ export class ClaudeChatStream {
       return;
     }
     if (row.type === 'control_request') {
-      if (record(row.request)?.subtype === 'can_use_tool') this.close('Claude Code requested approval outside the available permission channel.');
+      if (record(row.request)?.subtype === 'can_use_tool') {
+        if (!this.approvals) this.close('Claude Code requested approval outside the available permission channel.');
+        else this.approvals.receive(row);
+      }
       return;
     }
     if (row.type === 'rate_limit_event' && this.ready && !row.parent_tool_use_id) {
@@ -321,7 +326,7 @@ export class ClaudeChatStream {
     const model = identifier(row.model);
     this.model = model;
     this.publish({ kind: 'ready', nativeId: this.launch.identity.nativeId,
-      capabilities: { send: true, interrupt, commands: names(row.slash_commands), skills: names(row.skills),
+      capabilities: { send: true, interrupt, ...(this.approvals ? { approvals: true } : {}), commands: names(row.slash_commands), skills: names(row.skills),
         version: this.version, literalText: supportedExecutable, nativeCommands: verified,
         terminalCommands: verified ? names(row.terminal_slash_commands) : undefined,
         permissionMode: identifier(row.permissionMode),
@@ -586,6 +591,7 @@ export class ClaudeChatStream {
     this.latestOutcome = outcome;
     this.lastResultId = frameId;
     this.turn = undefined;
+    this.approvals?.turnEnded();
     this.publish({ kind: 'result', turnId: turn.id, outcome, usage, commandText, effortAcknowledged: Boolean(effortAcknowledged),
       compact: completed ? compact : undefined, errorKind: row.is_error === true && limitReason(row.result) ? 'limit' : undefined,
       ...(outcome === 'failed' ? { reason: reason ?? (turn.command === 'compact'

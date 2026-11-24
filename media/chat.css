@@ -284,3 +284,23 @@
 }
 .chat-card-fold > summary { cursor: pointer; font-weight: 600; }
 .chat-card-fold { max-width: 72ch; }
+
+.chat-approval {
+  margin-block: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--vscode-panel-border, currentColor);
+  border-inline-start: 3px solid var(--vscode-editorWarning-foreground, currentColor);
+  border-radius: 4px;
+}
+.chat-approval[data-state="allowed"] { border-inline-start-color: var(--vscode-testing-iconPassed, currentColor); }
+.chat-approval-description { margin: 4px 0; }
+.chat-approval-preview {
+  margin: 4px 0;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+}
+.chat-approval-actions { display: flex; gap: 8px; margin-block: 6px; }
