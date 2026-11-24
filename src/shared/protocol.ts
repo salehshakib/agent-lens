@@ -408,12 +408,26 @@ export interface ChatCard {
   diff?: readonly { heading: string; lines: readonly { text: string; before?: number; after?: number }[] }[];
 }
 
+/** One live permission request shown inline at its tool row. The raw input never leaves the host. */
+export interface ChatApproval {
+  /** Opaque host-issued id. */
+  id: string;
+  toolName: string;
+  description?: string;
+  /** Bounded, redacted argument summary. */
+  preview: string;
+  state: 'pending' | 'allowed' | 'denied' | 'expired' | 'closed' | 'interrupted';
+  /** Why the card was retired, or why a decision was refused. */
+  note?: string;
+}
+
 export interface ChatRow {
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice' | 'error';
   text: string;
   state?: 'pending' | 'failed' | 'uncertain';
   card?: ChatCard;
+  approval?: ChatApproval;
 }
 
 /** Live, owner-bound facts a chat worker reported. Absent fields are unknown, never guessed. */
@@ -508,6 +522,7 @@ export type PanelRequest =
   | { type: 'chatCardAction'; id: string; input?: string }
   | { type: 'chatContinue' }
   | { type: 'chatInterrupt' }
+  | { type: 'chatApproval'; id: string; decision: 'allow' | 'deny' }
   | { type: 'chatCycleMode' }
   | { type: 'chatRetry' }
   | { type: 'chatChooseScope' }
@@ -592,6 +607,10 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   if ((type === 'chatDraft' || type === 'chatSend') && shape(message, ['type', 'revision', 'text'])
     && typeof message.revision === 'number' && Number.isSafeInteger(message.revision) && message.revision >= 0
     && text(message.text, maxChatDraft)) return { type, revision: message.revision, text: message.text };
+  if (type === 'chatApproval' && shape(message, ['type', 'id', 'decision']) && typeof message.id === 'string'
+    && actionId.test(message.id) && (message.decision === 'allow' || message.decision === 'deny')) {
+    return { type, id: message.id, decision: message.decision };
+  }
   if (type === 'chatCardAction' && (shape(message, ['type', 'id']) || shape(message, ['type', 'id', 'input']))
     && typeof message.id === 'string' && actionId.test(message.id)) {
     if (!('input' in message)) return { type, id: message.id };

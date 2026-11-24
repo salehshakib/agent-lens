@@ -42,6 +42,8 @@ export interface ChatCapabilities {
   nativeCommands?: boolean;
   terminalCommands?: readonly string[];
   permissionMode?: string;
+  /** The channel answers permission requests through the host bridge. */
+  approvals?: boolean;
   effortActive?: boolean;
   ultrathinkAvailable?: boolean;
   fastMode?: string;
@@ -64,6 +66,10 @@ type ChatUpdate =
   | { kind: 'text'; turnId: string; messageId: string; blockId: string; mode: 'append' | 'replace'; text: string }
   | { kind: 'tool'; turnId: string; callId: string; name: string }
   | { kind: 'toolResult'; turnId: string; callId: string; outcome: 'completed' | 'failed' | 'needs-approval' }
+  | { kind: 'approval'; turnId: string; requestId: string; toolUseId: string; toolName: string; description?: string;
+    preview: string; deadline: number }
+  | { kind: 'approvalEnd'; turnId: string; requestId: string; toolUseId: string;
+    state: 'allowed' | 'denied' | 'expired' | 'closed' | 'interrupted'; message?: string }
   | { kind: 'interruptReceipt'; turnId: string; requestId: string; accepted: boolean }
   | { kind: 'result'; turnId: string; outcome: ChatOutcome; usage?: Tokens; reason?: string;
     compact?: CompactMeasurement; commandText?: string; effortAcknowledged?: boolean; errorKind?: 'limit' }
@@ -84,6 +90,9 @@ export interface ChatConnection {
   setPermissionMode?(mode: string): Promise<{ mode?: string; error?: string }>;
   /** Close only this worker and resolve when it has exited. */
   close(): Promise<void>;
+  /** Answer one live permission request. The adapter rechecks owner, turn and deadline and replays the original input. */
+  decideApproval?(requestId: string, decision: 'allow' | 'deny', context: { epoch: string; turnId: string | undefined }):
+    { ok: true } | { ok: false; reason: string };
 }
 
 export interface ChatAdapter {

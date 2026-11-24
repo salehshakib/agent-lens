@@ -72,3 +72,16 @@ Claude Code 2.1.330, stream-json with the chat flags. The orchestrator's live pr
 - An invalid mode returned `control_response` `error` with `error_code: "invalid_mode"` and a message listing `acceptEdits, auto, bypassPermissions, default, dontAsk, plan`.
 - It ran with no model call and worked before the first user turn.
 - Agent Lens cycles only `default, acceptEdits, plan, auto`. It never sends `bypassPermissions` or `dontAsk`, gates on `supportsClaudeCodeVersion` and an initialized owned channel, and shows only the mode the CLI reports (init, the response mode, or a status frame). Because the stream reads init inside the first turn, the control is offered once the channel is initialized and idle.
+
+## Phase F live evidence: permission bridge (Claude Code 2.1.330, native Windows executable)
+
+Probe flags: `-p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-mode default --permission-prompt-tool stdio`, without `--permission-prompts none`, with `--setting-sources project` so user allow rules did not pre-approve. In real chats the user's own settings, hooks and Auto decide first, and only undecided calls reach the bridge.
+
+| Item | Evidence | Use |
+| --- | --- | --- |
+| Request | The CLI writes `{"type":"control_request","request_id":"<uuid>","request":{"subtype":"can_use_tool","tool_name","display_name","input","description","permission_suggestions","blocked_path"?,"tool_use_id"}}` to stdout and the turn blocks until the host answers. `tool_use_id` equals the assistant `tool_use` block id. | Parse strictly; bind the card to the tool row by `tool_use_id`. |
+| Allow | Host writes `{"type":"control_response","response":{"subtype":"success","request_id":"<same>","response":{"behavior":"allow","updatedInput":<original input>}}}`. The tool ran, a normal `tool_result` followed, and the turn continued. | Always send the original input unchanged. |
+| Deny | Same envelope with `{"behavior":"deny","message":"<text>"}`. The `tool_result` content was the message, the model continued, `is_error` was false. | Default for timeout, close, interrupt and owner change. |
+| Not verified | Applying `permission_suggestions` (persistent rules, `setMode`), changing `updatedInput`, behavior on no answer (timeout), and a reply after an interrupt. | Persistent rules are not offered. Timeout and interrupt use Agent Lens's own deny path. Stop agent and Stop session stay disabled because no control subtype for them is verified. |
+
+Verified earlier in this file: `interrupt` (`interrupt_receipt_v1`), `set_permission_mode`, `set_model`.

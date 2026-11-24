@@ -43,6 +43,7 @@ import { LensData } from './host/views/data';
 import type { ProfileInfo } from './host/views/data';
 import { namesFor, projectLabel, providerLabels } from './host/views/models';
 import { PanelView } from './host/views/panel';
+import { resolveAllStops } from './host/chat/control';
 import type { ChatPanelRequest, PanelTarget } from './host/views/panel';
 import { SidebarView } from './host/views/sidebar';
 import { StatusView } from './host/views/status';
@@ -575,6 +576,13 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
           actions: command.canSendAsText && view.canSend && state.revision === command.revision && state.capabilities?.literalText
             ? [action({ kind: 'sendAsText' }, 'Send as text')] : undefined,
         };
+      } else if (command.name === 'stop') {
+        const stops = resolveAllStops({ provider: scope?.provider, turnActive: state.busy, canInterrupt: view.canInterrupt });
+        const picked = command.argument ? stops.filter(item => item.target === command.argument) : stops;
+        card = { title: '/stop', scope: label, state: picked.some(item => item.available) ? 'ready' : 'unavailable',
+          message: command.argument ? picked[0]?.message : 'Choose what to stop. Only verified routes are enabled.',
+          entries: picked.map(item => ({ title: item.label, detail: item.message,
+            actions: item.available && item.action === 'interrupt' ? [action({ kind: 'interrupt' }, item.label)] : undefined })) };
       } else if (inspectionCommands.has(command.name)) {
         const diff = command.diffId ? files.get(command.diffId) : undefined;
         card = projectChatCard(command.name as InspectionCommand, {
@@ -786,6 +794,8 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
   function chatRequest(key: string, request: ChatPanelRequest, id?: string): void {
     if (request.type === 'chatInterrupt') { void chat.handle(key, request); return; }
     if (privateMode()) return;
+    // The key is the panel's own conversation. The ledger refuses a request that belongs to any other.
+    if (request.type === 'chatApproval') { void chat.handle(key, request); return; }
     if (request.type === 'chatChooseScope') { void chooseScope(key); return; }
     if (request.type === 'chatCardAction') { void runCardAction(key, id, request); return; }
     chat.inspect(key);

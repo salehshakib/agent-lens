@@ -117,12 +117,14 @@ test('native dispatch requires a verified idle owner and respects advertised nam
 });
 
 test('later phases and setting pickers distinguish requested, resolved, and reported values', () => {
-  for (const name of ['login', 'logout', 'profile', 'stop']) {
+  for (const name of ['login', 'logout', 'profile']) {
     const result = parseChatInput('/' + name);
     assert.equal(result.kind, 'local');
     assert.match(result.kind === 'local' ? result.reason ?? '' : '', /phase/i);
     assert.ok(slashCatalog().find(option => option.name === name)?.reason);
   }
+  // Phase F resolves /stop per target in the host, so the catalog carries no blanket reason.
+  assert.equal(slashCatalog().find(option => option.name === 'stop')?.reason, undefined);
   const action = (id: string, label: string) => ({ id, label });
   const model = claudeChatSettings('model', 'Current project', 'sonnet', { model: 'claude-haiku-5-5' }, {
     capabilities, requested: { model: 'sonnet' }, resolvedModel: 'claude-sonnet-5-5', action,

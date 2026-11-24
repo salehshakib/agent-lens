@@ -25,7 +25,7 @@ const catalog = {
   logout: { description: 'Sign out of this profile', reason: 'In-chat sign-out requires the later Accounts phase and verified credential-store isolation.' },
   profile: { description: 'Find or switch account profiles', arguments: '[label filter]', reason: 'Profile switching is planned for the Accounts phase.' },
   codex: { description: 'Start or inspect a linked Codex run', arguments: '[start [prompt]|follow [filter]]' },
-  stop: { description: 'Choose a turn, session or agent to stop', arguments: '[turn|session|agent]', reason: 'Scoped Stop is planned for the approvals and Stop phase. Use Interrupt in the composer for an eligible main turn.' },
+  stop: { description: 'Choose a turn, session or agent to stop', arguments: '[turn|session|agent]' },
 } satisfies Record<string, LocalOption>;
 
 export type LocalCommandName = keyof typeof catalog;

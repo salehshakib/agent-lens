@@ -6,7 +6,9 @@ import type { SessionModel, Ui } from './state';
 import { saveUi } from './state';
 
 const kindText: Record<AgentNode['kind'], string> = { main: 'Main agent', agent: 'Subagent', 'codex-run': 'Linked Codex run' };
-const stopReason = 'Stopping agents is not available yet. Agent Lens only observes in this version.';
+import { stopAgentUnavailable } from '../../shared/stop-reasons';
+
+const stopReason = stopAgentUnavailable;
 
 function stats(node: AgentNode): string {
   const parts = [
