@@ -1,4 +1,5 @@
 import type { Tokens } from '../adapters/types';
+import type { AgentDelegation } from '../../shared/protocol';
 import { identityKey, sourceSessionId } from '../sessions/evidence';
 import type { Source } from '../adapters/types';
 import type { ChatIdentity } from './types';
@@ -16,6 +17,35 @@ export interface ProvisionalRow {
   id: string;
   /** Local prompt uuid, API response id or tool call id. Absent when the stream did not report one. */
   identity?: { kind: 'user' | 'response' | 'call'; id: string };
+}
+
+export interface DelegationEvidence {
+  delegation: AgentDelegation;
+  /** Exact spawn call keys only. Response identities cannot attach a delegation. */
+  delegationCallKeys?: readonly string[];
+}
+
+/** Join only one recorded spawn and one live tool occurrence per exact call identity. */
+export function reconcileDelegations(recorded: readonly DelegationEvidence[], live: readonly ProvisionalRow[]): {
+  attached: ReadonlyMap<string, AgentDelegation>; unresolved: boolean;
+} {
+  const offers = new Map<string, AgentDelegation | undefined>();
+  for (const row of recorded) {
+    const call = row.delegationCallKeys?.length === 1 ? row.delegationCallKeys[0] : undefined;
+    if (call) offers.set(call, offers.has(call) ? undefined : row.delegation);
+  }
+  const calls = new Map<string, string | undefined>();
+  for (const item of live) {
+    if (item.identity?.kind !== 'call') continue;
+    const call = identityKey('call', item.identity.id);
+    if (offers.has(call)) calls.set(call, calls.has(call) ? undefined : item.id);
+  }
+  const attached = new Map<string, AgentDelegation>();
+  for (const [call, delegation] of offers) {
+    const liveId = calls.get(call);
+    if (liveId && delegation) attached.set(liveId, delegation);
+  }
+  return { attached, unresolved: attached.size !== recorded.length };
 }
 
 export interface Reconciled<P extends ProvisionalRow> {

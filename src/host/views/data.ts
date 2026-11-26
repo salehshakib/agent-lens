@@ -2,6 +2,7 @@ import { basename } from 'node:path';
 import type { Provider } from '../adapters/types';
 import type { ChatScope, CompactMeasurement } from '../chat/types';
 import { projectChatStatus } from './chat-status';
+import { displayRecordedChatRow } from '../chat/session';
 import type { ChatPresentation } from '../chat/session';
 import { safeText } from '../privacy/projection';
 import { profileKey } from '../accounts/profiles';
@@ -23,8 +24,8 @@ import {
   buildDetail, buildTasks, buildTree, buildUsage, earlierPage, filterOptions, gaugeView, namesFor, providerLabels,
 } from './models';
 import { laneContext, parentInfo } from './signal-models';
-import { projectTranscript } from './chat-transcript';
-import type { TranscriptRow } from './chat-transcript';
+import { directAgentEdges, projectTranscript } from './chat-transcript';
+import type { AgentEdge, AgentScope, TranscriptRow } from './chat-transcript';
 import { chatContextEvidence } from './chat-cards';
 import type { ContextCandidate } from './alerts';
 
@@ -54,6 +55,22 @@ export interface LensDeps {
   /** Context level thresholds from settings. The defaults apply when absent. */
   thresholds?(): Thresholds;
   canContinue?(session: Session): boolean;
+}
+
+export interface RootAgentProjection {
+  limit: number;
+  snapshotStartRow?: string;
+  detailFocus?: { lane: string; row: string };
+  loadEarlier(): boolean;
+  issueEdge(edge: AgentEdge): string | undefined;
+}
+
+export interface AgentGraph {
+  sessions: readonly Session[];
+  root?: AgentScope;
+  edges: readonly AgentEdge[];
+  now: number;
+  privateMode: boolean;
 }
 
 /** Builds every view model from host state. It holds only paging state, never provider data. */
@@ -165,7 +182,10 @@ export class LensData {
   }
 
   async detail(id: string): Promise<PanelModel> {
-    const sessions = await this.deps.sessions();
+    return this.detailFrom(await this.deps.sessions(), id, this.deps.privateMode());
+  }
+
+  private detailFrom(sessions: readonly Session[], id: string, privateMode: boolean, focus?: RootAgentProjection['detailFocus']): PanelModel {
     const session = sessions.find(item => item.id === id);
     if (!session) return { mode: 'empty', message: 'This session is no longer available. It may have been removed or its source is disabled.' };
     const profiles = this.deps.profiles();
@@ -175,32 +195,64 @@ export class LensData {
     const snapshots = profile ? this.deps.relay(profile.id).snapshots : [];
     const context = session.provider === 'claude-code' ? relayContext(snapshots, session.nativeId, this.deps.now()) : undefined;
     return { mode: 'session', session: buildDetail(session, sessions, {
-      now: this.deps.now(), privateMode: this.deps.privateMode(), relayContext: context?.percent,
+      now: this.deps.now(), privateMode, focus, relayContext: context?.percent,
       thresholds: this.deps.thresholds?.(),
       profileLabel: named && (several || named.id !== 'default') ? named.label : undefined,
     }) };
   }
 
+  privateDisplay(): boolean {
+    return this.deps.privateMode();
+  }
+
+  private approvedAgentSessions(snapshot: readonly Session[]): Session[] {
+    const approved = new Set(this.deps.profiles().map(profile => profileKey(profile.provider, profile.id)));
+    return snapshot.filter(session => !session.profile || approved.has(profileKey(session.provider, session.profile)));
+  }
+
+  /** Follow the exact offered edge IDs from the main lane using a fresh approved source snapshot. */
+  async agentGraph(id: string, path: readonly string[]): Promise<AgentGraph> {
+    const sessions = this.approvedAgentSessions(await this.deps.sessions());
+    const lane = sessions.find(session => session.id === id)?.lanes[0];
+    const root = lane && { sessionId: id, laneId: lane.id };
+    const edges: AgentEdge[] = [];
+    let parent: AgentScope | undefined = root;
+    const visited = new Set(root ? [agentScopeKey(root)] : []);
+    for (const edgeId of path) {
+      if (!parent) break;
+      const edge = directAgentEdges(sessions, parent).find(candidate => candidate.id === edgeId);
+      if (!edge || visited.has(agentScopeKey(edge.target))) break;
+      visited.add(agentScopeKey(edge.target));
+      edges.push(edge);
+      parent = edge.target;
+    }
+    return { sessions, root, edges, now: this.deps.now(), privateMode: this.deps.privateMode() };
+  }
+
   async chat(
     key: string, id: string | undefined, scope: ChatScope | undefined,
-    view: (presentation: ChatPresentation) => ChatView | undefined, reason?: string,
+    view: (presentation: ChatPresentation) => ChatView | undefined, reason?: string, reader?: RootAgentProjection,
   ): Promise<PanelModel> {
-    const detail = id ? await this.detail(id) : undefined;
-    const session = detail?.mode === 'session' ? detail.session : undefined;
+    const sessions = id ? await this.deps.sessions() : [];
     const privateMode = this.deps.privateMode();
-    const raw = id ? (await this.deps.sessions()).find(item => item.id === id) : undefined;
-    const history: TranscriptRow[] = session ? projectTranscript(session, raw?.files ?? [], privateMode) : [];
+    const detail = id ? this.detailFrom(sessions, id, privateMode, reader?.detailFocus) : undefined;
+    const session = detail?.mode === 'session' ? detail.session : undefined;
+    const raw = id ? sessions.find(item => item.id === id) : undefined;
+    const history: TranscriptRow[] = session ? projectTranscript(session, raw?.files ?? [], privateMode, {
+      sessions: this.approvedAgentSessions(sessions), now: this.deps.now(), limit: reader?.limit,
+      snapshotStartRow: reader?.snapshotStartRow, issueEdge: reader?.issueEdge,
+    }) : [];
     const profile = scope && this.deps.profiles().find(item => item.provider === scope.provider && item.id === scope.profile);
     const presentation: ChatPresentation = {
       title: session?.title ?? (id ? 'Session' : 'New chat'),
       project: session?.project ?? (scope ? safeText(basename(scope.cwd), 100) : undefined),
       provider: session?.provider ?? (scope ? providerLabels[scope.provider] : undefined),
       profile: profile?.label ?? session?.profile,
-      privateMode, history, reason, sessionId: id,
+      privateMode, history, reason, sessionId: id, loadEarlier: reader?.loadEarlier(),
     };
     const chat = view(presentation) ?? {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider, profile: presentation.profile,
-      privateMode, rows: history.map(({ keys: _keys, ...row }) => row), draft: '', revision: 0, state: 'view-only',
+      privateMode, rows: history.map(row => displayRecordedChatRow(row, privateMode)), draft: '', revision: 0, state: 'view-only',
       reason: reason ?? (detail?.mode === 'empty' ? detail.message : 'This recorded session is available for inspection.'),
       canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
     };
@@ -256,6 +308,10 @@ export class LensData {
     };
     return { mode: 'usage', usage };
   }
+}
+
+export function agentScopeKey(scope: AgentScope): string {
+  return JSON.stringify([scope.sessionId, scope.laneId, scope.turnId]);
 }
 
 /** Compact provider quota text for the status bar. */

@@ -35,6 +35,7 @@ import { resolveProject } from './host/sessions/project';
 import { defaultSignalSettings, parseSignalSettings } from './host/sessions/signals';
 import type { SignalSettings } from './host/sessions/signals';
 import { SessionStore } from './host/sessions/store';
+import type { AgentHistoryScope } from './host/sessions/store';
 import type { RowRef, Session } from './host/sessions/types';
 import { alertText, ContextAlerts } from './host/views/alerts';
 import { compactChatCard, compactContextEvidence, projectChatCard } from './host/views/chat-cards';
@@ -140,6 +141,8 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
   let modelUpdate: NodeJS.Timeout | undefined;
   const taskRoot = claudeTaskRoot(process.env.LOCALAPPDATA);
   const store = new SessionStore(taskRoot);
+  const visibleAgentPaths = new Map<string, readonly AgentHistoryScope[]>();
+  const selectedAgentSources = new Map<RootObservation, string>();
   const attemptDirectory = join(context.globalStorageUri.fsPath, 'chat-attempts');
   const recoveries = await recoveredAttempts(attemptDirectory);
   const catalogEditors = new Map<string, string>();
@@ -339,6 +342,21 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       for (const observer of roots) observer.setVisible(visible);
     }
     relay.setVisible(visible);
+  }
+
+  function keepAgentHistory(key: string, scopes: readonly AgentHistoryScope[]): void {
+    store.keepAgentHistory(key, scopes);
+    if (scopes.length) visibleAgentPaths.set(key, scopes);
+    else visibleAgentPaths.delete(key);
+    const wanted = [...visibleAgentPaths.values()].reverse().flatMap(path => [...path].reverse())
+      .map(scope => store.transcriptSource(scope.sessionId, scope.laneId)).filter(source => source !== undefined);
+    for (const roots of observers.values()) for (const observer of roots) {
+      const sourceKey = wanted.find(source => observer.catalog.has(source.key))?.key;
+      if (sourceKey === selectedAgentSources.get(observer)) continue;
+      if (sourceKey) selectedAgentSources.set(observer, sourceKey);
+      else selectedAgentSources.delete(observer);
+      observer.select(sourceKey);
+    }
   }
 
   function editorSession(key: string): string | undefined {
@@ -737,7 +755,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
         case 'parked': panel.show({ kind: 'chat', key: target.key, tab: 'chat', from: key }); break;
         case 'session': case 'continue': await openSession(target.session, 'chat', undefined, key, target.kind === 'continue'); break;
         case 'parent': await openParent(target.session, target.lane, key); break;
-        case 'transcript': openTranscript(target.session, target.lane); break;
+        case 'transcript': await openTranscript(target.session, target.lane); break;
         case 'view':
           if (target.view === 'allTasks' || (!id && target.view === 'tasks')) panel.show({ kind: 'tasks' });
           else if (!id && target.view === 'usage') panel.show({ kind: 'usage' });
@@ -778,13 +796,16 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     }
   }
 
-  function openTranscript(session: string, lane: string): void {
+  async function openTranscript(session: string, lane: string): Promise<void> {
     if (privateMode()) {
       void window.showInformationMessage('Transcripts are hidden in private display mode.');
       return;
     }
     const source = store.transcriptSource(session, lane);
-    if (!source) {
+    const generation = commandGeneration;
+    const access = source && await store.agentSource({ sessionId: session, laneId: lane });
+    if (privateMode() || generation !== commandGeneration) return;
+    if (!source || access !== 'readable' || store.transcriptSource(session, lane)?.key !== source.key) {
       void window.showInformationMessage('This transcript is no longer available.');
       return;
     }
@@ -845,7 +866,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
   }
 
   const panel = new PanelView(context.extensionUri, data, {
-    chat: async (key, id) => {
+    chat: async (key, id, reader) => {
       if (id && !chat.scope(key) && exactSources(id, chatProvider).length === 1 && !chat.identity(key)) {
         await resolveSessionEditor(id);
       }
@@ -855,7 +876,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
         : !workspaceChoices().length ? 'Open a local workspace folder to start a chat.'
           : !chatProfiles().length ? 'Enable a local chat profile to start a chat.' : 'Choose the workspace and profile for this chat.'
         : !workspace.isTrusted ? 'Trust this workspace to use chat.' : undefined;
-      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation), reason);
+      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation), reason, reader);
       if (model.mode !== 'chat') return model;
       const { cards, grants } = await commandCards(key, id, model.chat, model.session);
       if (grants.size) cardGrants.set(key, grants);
@@ -863,12 +884,22 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       return { ...model, chat: { ...model.chat,
         rows: model.chat.rows.map(row => cards.has(row.id) ? { ...row, card: cards.get(row.id) } : row) } };
     },
+    frozenHistoryStart: key => chat.frozenHistoryStart(key),
+    agentSource: scope => store.agentSource(scope),
+    materializeAgent: (target, ancestors, current, verify) => {
+      const pending = prepareChain.then(async () => {
+        if (current() && await verify() && current()) await store.materializeAgent(target, ancestors, current);
+      });
+      prepareChain = pending.catch(() => undefined);
+      return pending;
+    },
+    keepAgentHistory,
     chatRequest,
     sessionId: editorSession,
     openSession: (id, tab, focus, from) => void openSession(id, tab, focus, from),
     openFile: id => void commands.executeCommand('agentLens.files.open', id),
     openDiff: id => void commands.executeCommand('agentLens.files.diff', id),
-    openTranscript,
+    openTranscript: (session, lane) => void openTranscript(session, lane).catch(() => undefined),
     openParent: (session, lane, from) => void openParent(session, lane, from),
     openSettings: () => void commands.executeCommand('workbench.action.openSettings', '@ext:salehshakib.agent-lens'),
     relay: (command, profile) => void relay.command(command, profile),
@@ -942,6 +973,8 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       for (const observer of roots) observer.dispose();
     }
     observers.clear();
+    visibleAgentPaths.clear();
+    selectedAgentSources.clear();
     clearTimeout(modelUpdate);
     modelUpdate = undefined;
     store.clear();
@@ -951,11 +984,14 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
     const next = configureRoots(adapters, settings?.globalValue ?? settings?.defaultValue, homedir(), process.env);
     disposeObservers();
     configuration = next;
+    chat.clearEarlierHistory();
+    panel.invalidateAgentReaders(true);
     relay.setProfiles(relayProfiles());
     observers = new Map([...next].map(([id, config]) => [id, config.roots.map(root => {
       const observer = new RootObservation(root, {
         onChange: () => {
           store.setCatalog(root.key, root.adapter, observer.catalog);
+          panel.verifyParkedAgentSources();
           updateModel();
         },
         onBatch: batch => {
@@ -1040,6 +1076,8 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       }
       else if (event.affectsConfiguration('agentLens.privateDisplay')) {
         commandGeneration++;
+        chat.clearEarlierHistory();
+        panel.invalidateAgentReaders();
         refreshViews();
       }
       else if (event.affectsConfiguration('agentLens.signals') || event.affectsConfiguration('agentLens.context')) {

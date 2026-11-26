@@ -1,10 +1,11 @@
-import { reconcileRows, scopeSessionId } from './reconcile';
+import { reconcileDelegations, reconcileRows, scopeSessionId } from './reconcile';
 import type { ProvisionalRow } from './reconcile';
 import { randomUUID } from 'node:crypto';
 import { maxChatDraft } from '../../shared/protocol';
-import type { ChatRow, ChatView } from '../../shared/protocol';
+import type { AgentDelegation, ChatRow, ChatView } from '../../shared/protocol';
 import type { Provider } from '../adapters/types';
 import { safeText } from '../privacy/projection';
+import { key as opaqueKey } from '../sessions/evidence';
 import { parseChatInput, slashCatalog } from './commands';
 import { canCheckFast, isVerifiedClaudeChat, normalizeEffortChoice, normalizeModelChoice } from '../adapters/claude-code/chat-settings';
 import { ApprovalLedger } from './approvals';
@@ -37,10 +38,19 @@ export interface ChatPresentation {
   profile?: string;
   privateMode: boolean;
   reason?: string;
-  history?: readonly (ChatRow & { keys?: readonly string[] })[];
+  history?: readonly ChatHistoryRow[];
+  /** Set only while servicing an explicit earlier request for this editor. */
+  loadEarlier?: boolean;
   /** Recorded session id the history came from. Live rows merge into it only when the conversation's verified scope derives it. */
   sessionId?: string;
 }
+
+export type ChatHistoryRow = ChatRow & {
+  keys?: readonly string[];
+  delegationCallKeys?: readonly string[];
+  sourceRowId?: string;
+  unresolvedDelegation?: boolean;
+};
 
 export type ChatRequest =
   | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
@@ -119,6 +129,9 @@ interface Conversation {
   retryRow?: string;
   history: readonly string[];
   frozenHistory?: ReadonlySet<string>;
+  historyStart?: string;
+  earlierHistory: Set<string>;
+  privateMode?: boolean;
   worker?: Worker;
   turn?: Turn;
   checking: boolean;
@@ -147,7 +160,7 @@ const approvalsLater = 'Needs approval. In-chat approval is planned for a later 
 
 function makeConversation(key: string, scope: ChatScope | undefined, armed: boolean): Conversation {
   return {
-    key, scope, armed, draft: '', revision: 0, rows: new Map(), history: [], checking: false, recoveryQueue: [],
+    key, scope, armed, draft: '', revision: 0, rows: new Map(), history: [], earlierHistory: new Set(), checking: false, recoveryQueue: [],
   };
 }
 
@@ -163,14 +176,36 @@ const approvalRefusals: Record<string, string> = {
   write: 'The chat connection stopped accepting answers. This request was denied.',
 };
 
-function displayRow(row: LiveRow, privateMode: boolean): ChatRow {
+function displayDelegation(value: AgentDelegation, privateMode: boolean): AgentDelegation {
+  if (!privateMode) return value;
+  const { id, ref, provider, status, tone, elapsedMs, reason, links } = value;
+  const launch = links?.find(link => link.request?.type === 'goto')?.request;
+  return {
+    id, ref, status, tone, elapsedMs, label: provider === 'Codex' && value.label === 'Linked run' ? 'Linked run' : 'Agent',
+    provider: provider === 'Codex' ? 'Codex' : 'Claude Code',
+    reason: reason === 'Waiting for transcript' || reason === 'Transcript unavailable' ? reason
+      : reason ? 'Launch unresolved' : undefined,
+    links: launch ? [{ label: 'Launch evidence', request: launch }] : undefined,
+  };
+}
+
+/** Host identity and paging markers are used only before this public projection. */
+export function displayRecordedChatRow(row: ChatHistoryRow, privateMode: boolean): ChatRow {
+  const { keys: _keys, delegationCallKeys: _calls, sourceRowId: _source, unresolvedDelegation: _unresolved, delegation, ...publicRow } = row;
+  return delegation ? { ...publicRow, delegation: displayDelegation(delegation, privateMode) } : publicRow;
+}
+
+function displayRow(row: LiveRow, privateMode: boolean, delegation?: AgentDelegation): ChatRow {
   const hidden = privateMode && (row.role === 'user' || row.role === 'assistant');
-  const text = hidden ? 'Hidden in private mode.'
+  const text = privateMode && delegation ? 'Tool' : hidden ? 'Hidden in private mode.'
     : (row.projected ??= (safeText(row.text.replace(/[\uD800-\uDBFF]$/, ''), maxBlock) ?? '') + (row.truncated ? '…' : ''));
   const approval = row.approval && privateMode && row.approval.state === 'pending'
     ? { ...row.approval, preview: '', description: undefined, note: 'Hidden in private display mode. Leave private mode to decide, or the request is denied when it times out.' }
     : row.approval;
-  return { id: row.id, role: row.role, text, state: row.state, ...(approval ? { approval } : {}) };
+  const id = row.identity?.kind === 'call' ? opaqueKey('live-tool', row.id) : row.id;
+  return { id, role: row.role, text, state: row.state,
+    ...(approval ? { approval: privateMode && delegation ? { ...approval, toolName: 'Tool', preview: '', description: undefined } : approval } : {}),
+    ...(delegation ? { delegation: displayDelegation(delegation, privateMode) } : {}) };
 }
 
 /** Owns conversations across editor lifetimes. Each worker gets a fresh owner token. */
@@ -420,6 +455,15 @@ export class ChatSessions {
     this.changed(conversation);
   }
 
+  frozenHistoryStart(key: string): string | null | undefined {
+    const conversation = this.conversations.get(key);
+    return conversation?.frozenHistory ? conversation.historyStart ?? null : undefined;
+  }
+
+  clearEarlierHistory(): void {
+    for (const conversation of this.conversations.values()) conversation.earlierHistory.clear();
+  }
+
   view(key: string, presentation: ChatPresentation): ChatView | undefined {
     const conversation = this.conversations.get(key);
     if (!conversation) return undefined;
@@ -432,12 +476,31 @@ export class ChatSessions {
     const state = this.state(conversation, Boolean(blockingReason));
     const history = presentation.history ?? [];
     const frozen = conversation.frozenHistory;
-    if (!frozen) conversation.history = history.map(row => row.id);
-    const recorded = frozen ? history.filter(row => frozen.has(row.id)) : history;
     const verified = Boolean(identity && presentation.sessionId && presentation.sessionId === scopeSessionId(identity));
+    const privacyChanged = conversation.privateMode !== undefined && conversation.privateMode !== presentation.privateMode;
+    if (privacyChanged) conversation.earlierHistory.clear();
+    conversation.privateMode = presentation.privateMode;
+    if (!frozen) {
+      conversation.history = history.map(row => row.id);
+      conversation.historyStart = history.find(row => row.sourceRowId !== undefined)?.sourceRowId;
+    }
+    const earlier = frozen && verified && conversation.historyStart !== undefined
+      ? history.findIndex(row => row.sourceRowId === conversation.historyStart) : -1;
+    if (presentation.loadEarlier && !privacyChanged && earlier > 0) {
+      for (const row of history.slice(0, earlier)) if (row.sourceRowId) conversation.earlierHistory.add(row.id);
+    }
+    const recorded = frozen ? history.filter((row, index) => frozen.has(row.id)
+      || (index < earlier && conversation.earlierHistory.has(row.id))) : history;
     const live = reconcileRows(recorded, [...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local), verified).live;
-    const rows = recorded.map(({ keys: _keys, ...row }) => row as ChatRow)
-      .concat(live.map(row => displayRow(row, presentation.privateMode)));
+    const displayed = new Set(recorded.map(row => row.id));
+    const late = frozen && verified && !conversation.conflict ? history.flatMap(row => row.delegation && !displayed.has(row.id)
+      ? [{ delegation: row.delegation, delegationCallKeys: row.delegationCallKeys }] : []) : [];
+    const { attached, unresolved } = reconcileDelegations(late, live);
+    const rows = recorded.map(row => displayRecordedChatRow(row, presentation.privateMode))
+      .concat(live.map(row => displayRow(row, presentation.privateMode, attached.get(row.id))));
+    const unresolvedScope = frozen && verified && history.some(row => row.unresolvedDelegation && !displayed.has(row.id));
+    if (unresolved || unresolvedScope) rows.push({ id: opaqueKey('unresolved-chat-launch', key), role: 'notice',
+      text: 'Launch unresolved. A recorded delegation could not be matched to its live tool row.' });
     return {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider,
       profile: presentation.profile, state, reason, rows,

@@ -46,8 +46,9 @@ export function pairCalls(items: Positioned[]): { calls: PairedCall[]; unmatched
     const call = candidates.length === 1 ? candidates[0] : undefined;
     if (call) {
       const previous = call.result;
-      if (previous && resultRank[event.status] === resultRank[previous.event.status] &&
-          event.text !== previous.event.text) call.ambiguous = true;
+      const other = previous?.event;
+      if (other && ((event.agentId && other.agentId && event.agentId !== other.agentId) ||
+          (resultRank[event.status] === resultRank[other.status] && event.text !== other.text))) call.ambiguous = true;
       if (!previous || resultRank[event.status] >= resultRank[previous.event.status]) call.result = item;
     } else {
       for (const candidate of candidates) candidate.ambiguous = true;
@@ -121,15 +122,21 @@ export function reconcileCodex<T extends Positioned>(items: T[]): T[] {
         const previous = item as PairedCall;
         if (!current.result) current.result = previous.result;
         else if (previous.result?.event.text && !current.result.event.text && !current.event.restricted) {
-          current.result = { ...current.result, event: { ...current.result.event, text: previous.result.event.text } };
+          current.result = { ...current.result, event: { ...current.result.event, text: previous.result.event.text,
+            stdout: previous.result.event.stdout, stderr: previous.result.event.stderr,
+            outputTruncated: previous.result.event.outputTruncated,
+            readerPayloadAttributed: Boolean(previous.result.event.owningThread ||
+              (previous.result.event.turnId && previous.result.turnId === current.turnId)),
+            readerPayloadTurnMatched: Boolean(current.turnId && previous.result.turnId === current.turnId) } };
         }
         if (previous.event.argumentKey && !current.event.restricted) {
           current.event = { ...current.event, argumentKey: previous.event.argumentKey, polling: previous.event.polling };
         }
       }
       if (isKind(winner, 'message') && winner.event.role === 'assistant' &&
-          isKind(item, 'message') && item.event.role === 'final' && winner.event.variant !== 'structured') {
-        (winner as Positioned<Kind<'message'>>).event = { ...winner.event, role: 'final' };
+          isKind(item, 'message') && item.event.role === 'final' &&
+          (winner.event.variant !== 'structured' || item.event.terminal && winner.event.text === item.event.text)) {
+        (winner as Positioned<Kind<'message'>>).event = { ...winner.event, role: 'final', terminal: item.event.terminal };
       }
     }
     if (exact) consumed.add(winner);
@@ -160,24 +167,39 @@ export function rowFor(item: Positioned): TimelineRow | undefined {
     parentRecordId: event.parentId,
     responseId: event.responseId ? key(laneId, event.responseId) : undefined,
     nativeKeys: nativeKeysOf(event),
+    explicitTurn: item.source.provider === 'codex' ? Boolean(event.turnId) : undefined,
+    agentHistory: item.source.provider === 'codex' ? event.owningThread ? 'owned' as const : 'unattributed' as const : undefined,
   };
   switch (event.kind) {
     case 'message':
-      return { ...base, kind: messageKind[event.role], label: event.role === 'user' ? 'Prompt' : event.role,
-        text: event.text, durationMs: event.durationMs };
+      return { ...base, kind: messageKind[event.role],
+        label: event.role === 'user' ? 'Prompt' : event.role === 'agent' ? 'Agent message' : event.role,
+        text: event.text, durationMs: event.durationMs, commentary: event.commentary, terminal: event.terminal };
     case 'call': {
-      const result = (item as PairedCall).result?.event;
+      const paired = (item as PairedCall).result;
+      const result = paired?.event;
+      const readerOutput = event.readerOutput && !event.restricted && !ambiguous && !result?.launcher &&
+        !result?.taskOutputPath && !result?.readerBodyRestricted;
+      const scopedResult = item.source.provider !== 'codex' || result?.readerPayloadAttributed !== false &&
+        (result?.owningThread || result?.turnId !== undefined && paired?.turnId === turnId);
       return { ...base, kind: 'tool', label: event.name,
         text: event.restricted ? undefined : event.text, command: event.restricted ? undefined : event.command,
+        input: event.restricted ? undefined : event.input,
+        readerOutput: readerOutput || undefined, spawnAttempt: event.spawn,
         output: event.restricted ? undefined : result?.text, status: result?.status ?? 'requested',
+        stdout: readerOutput ? result?.stdout : undefined, stderr: readerOutput ? result?.stderr : undefined,
+        outputTruncated: readerOutput ? result?.outputTruncated : undefined,
+        readerOutputAttributed: scopedResult || undefined,
+        readerOutputTurnMatched: Boolean(turnId && paired?.turnId === turnId && result?.readerPayloadTurnMatched !== false) || undefined,
         exitCode: result?.exitCode, durationMs: result?.durationMs };
     }
     case 'result':
-      return { ...base, kind: 'result', label: 'Tool result', status: event.status };
+      return { ...base, kind: 'result', label: 'Tool result', status: event.status, unmatched: true };
     case 'compaction':
       return { ...base, kind: 'compact', label: 'Context compacted' };
     case 'spawn':
-      return { ...base, kind: 'agent', label: 'Subagent activity', status: event.state };
+      return { ...base, kind: 'agent', label: event.state === 'running' ? 'Subagent started' : 'Subagent activity',
+        status: event.state, spawnAttempt: event.state === 'running' };
     case 'task':
       return { ...base, kind: 'task', label: event.description ?? 'Background task', status: event.state };
     case 'file':

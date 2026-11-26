@@ -8,6 +8,7 @@ import type { Crumb, ParentChoice, ParentInfo, RowTarget, SignalView, StatusTone
 export interface Names {
   session(session: Session): string;
   project(session: Session): string;
+  privateMode?: boolean;
 }
 
 export type Thresholds = Pick<SignalSettings, 'warnPercent' | 'criticalPercent'>;
@@ -112,10 +113,10 @@ export function warningLabels(summary: SessionSignals): SignalView[] {
   return labels;
 }
 
-function laneLabel(session: Session, lane: Lane | undefined): string {
+function laneLabel(session: Session, lane: Lane | undefined, privateMode?: boolean): string {
   if (!lane) return 'Agent';
   if (lane === session.lanes[0]) return (session.provider === 'claude-code' ? 'Claude' : 'Codex') + ' main';
-  return safeText(lane.title, 60) ?? 'Agent';
+  return privateMode ? 'Agent' : safeText(lane.title, 60) ?? 'Agent';
 }
 
 function newestFirst(targets: readonly ParentTarget[]): ParentTarget[] {
@@ -125,7 +126,7 @@ function newestFirst(targets: readonly ParentTarget[]): ParentTarget[] {
 function choice(target: ParentTarget, byId: ReadonlyMap<string, Session>, names: Names): ParentChoice {
   const parent = byId.get(target.sessionId);
   const lane = parent?.lanes.find(item => item.id === target.laneId);
-  const label = parent ? names.session(parent) + ' · ' + laneLabel(parent, lane) : 'Session unavailable';
+  const label = parent ? names.session(parent) + ' · ' + laneLabel(parent, lane, names.privateMode) : 'Session unavailable';
   return { sessionId: target.sessionId, laneId: target.laneId, rowId: target.rowId, label, at: target.at };
 }
 
@@ -173,8 +174,8 @@ export function breadcrumb(session: Session, byId: ReadonlyMap<string, Session>,
     const row = lane?.rows.find(item => item.id === target.rowId);
     const at: RowTarget = { sessionId: parent.id, laneId: target.laneId, rowId: target.rowId };
     if (index === 0) crumbs.push({ label: names.session(parent), target: { sessionId: parent.id, laneId: '', rowId: '' } });
-    crumbs.push({ label: laneLabel(parent, lane), target: { sessionId: parent.id, laneId: target.laneId, rowId: '' } });
-    crumbs.push({ label: safeText(row?.label, 60) ?? 'Spawn', target: at });
+    crumbs.push({ label: laneLabel(parent, lane, names.privateMode), target: { sessionId: parent.id, laneId: target.laneId, rowId: '' } });
+    crumbs.push({ label: names.privateMode ? 'Spawn' : safeText(row?.label, 60) ?? 'Spawn', target: at });
     const next = hops[index + 1]?.parent ?? session;
     if (next !== session) crumbs.push({ label: names.session(next), target: { sessionId: next.id, laneId: '', rowId: '' } });
   }

@@ -1,8 +1,9 @@
 import { isHostMessage } from '../shared/protocol';
-import type { ChatView, PanelModel, PanelTab } from '../shared/protocol';
+import type { AgentReader, ChatView, PanelModel, PanelTab } from '../shared/protocol';
 import { formatDuration } from '../shared/format';
 import { api, badge, button, el, preserve, signalBadge } from './dom';
 import { mapTab } from './panel/agents';
+import { AgentPopupView } from './panel/agent-popup';
 import { ChatPane } from './panel/chat';
 import { filesTab } from './panel/files';
 import { applyFocus, applyRestore, arrive, canGoBack, departed, goBack, goTo, parentAction } from './panel/nav';
@@ -17,10 +18,17 @@ const root = document.getElementById('root');
 if (!root) throw new Error('Missing root');
 const ui = loadUi();
 let model: PanelModel | undefined;
+let reader: AgentReader | undefined;
 const chatPane = new ChatPane(request => api.postMessage(request), position => {
   ui.chatPosition = position;
   saveUi(ui);
-}, ui.chatPosition, tab => select(tab));
+}, ui.chatPosition, tab => select(tab), (ref, id) => agentPopup.enter(ref, id), () => agentPopup.loadEarlier());
+const agentPopup = new AgentPopupView(request => api.postMessage(request), {
+  focusLaunch: id => chatPane.focusLaunch(id),
+  focusApproval: () => chatPane.focusApproval(),
+  openTab: tab => select(tab),
+  inspecting: active => chatPane.setInspecting(active),
+});
 let peerBack = false;
 let inspectionScroll = 0;
 
@@ -108,6 +116,34 @@ function drawChat(chat: ChatView, session?: SessionModel): void {
   }
   chatPane.update(chat);
   if (entering) chatPane.show();
+  drawReader();
+}
+
+function drawReader(updateRoot = true): void {
+  if (updateRoot && !reader?.popup) chatPane.setEarlier(Boolean(reader?.earlier));
+  if (!reader) return;
+  const pending = model?.mode === 'chat' && model.chat.rows.some(row => row.approval?.state === 'pending');
+  agentPopup.update(reader, pending, chatPane.element.isConnected);
+}
+
+function applyReader(next: AgentReader): boolean {
+  if (reader && next.revision < reader.revision) return false;
+  reader = next;
+  if (!next.invalidate) return true;
+  chatPane.clearDelegations();
+  if (model?.mode !== 'chat') return true;
+  const { chat } = model;
+  const rows = chat.rows.map(({ delegation: _delegation, ...row }) => next.privateMode
+    ? { id: row.id, role: row.role, text: '' } : row);
+  if (!next.privateMode) {
+    model = { mode: 'chat', id: model.id, chat: { ...chat, rows } };
+  } else {
+    model = { mode: 'chat', id: model.id, chat: {
+      key: chat.key, title: 'Conversation', provider: chat.provider, state: chat.state, rows, draft: '', revision: chat.revision,
+      privateMode: true, canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
+    } };
+  }
+  return true;
 }
 
 function tabBar(session: SessionModel): HTMLElement {
@@ -166,6 +202,7 @@ function draw(): void {
   }
   const wasChat = chatPane.element.isConnected;
   if (wasChat) {
+    agentPopup.leaveChat();
     chatPane.hide();
     document.body.classList.remove('chat-open');
   }
@@ -186,11 +223,28 @@ function draw(): void {
     }
   });
   if (wasChat && document.scrollingElement) document.scrollingElement.scrollTop = inspectionScroll;
+  drawReader();
 }
 
 window.addEventListener('message', event => {
   const message: unknown = event.data;
-  if (!isHostMessage(message) || message.type !== 'panel') return;
+  if (!isHostMessage(message) || message.type === 'sidebar') return;
+  if (message.type === 'agentReader') {
+    if (!applyReader(message.reader)) return;
+    if (message.reader.invalidate && model?.mode === 'chat') {
+      if (chatPane.element.isConnected && message.reader.privateMode) {
+        drawChat(model.chat);
+        return;
+      }
+      if (!chatPane.element.isConnected) {
+        if (message.reader.privateMode) chatPane.update(model.chat);
+        root.replaceChildren(el('p', { cls: 'empty', text: message.reader.privateMode ? 'Private display mode is on.' : 'Source unavailable.' }));
+      }
+    }
+    drawReader(false);
+    return;
+  }
+  if (message.reader && !applyReader(message.reader)) return;
   const next = message.model;
   peerBack = message.back === true;
   if (next.mode === 'chat' || next.mode === 'session') {

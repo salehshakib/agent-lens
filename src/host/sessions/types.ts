@@ -101,7 +101,16 @@ export type TimelineRow = {
   kind: "user" | "assistant" | "final" | "reasoning" | "tool" | "result" | "compact" | "agent" | "task" | "system";
   label: string;
   text?: string;
+  input?: string;
+  /** Reader eligibility is narrower than the existing Timeline result preview. */
+  readerOutput?: boolean;
+  /** The paired result independently identifies its owning Codex scope. */
+  readerOutputAttributed?: boolean;
+  readerOutputTurnMatched?: boolean;
   output?: string;
+  stdout?: string;
+  stderr?: string;
+  outputTruncated?: boolean;
   status?: string;
   command?: string;
   exitCode?: number;
@@ -111,6 +120,14 @@ export type TimelineRow = {
   parentRecordId?: string;
   currentBranch?: boolean;
   ambiguous?: boolean;
+  terminal?: 'response' | 'fallback';
+  commentary?: boolean;
+  /** For child rollouts, only activity with explicit ownership is shown in the reader. */
+  agentHistory?: 'owned' | 'unattributed';
+  /** True when the provider named a native turn on this Codex row. */
+  explicitTurn?: boolean;
+  spawnAttempt?: boolean;
+  unmatched?: boolean;
 };
 
 export type Turn = {
@@ -126,6 +143,8 @@ export type Turn = {
   modelSource?: ModelSource;
   cwd?: string;
   rootId?: string;
+  /** Recorded on a Codex child start, independent of the child's root-turn label. */
+  parentNativeId?: string;
   usage?: TokenCounts;
   usageScope?: UsageObservation['scope'];
 };
@@ -144,7 +163,18 @@ export type Lane = {
   parentReason?: string;
   branchLeaf?: string;
   pending?: boolean;
+  /** A Claude spawn stub still uses its call identity while the child identity is pending. */
+  pendingIdentity?: boolean;
+  pendingSessionId?: string;
   transcriptAvailable?: boolean;
+  historyPending?: boolean;
+  historyUnavailable?: boolean;
+  historyPartial?: boolean;
+  /** Redacted prompt from this lane's verified spawning tool. */
+  delegatedPrompt?: string;
+  parentResult?: string;
+  parentStatus?: State;
+  parentEndedAt?: number;
   latestActivity?: TimelineRow;
   context?: ContextSample;
   usage?: TokenCounts;

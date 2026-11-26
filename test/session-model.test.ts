@@ -11,6 +11,7 @@ import { mergeTimeline } from '../src/host/sessions/items';
 import { resolveProject } from '../src/host/sessions/project';
 import { reduceSession } from '../src/host/sessions/reduce';
 import { SessionStore } from '../src/host/sessions/store';
+import { directAgentEdges, projectAgentActivity } from '../src/host/views/chat-transcript';
 import { call, childId, claudeId, claudeSource, codexId, codexSource, fixtureEvents, fixtureEvidence,
   fixtureRoot, instant, prompt, response, result, rollout } from './fixtures/session';
 
@@ -278,4 +279,62 @@ test('recorded project identities distinguish worktrees and the mixed timeline p
     { rows: [{ id: 'b1', laneId: 'b', kind: 'user', label: 'fixture', at: 15 }] },
   ]);
   deepEqual(rows.map(row => row.id), ['b1', 'a1', 'a2']);
+});
+
+test('scoped reads hydrate only the selected child and quarantine a source whose access was lost', async t => {
+  const home = await mkdtemp(join(fixtureRoot, '.agent-reader-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const history = join(home, 'projects');
+  const project = join(history, 'fixture');
+  const subagents = join(project, claudeId, 'subagents');
+  const schemaPath = join(subagents, 'agent-schema.jsonl');
+  const errorsPath = join(subagents, 'agent-errors.jsonl');
+  const rootRecords = [
+    prompt('root-prompt', 'Check the fixture', 0),
+    response('spawn', 'root-prompt', 10, [call('Agent', 'schema-call', { prompt: 'Inspect schema' }),
+      call('Agent', 'errors-call', { prompt: 'Inspect errors' })]),
+    result('schema-out', 'schema-call', 15, { agentId: 'schema', isAsync: true }, 'spawn'),
+    result('errors-out', 'errors-call', 16, { agentId: 'errors', isAsync: true }, 'spawn'),
+  ];
+  const schemaRecords = [prompt('schema-prompt', 'Record for schema only', 20)];
+  const jsonl = (rows: unknown[]) => rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+  await mkdir(subagents, { recursive: true });
+  await Promise.all([
+    writeFile(join(project, claudeId + '.jsonl'), jsonl(rootRecords)),
+    writeFile(schemaPath, jsonl(schemaRecords)),
+    writeFile(errorsPath, jsonl([prompt('errors-prompt', 'Record for errors only', 21)])),
+  ]);
+  const root: ApprovedRoot = { key: 'fixture-scope', adapter: adapters[0], boundary: home, history,
+    profile: { id: 'fixture', label: 'Fixture', provider: 'claude-code', home } };
+  const { sources } = await discoverSources(root, new AbortController().signal);
+  const mainSource = [...sources.values()].find(source => source.laneId === claudeId)!;
+  const schemaSource = [...sources.values()].find(source => source.laneId === 'schema')!;
+  const store = new SessionStore(undefined, () => instant + 100);
+  store.setCatalog(root.key, root.adapter, sources);
+  batch(store, mainSource, fixtureEvents(mainSource, rootRecords));
+  let sessions = await store.sessions();
+  const main = sessions.find(session => session.id === sourceSessionId(mainSource))!;
+  const scope = { sessionId: main.id, laneId: main.lanes[0]!.id };
+  const edges = directAgentEdges(sessions, scope);
+  equal(edges.length, 2);
+  const schema = edges.find(edge => main.lanes.find(lane => lane.id === edge.target.laneId)?.nativeId === 'schema')!;
+  const errors = edges.find(edge => edge.id !== schema.id)!;
+  const view = (edge = schema) => projectAgentActivity(sessions, edge, { now: instant + 100, privateMode: false });
+  equal(view().state, 'waiting');
+  let current = true;
+  const cancelled = store.materializeAgent(schema.target, [scope], () => current);
+  current = false;
+  await cancelled;
+  sessions = await store.sessions();
+  equal(view().state, 'waiting');
+  await store.materializeAgent(schema.target, [scope], () => true);
+  sessions = await store.sessions();
+  equal(view().rows.find(row => row.kind === 'prompt')?.text, 'Record for schema only');
+  equal(view(errors).state, 'waiting');
+
+  await rm(schemaPath);
+  equal(await store.agentSource(schema.target), 'unavailable');
+  batch(store, schemaSource, fixtureEvents(schemaSource, schemaRecords), 2);
+  sessions = await store.sessions();
+  ok(!JSON.stringify(sessions).includes('Record for schema only'));
 });

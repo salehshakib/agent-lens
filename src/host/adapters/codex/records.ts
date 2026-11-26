@@ -50,8 +50,10 @@ function label(value: unknown): string | undefined {
   return safeText(value, 256)?.trim() || undefined;
 }
 
-function message(base: EventBase, role: Extract<Event, { kind: "message" }>["role"], text?: string): Event[] {
-  return text ? [{ ...base, kind: "message", role, text }] : [];
+function message(base: EventBase, role: Extract<Event, { kind: "message" }>["role"], text?: string, phase?: unknown): Event[] {
+  const terminal = phase === "final_answer" ? "response"
+    : role === "final" && base.variant === "fallback" && base.turnId ? "fallback" : undefined;
+  return text ? [{ ...base, kind: "message", role, text, terminal, commentary: phase === "commentary" || undefined }] : [];
 }
 
 function contentText(value: unknown, types: readonly string[], include?: (index: number) => boolean): string | undefined {
@@ -129,7 +131,7 @@ function completedItem(base: EventBase, item: Record<string, unknown>, source: S
     }
     case "AgentMessage":
       return message(itemBase, item.phase === "final_answer" ? "final" : "assistant",
-        contentText(item.content, ["text", "output_text"]));
+        contentText(item.content, ["text", "output_text"]), item.phase);
     case "Reasoning": {
       const parts = Array.isArray(item.summary_text)
         ? item.summary_text.map((entry) => safeText(entry)).filter((entry) => entry?.trim())
@@ -231,7 +233,7 @@ function responseItem(base: EventBase, payload: Record<string, unknown>): Event[
     case "message": {
       if (payload.role === "assistant") {
         return message(responseBase, payload.phase === "final_answer" ? "final" : "assistant",
-          contentText(payload.content, ["output_text"]));
+          contentText(payload.content, ["output_text"]), payload.phase);
       }
       if (payload.role !== "user") return [];
       const kinds = metadata?.content_item_kinds ?? record(payload.metadata)?.content_item_kinds ??
@@ -272,7 +274,8 @@ export function parseCodexRecords(value: unknown, source: Source, offset: number
   if (source.kind !== "transcript" || !uuid(source.sessionId)) return [];
   const payload = record(row.payload);
   if (!payload || !matchesThread(payload.thread_id, source)) return [];
-  const attributed = { ...base, turnId: identifier(payload.turn_id), rootTurnId: identifier(payload.root_turn_id) };
+  const attributed = { ...base, turnId: identifier(payload.turn_id), rootTurnId: identifier(payload.root_turn_id),
+    owningThread: uuid(payload.thread_id) === source.sessionId.toLowerCase() || undefined };
   switch (row.type) {
     case "session_meta":
       return sessionMeta(base, payload, source);

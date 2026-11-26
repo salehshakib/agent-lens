@@ -10,6 +10,7 @@ export interface WorkingTurn extends Turn {
   started?: boolean;
   modelFromContext?: boolean;
   effortFromContext?: boolean;
+  parentTurnConflict?: boolean;
 }
 
 export interface LaneWork {
@@ -36,6 +37,28 @@ function touch(turn: WorkingTurn, at: number | undefined): void {
 }
 
 const terminalReasons = new Set(['end_turn', 'stop_sequence']);
+
+/** A stop on one Claude response does not make another response in the same turn final. */
+function markClaudeFinals(work: LaneWork): void {
+  const responses = new Map<string, { terminal: boolean; conflicted: boolean }>();
+  const responseKey = (item: Positioned): string => key(item.turnId, item.event.responseId ?? item.event.recordId ??
+    item.event.id.replace(/:(?:metadata|block:\d+)$/, ''));
+  for (const item of work.items) {
+    if (!isKind(item, 'metadata') || item.source.kind !== 'transcript') continue;
+    const { stopReason, outcome } = item.event;
+    if (!stopReason && outcome !== 'aborted') continue;
+    const id = responseKey(item);
+    const state = responses.get(id) ?? { terminal: false, conflicted: false };
+    state.terminal ||= terminalReasons.has(stopReason ?? '');
+    state.conflicted ||= outcome === 'aborted' || (stopReason !== undefined && !terminalReasons.has(stopReason));
+    responses.set(id, state);
+  }
+  for (const item of work.items) {
+    if (!isKind(item, 'message') || item.event.role !== 'assistant') continue;
+    const state = responses.get(responseKey(item));
+    if (state?.terminal && !state.conflicted) item.event = { ...item.event, terminal: 'response' };
+  }
+}
 
 function assignClaude(work: LaneWork, initialCwd?: string): void {
   const { lane, items } = work;
@@ -96,6 +119,7 @@ function assignClaude(work: LaneWork, initialCwd?: string): void {
     }
   }
   work.currentTurn = resolve(lane.branchLeaf) ?? current;
+  markClaudeFinals(work);
 }
 
 function assignCodex(work: LaneWork, initialCwd?: string): void {
@@ -127,6 +151,12 @@ function assignCodex(work: LaneWork, initialCwd?: string): void {
     }
     if (event.kind === 'turn') {
       if (event.state === 'running') {
+        if (event.turnId && event.parentId && !turn.parentTurnConflict) {
+          if (turn.parentNativeId && turn.parentNativeId !== event.parentId) {
+            turn.parentTurnConflict = true;
+            turn.parentNativeId = undefined;
+          } else turn.parentNativeId = event.parentId;
+        }
         if (!turn.terminal) open.add(id);
         turn.started = true;
         turn.startedAt ??= event.at;

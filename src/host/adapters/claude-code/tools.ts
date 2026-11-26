@@ -1,3 +1,4 @@
+import { delegatedPromptCandidate } from "../types";
 import type { Event, EventBase, FileEvidence, Outcome, ResultStatus } from "../types";
 import {
   containsSensitivePath, count, identifier, record, safePath, safeText,
@@ -75,6 +76,8 @@ export function claudeToolCall(block: JsonObject, base: EventBase, unsafeCwd: bo
       return { ...call, restricted: true };
     }
     call.command = safeText(input.command);
+    call.input = call.command;
+    call.readerOutput = Boolean(call.command) || undefined;
     call.background = boolean(input.run_in_background);
     call.text = safeText(input.description, 512);
     // If sanitization changed the command, equality of the visible text is insufficient evidence.
@@ -93,6 +96,9 @@ export function claudeToolCall(block: JsonObject, base: EventBase, unsafeCwd: bo
     const limit = count(input.limit);
     const range = name === "Read" && (offset !== undefined || limit !== undefined) ? { offset, limit } : undefined;
     call.files = [{ path, kind: name === "Read" ? "read" : "edit", range, status: "pending" }];
+    call.readerOutput = true;
+    call.input = [path, range?.offset === undefined ? undefined : `Offset ${range.offset}`,
+      range?.limit === undefined ? undefined : `Limit ${range.limit}`].filter(value => value !== undefined).join("\n");
 
     if (name === "Read" && (offset !== undefined || input.offset === undefined) &&
         (limit !== undefined || input.limit === undefined)) {
@@ -114,14 +120,19 @@ export function claudeToolCall(block: JsonObject, base: EventBase, unsafeCwd: bo
     if (path) call.files = [{ path, kind: "mention", status: "unknown" }];
 
     const glob = safeText(input.glob);
+    call.input = [safeText(input.pattern, 2_000), path, safeText(input.glob, 2_000)].filter(Boolean).join("\n") || undefined;
+    call.readerOutput = Boolean(pattern) || undefined;
     if (pattern && pattern === input.pattern && glob === input.glob && (input.path === undefined || path)) {
       args = { path, pattern, glob, outputMode: identifier(input.output_mode) };
     }
   } else if (name === "Agent" || (name === "Task" && identifier(input.subagent_type) && typeof input.prompt === "string")) {
     // A legacy Task is only a spawn candidate. The host still needs child identity evidence.
     call.spawn = true;
+    call.readerOutput = typeof input.prompt === "string" || undefined;
     call.background = boolean(input.run_in_background);
     call.text = safeText(input.description, 512);
+    call.input = [call.text, identifier(input.subagent_type)].filter(Boolean).join("\n") || undefined;
+    call[delegatedPromptCandidate] = safeText(input.prompt, 12_000);
     const prompt = safeText(input.prompt);
     if (prompt && prompt === input.prompt) {
       args = {
@@ -252,16 +263,17 @@ export function claudeToolResult(
       status: status === "success" ? "applied" : status === "failed" ? "failed" : "unknown" });
   }
 
-  let text: string | undefined;
-  if (!restricted) {
-    const stdout = safeText(meta?.stdout);
-    const stderr = safeText(meta?.stderr);
-    text = stderr
+  const stdout = restricted ? undefined : safeText(meta?.stdout);
+  const stderr = restricted ? undefined : safeText(meta?.stderr);
+  const text = !restricted
+    ? stderr
       ? (stdout ? `${stdout}\n\nStderr\n${stderr}` : `Stderr\n${stderr}`)
-      : stdout ?? renderResultContent(block.content);
-  }
+      : stdout ?? renderResultContent(block.content)
+    : undefined;
+  const readerBodyRestricted = typeof text === "string" && /<persisted-output\b|\btool-results[\\/]/i.test(text);
   return {
-    ...base, kind: "result", callId, status, text, exitCode, files: files.length ? files : undefined,
+    ...base, kind: "result", callId, status, text, stdout, stderr, exitCode, files: files.length ? files : undefined,
+    readerBodyRestricted: readerBodyRestricted || undefined,
     agentId, backgroundTaskId,
     backgroundCwd: restricted ? undefined : safePath(meta?.backgroundCwdHint),
     taskOutputPath: restricted ? undefined : claudeTaskOutputReference(meta?.outputFilePath ?? meta?.outputFile)?.path ?? scheduledRef?.path,

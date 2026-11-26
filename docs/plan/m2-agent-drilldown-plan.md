@@ -192,6 +192,8 @@ The lead defines the shared view and edge contract first. The three workers can 
 | C · cards, agent popup and navigation | new `src/webview/panel/agent-popup.ts` (dialog frame, focus trap, Escape/backdrop close, breadcrumb, Back, popup body), `src/webview/panel.ts`, `src/webview/panel/chat.ts`, `src/webview/panel/chat-cards.ts`, `src/webview/panel/chat-keys.ts` (Escape priority while the popup is open), `src/webview/panel/nav.ts`, `src/webview/panel/state.ts`, `media/chat.css` |
 | Lead · contract and integration | `src/shared/protocol.ts`, `src/host/views/data.ts`, `src/host/views/panel.ts`, `src/extension.ts`, and `src/host/chat/codex-launch.ts` if shared per-launch target projection is needed. Own cross-layer wiring, evidence review, manual acceptance and the final gates. |
 
+Coordinator ownership update: The lead also owns `src/host/chat/session.ts` and `src/host/chat/reconcile.ts` if needed for live delegation placement and earlier root pages.
+
 ## Verification plan
 
 Run `npm run typecheck`, `npm test`, and `npm run build` after implementation. Use the existing `test/claude-reader.test.ts`, `test/codex-reader.test.ts`, `test/session-model.test.ts`, `test/delegation.test.ts`, `test/chat-transcript.test.ts`, `test/chat-reconcile.test.ts`, `test/lane-parent.test.ts`, `test/signal-views.test.ts`, and `test/protocol.test.ts` for automated regression coverage. Use manual VS Code replay and disposable provider runs for the new end-to-end paths. [Phase D verification](m2-phase-d-report.md) · [Phase F verification](m2-phase-f-report.md)
