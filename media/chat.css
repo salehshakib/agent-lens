@@ -271,5 +271,33 @@
     padding-block-end: 6px;
   }
 }
-.chat-card-fold > summary { cursor: pointer; font-weight: 600; }
-.chat-card-fold { max-width: 72ch; }
+.chat-card-fold {
+  max-inline-size: 100%;
+  min-inline-size: 0;
+}
+
+.chat-card-fold > summary {
+  cursor: pointer;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.chat-transcript-children {
+  list-style: none;
+  margin: 8px 0 0;
+  padding-inline-start: clamp(5px, 2vw, 14px);
+  border-inline-start: 1px solid var(--chat-border);
+  min-inline-size: 0;
+}
+
+.chat-card-entry pre {
+  max-block-size: 10rem;
+  max-inline-size: 100%;
+  overflow: auto;
+  margin: 4px 0;
+  padding: 5px 7px;
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  font: 0.95em / 1.55 var(--chat-mono);
+  white-space: pre;
+  overflow-wrap: normal;
+}

@@ -1,9 +1,10 @@
 import { TextDecoder } from 'node:util';
 import type { Readable } from 'node:stream';
-import type { ChatEvent, ChatLaunch, ChatSend, CompactMeasurement } from '../../chat/types';
+import type { ChatEvent, ChatLaunch, ChatRowIdentity, ChatSend, CompactMeasurement } from '../../chat/types';
 import { localPath, pathKey } from '../../discovery/local-path';
 import { count, identifier, record, safeText } from '../../privacy/projection';
 import type { Tokens } from '../types';
+import { claudeToolCall, claudeToolResult } from './tools';
 import { minimumClaudeCodeVersion, supportsClaudeCodeVersion } from './version';
 
 const maxFrame = 1024 * 1024;
@@ -11,6 +12,7 @@ const maxBlockText = 32 * 1024;
 const maxTurnText = 192 * 1024;
 const maxBlocks = 256;
 const maxCalls = 256;
+const maxToolOutput = 1_000;
 const maxRememberedRecords = 16_384;
 const uuid = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const decoder = new TextDecoder('utf-8', { fatal: true });
@@ -20,6 +22,7 @@ const turnFailure = 'Claude Code did not complete this turn.';
 
 type Row = Record<string, unknown>;
 type ToolOutcome = Extract<ChatEvent, { kind: 'toolResult' }>['outcome'];
+type TextIdentity = Extract<ChatRowIdentity, { kind: 'response' }>;
 type Update<T = ChatEvent> = T extends ChatLaunch ? Omit<T, keyof ChatLaunch> : never;
 
 export function isClaudeSessionId(value: unknown): value is string {
@@ -113,11 +116,22 @@ function correlates(row: Row, turnId: string): boolean | undefined {
 
 interface TextBlock {
   messageId: string;
+  identity?: TextIdentity;
+  aliases?: TextIdentity[];
+  evidenceChanged?: boolean;
   source: string;
   shown: string;
   complete: boolean;
   lastUpdate: number;
   heldLimit?: boolean;
+}
+
+interface ToolState {
+  observed?: boolean;
+  inspectOutput?: boolean;
+  result?: { outcome: ToolOutcome; output?: string };
+  published?: boolean;
+  outputPublished?: boolean;
 }
 
 interface Turn {
@@ -128,7 +142,7 @@ interface Turn {
   failure?: string;
   records: Set<string>;
   blocks: Map<string, TextBlock>;
-  tools: Map<string, ToolOutcome | undefined>;
+  tools: Map<string, ToolState>;
   textBytes: number;
   messageId?: string;
   blockIndex?: number;
@@ -162,7 +176,7 @@ export class ClaudeChatStream {
   private nativeCommands = false;
   private fastCheck = false;
   private modelControl?: { id: string; received: (model?: string) => void };
-  private lastResultId?: string;
+  private readonly terminalRecords = new Set<string>();
 
   constructor(
     private readonly launch: ChatLaunch,
@@ -259,15 +273,18 @@ export class ClaudeChatStream {
     }
     if (this.nativeCommands && turn.initialized && row.type === 'result') {
       const id = isClaudeSessionId(row.uuid) ? row.uuid : turn.id;
-      if (id === this.lastResultId || !(match || turn.started || turn.acknowledged || limitReason(row.result))) return;
+      if (this.terminalRecords.has(id) || !(match || turn.started || turn.acknowledged || limitReason(row.result))) return;
       if (match || turn.lifecycleCompleted) this.result(turn, row, id);
       else turn.terminal ??= { row, id };
       return;
     }
     const frameId = isClaudeSessionId(row.uuid) ? row.uuid : undefined;
-    if (!frameId || turn.records.has(frameId)) return;
+    if (!frameId) return;
+    const apiIndex = row.type === 'assistant' ? count(row.apiBlockIndex) : undefined;
+    const recordId = apiIndex === undefined ? frameId : `${frameId}:${apiIndex}`;
+    if (turn.records.has(recordId)) return;
     if (turn.records.size === maxRememberedRecords) turn.records.delete(turn.records.values().next().value!);
-    turn.records.add(frameId);
+    turn.records.add(recordId);
 
     switch (row.type) {
       case 'user': this.user(turn, row); break;
@@ -275,7 +292,7 @@ export class ClaudeChatStream {
         if (turn.acknowledged || match) this.partial(turn, row);
         break;
       case 'assistant':
-        if (turn.acknowledged || match) this.assistant(turn, row);
+        if (turn.acknowledged || match) this.assistant(turn, row, frameId, apiIndex);
         break;
       case 'result':
         if (match || (row.is_error === true && !turn.acknowledged)) this.result(turn, row, frameId);
@@ -385,17 +402,20 @@ export class ClaudeChatStream {
     }
     if (!turn.acknowledged) return;
     const metadata = Array.isArray(row.tool_result_meta) ? row.tool_result_meta.slice(0, maxCalls).map(record) : [];
-    for (const item of message.content.slice(0, maxCalls)) {
-      const block = record(item);
+    const results = message.content.slice(0, maxCalls).map(record).filter(item => item?.type === 'tool_result');
+    for (const block of results) {
       const id = identifier(block?.tool_use_id);
-      if (block?.type !== 'tool_result' || !id) continue;
+      if (!block || !id) continue;
       const details = metadata.find(detail => detail?.id === id);
       const decision = record(details?.permission_decision);
       const needsApproval = details?.non_execution_kind === 'permission-prompt'
         || (decision?.decision === 'reject' && decision.reason_type === 'permission_prompt_disabled');
       const rejected = decision?.decision === 'reject' || details?.non_execution_kind === 'permission-rule';
-      const outcome = needsApproval ? 'needs-approval' : rejected || block.is_error === true ? 'failed' : 'completed';
-      this.toolResult(turn, id, outcome);
+      const result = claudeToolResult(block, { id }, row, results.length === 1, false);
+      if (result?.kind !== 'result') continue;
+      if (!needsApproval && !rejected && result.status === 'unknown') continue;
+      const outcome = needsApproval ? 'needs-approval' : rejected || result.status === 'failed' ? 'failed' : 'completed';
+      this.toolResult(turn, id, outcome, safeText(result.text, maxToolOutput));
     }
   }
 
@@ -420,18 +440,18 @@ export class ClaudeChatStream {
     if (event.type === 'content_block_start') {
       turn.blockIndex = index;
       const block = record(event.content_block);
-      if (block?.type === 'text') this.text(turn, messageId, index, block.text, false);
-      else if (block?.type === 'tool_use') this.tool(turn, block);
+      if (block?.type === 'text') this.partialText(turn, messageId, index, block.text);
+      else if (block?.type === 'tool_use') this.tool(turn, block, false);
     } else if (event.type === 'content_block_delta' && turn.blockIndex === index) {
       const delta = record(event.delta);
-      if (delta?.type === 'text_delta') this.text(turn, messageId, index, delta.text, false);
+      if (delta?.type === 'text_delta') this.partialText(turn, messageId, index, delta.text);
     } else if (event.type === 'content_block_stop' && turn.blockIndex === index) {
       this.flushText(turn, messageId, index);
       turn.blockIndex = undefined;
     }
   }
 
-  private assistant(turn: Turn, row: Row): void {
+  private assistant(turn: Turn, row: Row, frameId: string, apiIndex?: number): void {
     if (row.error !== undefined && row.error !== null) {
       turn.failure = this.resultError(row) ?? turnFailure;
       return;
@@ -444,24 +464,39 @@ export class ClaudeChatStream {
       this.model = model;
       this.publish({ kind: 'model', turnId: turn.id, model });
     }
-    // Claude sends a complete assistant record per block while streaming, including later block indices.
-    const firstIndex = message.content.length === 1 && turn.messageId === messageId ? turn.blockIndex ?? 0 : 0;
     for (const [offset, item] of message.content.slice(0, maxBlocks).entries()) {
       const block = record(item);
-      if (block?.type === 'text') this.text(turn, messageId, firstIndex + offset, block.text, true);
-      else if (block?.type === 'tool_use') this.tool(turn, block);
+      if (block?.type === 'text') {
+        const identity: TextIdentity = { kind: 'response', id: messageId, record: frameId,
+          recordIndex: apiIndex, block: offset };
+        if (apiIndex !== undefined && offset === 0) {
+          this.text(turn, messageId, `${messageId}:${apiIndex}`, block.text, true,
+            { kind: 'response', id: messageId, block: apiIndex }, identity);
+        } else {
+          // Separate split records can share a response id. Their local offset alone cannot identify a live delta.
+          this.text(turn, messageId, `${messageId}:${frameId}:${apiIndex ?? ''}:${offset}`, block.text, true, identity);
+        }
+      } else if (block?.type === 'tool_use') this.tool(turn, block, true);
     }
   }
 
-  private text(turn: Turn, messageId: string, index: number, value: unknown, complete: boolean): void {
+  private partialText(turn: Turn, messageId: string, index: number, value: unknown): void {
+    this.text(turn, messageId, `${messageId}:${index}`, value, false, { kind: 'response', id: messageId, block: index });
+  }
+
+  private text(turn: Turn, messageId: string, key: string, value: unknown, complete: boolean,
+    identity?: TextIdentity, alias?: TextIdentity): void {
     if (typeof value !== 'string') return;
-    const key = `${messageId}:${index}`;
     let block = turn.blocks.get(key);
     if (block?.complete) return;
     if (!block) {
       if (turn.blocks.size >= maxBlocks) return;
-      block = { messageId, source: '', shown: '', complete: false, lastUpdate: 0 };
+      block = { messageId, identity, source: '', shown: '', complete: false, lastUpdate: 0 };
       turn.blocks.set(key, block);
+    }
+    if (alias) {
+      block.aliases = [alias];
+      block.evidenceChanged = true;
     }
     const source = complete ? value : block.source + value;
     const available = Math.min(maxBlockText, maxTurnText - turn.textBytes + block.source.length);
@@ -489,26 +524,53 @@ export class ClaudeChatStream {
       return;
     }
     block.heldLimit = false;
-    if (text === block.shown) return;
+    if (text === block.shown && (!text || !block.evidenceChanged)) return;
     const append = text.startsWith(block.shown);
     const update = append ? text.slice(block.shown.length) : text;
     block.shown = text;
+    block.evidenceChanged = false;
     if (turn.command && turn.command !== 'native') return;
-    this.publish({ kind: 'text', turnId: turn.id, messageId, blockId, mode: append ? 'append' : 'replace', text: update });
+    this.publish({ kind: 'text', turnId: turn.id, messageId, blockId, mode: append ? 'append' : 'replace', text: update,
+      rowIdentity: block.identity, aliases: block.aliases });
   }
 
-  private tool(turn: Turn, block: Row): void {
+  private toolState(turn: Turn, callId: string): ToolState | undefined {
+    const previous = turn.tools.get(callId);
+    if (previous || turn.tools.size >= maxCalls) return previous;
+    const state: ToolState = {};
+    turn.tools.set(callId, state);
+    return state;
+  }
+
+  private tool(turn: Turn, block: Row, complete: boolean): void {
     const callId = identifier(block.id);
-    const name = identifier(block.name);
-    if (!callId || !name || turn.tools.has(callId) || turn.tools.size >= maxCalls) return;
-    turn.tools.set(callId, undefined);
-    this.publish({ kind: 'tool', turnId: turn.id, callId, name });
+    if (!callId) return;
+    const state = this.toolState(turn, callId);
+    if (!state || state.observed && !complete) return;
+    const call = claudeToolCall(block, { id: callId }, false);
+    if (call?.kind !== 'call') return;
+    if (!state.observed) {
+      state.observed = true;
+      this.publish({ kind: 'tool', turnId: turn.id, callId, name: call.name });
+    }
+    if (complete) state.inspectOutput = !call.restricted && record(block.input) !== undefined;
+    this.publishToolResult(turn, callId, state);
   }
 
-  private toolResult(turn: Turn, callId: string, outcome: ToolOutcome): void {
-    if (!turn.tools.has(callId) || turn.tools.get(callId)) return;
-    turn.tools.set(callId, outcome);
-    this.publish({ kind: 'toolResult', turnId: turn.id, callId, outcome });
+  private toolResult(turn: Turn, callId: string, outcome: ToolOutcome, output?: string): void {
+    const state = this.toolState(turn, callId);
+    if (!state || state.result) return;
+    state.result = { outcome, output };
+    this.publishToolResult(turn, callId, state);
+  }
+
+  private publishToolResult(turn: Turn, callId: string, state: ToolState): void {
+    if (!state.observed || !state.result) return;
+    const output = state.inspectOutput ? state.result.output : undefined;
+    if (state.published && (!output || state.outputPublished)) return;
+    state.published = true;
+    state.outputPublished = output !== undefined;
+    this.publish({ kind: 'toolResult', turnId: turn.id, callId, outcome: state.result.outcome, output });
   }
 
   private resultError(row: Row): string | undefined {
@@ -526,15 +588,25 @@ export class ClaudeChatStream {
   }
 
   private result(turn: Turn, row: Row, frameId: string): void {
+    if (this.terminalRecords.has(frameId)) return;
+    if (this.terminalRecords.size === maxRememberedRecords) {
+      this.terminalRecords.delete(this.terminalRecords.values().next().value!);
+    }
+    this.terminalRecords.add(frameId);
     if (Array.isArray(row.permission_denials)) {
       for (const item of row.permission_denials.slice(0, maxCalls)) {
         const id = identifier(record(item)?.tool_use_id);
         if (id) this.toolResult(turn, id, 'failed');
       }
     }
+    for (const [callId, tool] of turn.tools) {
+      if (!tool.observed && tool.result) {
+        this.publish({ kind: 'toolResult', turnId: turn.id, callId, outcome: tool.result.outcome, unpaired: true });
+      }
+    }
     if (turn.messageId && turn.blockIndex !== undefined) this.flushText(turn, turn.messageId, turn.blockIndex);
     if (turn.command && turn.command !== 'native' && ![...turn.blocks.values()].some(block => block.shown)) {
-      this.text(turn, frameId, 0, row.result, true);
+      this.text(turn, frameId, `${frameId}:result`, row.result, true);
     }
     const compact = turn.command === 'compact' ? turn.compact : undefined;
     const completed = row.subtype === 'success' && row.is_error !== true && (turn.command !== 'compact' || Boolean(compact));
@@ -551,9 +623,10 @@ export class ClaudeChatStream {
     const effortAcknowledged = completed && turn.commandReplay && row.num_turns === 0 && turn.effort
       && commandText?.startsWith('Set effort level to ' + turn.effort + ' (this session only)');
     // Some successful native commands return only a result string and no assistant blocks.
-    if (completed && ![...turn.blocks.values()].some(block => block.shown)) this.text(turn, frameId, 0, row.result, true);
+    if (completed && ![...turn.blocks.values()].some(block => block.shown)) {
+      this.text(turn, frameId, `${frameId}:result`, row.result, true);
+    }
     this.latestOutcome = outcome;
-    this.lastResultId = frameId;
     this.turn = undefined;
     this.publish({ kind: 'result', turnId: turn.id, outcome, usage, commandText, effortAcknowledged: Boolean(effortAcknowledged),
       compact: completed ? compact : undefined, errorKind: row.is_error === true && limitReason(row.result) ? 'limit' : undefined,

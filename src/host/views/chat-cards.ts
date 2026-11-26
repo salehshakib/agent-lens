@@ -1,7 +1,7 @@
 import { formatAge, formatPercent, formatTokens } from '../../shared/format';
 import { maxSearch } from '../../shared/protocol';
 import type {
-  ChatCard, ChatCardAction, ChatCardEntry, FileGroup, GaugeView, SessionDetail,
+  ChatCard, ChatCardAction, ChatCardEntry, FileGroup, GaugeView, SessionDetail, UsageView,
 } from '../../shared/protocol';
 import type { CompactMeasurement } from '../chat/types';
 import { recordedHunks, safeFileText } from '../files/diff';
@@ -45,6 +45,8 @@ export interface ChatCardInput {
   now: number;
   /** Selected by provider and owning profile before display labels are applied. */
   gauges?: readonly GaugeView[];
+  /** Conversation usage reconciled against the M1 recorded observations. */
+  usage?: UsageView;
   context?: ChatContextEvidence;
   contextLanes?: readonly { id: string; label: string }[];
   selectedContextLane?: string;
@@ -65,9 +67,7 @@ export interface ChatCardInput {
 }
 
 const maxEntries = 40;
-const maxDiffHunks = 8;
-const maxDiffLines = 80;
-const maxLineText = 500;
+const cardDiffBudget = { hunks: 8, lines: 80, lineText: 500 };
 const fileKinds: readonly [ChatFileKind, string][] = [
   ['all', 'All files'], ['changed', 'Changed'], ['read', 'Read'], ['mentioned', 'Mentioned'],
 ];
@@ -145,7 +145,7 @@ function bounded(entries: ChatCardEntry[], message?: string): Pick<ChatCard, 'en
 function usageCard(input: ChatCardInput, card: ChatCard): ChatCard {
   const actions = [view(input, 'usage', 'Open Usage')];
   if (input.refreshLimits) actions.push(input.action({ kind: 'refreshLimits' }, 'Refresh limits'));
-  const usage = input.detail?.usage;
+  const usage = input.usage ?? input.detail?.usage;
   const gauges = input.gauges;
   return {
     ...card, actions, gauges, usage: usage && { ...usage, tokens: usage.tokens.slice(0, maxEntries) },
@@ -263,24 +263,25 @@ function changeEntries(group: FileGroup, input: ChatCardInput): ChatCardEntry[] 
 }
 
 /** Bounded hunks for an inline or card preview. `clipped` tells the reader to open the full diff. */
-export function previewHunks(hunks: NonNullable<ReturnType<typeof recordedHunks>>): { diff: NonNullable<ChatCard['diff']>[number][]; clipped: boolean } {
-  let remaining = maxDiffLines;
+export function previewHunks(hunks: NonNullable<ReturnType<typeof recordedHunks>>, budget = cardDiffBudget):
+  { diff: NonNullable<ChatCard['diff']>[number][]; clipped: boolean } {
+  let remaining = budget.lines;
   const diff: NonNullable<ChatCard['diff']>[number][] = [];
-  for (const hunk of hunks.slice(0, maxDiffHunks)) {
+  for (const hunk of hunks.slice(0, budget.hunks)) {
     if (!remaining) break;
     const lines = hunk.lines.slice(0, remaining);
     remaining -= lines.length;
     diff.push({
       heading: `@@ -${hunk.oldStart},${hunk.oldCount} +${hunk.newStart},${hunk.newCount} @@`,
       lines: lines.map(line => ({
-        text: (line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' ') + line.text.slice(0, maxLineText)
-          + (line.text.length > maxLineText ? '…' : ''),
+        text: (line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' ') + line.text.slice(0, budget.lineText)
+          + (line.text.length > budget.lineText ? '…' : ''),
         before: line.oldLine, after: line.newLine,
       })),
     });
   }
   const clipped = diff.length < hunks.length || hunks.some((hunk, index) => hunk.lines.length !== diff[index]?.lines.length
-    || hunk.lines.some(line => line.text.length > maxLineText));
+    || hunk.lines.some(line => line.text.length > budget.lineText));
   return { diff, clipped };
 }
 

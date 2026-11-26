@@ -217,6 +217,14 @@ function rowView(row: TimelineRow, lanes: ReadonlyMap<string, Lane>, privateMode
   };
 }
 
+/** Use the Timeline display and signal rules for a bounded source-ordered lane in Chat. */
+export function buildLaneRows(session: Session, lane: Lane, privateMode: boolean, limit = maxRows, turn?: string): RowView[] {
+  const lanes = new Map([[lane.id, lane]]);
+  const selected = turn ? lane.rows.filter(row => row.turnId === turn) : lane.rows;
+  const rows = selected.slice(Math.max(0, selected.length - limit)).map(row => rowView(row, lanes, privateMode));
+  return decorateRows(session, rows, privateMode);
+}
+
 const scopeText: Record<NonNullable<Lane['usageScope']>, string> = {
   response: 'recorded responses', turn: 'turn totals', thread: 'thread total', reported: 'reported total', last: 'last request',
 };
@@ -269,6 +277,7 @@ function agentNode(session: Session, lane: Lane, opts: { now: number; privateMod
 export interface DetailOptions {
   now: number;
   privateMode: boolean;
+  focus?: { lane: string; row: string };
   /** Relay context fill for the Claude main session, when fresh. */
   relayContext?: number;
   thresholds?: Thresholds;
@@ -384,7 +393,13 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
   const { now, privateMode } = options;
   const lanes = new Map(session.lanes.map(lane => [lane.id, lane]));
   const merged = mergeTimeline(session.lanes);
-  const rows = decorateRows(session, merged.slice(-maxRows).map(row => rowView(row, lanes, privateMode)), privateMode);
+  const visible = merged.slice(-maxRows);
+  const focus = options.focus;
+  if (focus?.row && !visible.some(row => row.id === focus.row && row.laneId === focus.lane)) {
+    const target = lanes.get(focus.lane)?.rows.find(row => row.id === focus.row);
+    if (target) visible.unshift(target);
+  }
+  const rows = decorateRows(session, visible.map(row => rowView(row, lanes, privateMode)), privateMode);
   const main = session.lanes[0];
   const byId = new Map(sessions.map(item => [item.id, item]));
   const names = namesFor(privateMode);
@@ -406,8 +421,10 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     const child = byId.get(edge.sessionId);
     const childMain = child?.lanes[0];
     if (!child || !childMain || agents.some(agent => agent.id === child.id)) continue;
+    const parent = child.parents.find(target => target.sessionId === session.id && target.rowId === edge.rowId);
+    const parentLane = parent && lanes.get(parent.laneId);
     agents.push(agentNode(child, childMain, { now, privateMode, kind: 'codex-run', id: child.id,
-      parent: lanes.has(edge.laneId) ? edge.laneId : main?.id, parentTitle: lanes.get(edge.laneId)?.title ?? main?.title,
+      parent: parentLane?.id ?? main?.id, parentTitle: parentLane?.title ?? main?.title,
       level: levelOf(child, childMain), parentInfo: parentInfo(child, childMain, byId, names) }));
   }
   const level = main ? levelOf(session, main) : { approximate: false };
@@ -425,7 +442,7 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     parent: main ? parentInfo(session, main, byId, names) : { state: 'root', targets: [] },
     breadcrumb: breadcrumb(session, byId, names),
     usageText: total === undefined ? 'Usage unavailable' : total + ' tokens' + (session.usagePartial ? ' (partial)' : ''),
-    rows, rowsOmitted: Math.max(0, merged.length - rows.length), agents,
+    rows, rowsOmitted: merged.length - visible.length, agents,
     files: fileGroups(session.files, lanes, privateMode), usage: usageView(session),
     tasks: buildTasks([session], privateMode),
     lanes: session.lanes.map(lane => ({ id: lane.id, label: safeText(lane.title, 60) ?? 'Agent',

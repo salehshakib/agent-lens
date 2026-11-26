@@ -1,17 +1,7 @@
-import type { ChatRow, ChatView, PanelRequest } from '../../shared/protocol';
-import { button, clean, el } from '../dom';
+import type { ChatView, PanelRequest } from '../../shared/protocol';
+import { button, el } from '../dom';
 import { Composer } from './composer';
-import { renderChatCard } from './chat-cards';
-
-interface TranscriptRow {
-  element: HTMLLIElement;
-  label: HTMLSpanElement;
-  status: HTMLSpanElement;
-  body: HTMLParagraphElement;
-  content: Text;
-  text?: string;
-  card?: { signature: string; element: HTMLElement };
-}
+import { ChatTranscript } from './chat-transcript';
 
 export interface ChatPosition {
   readonly top: number;
@@ -19,7 +9,7 @@ export interface ChatPosition {
   readonly offset?: number;
 }
 
-const persistedRow = /^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i;
+const persistedRow = /^(?:(?:fold:|agent:)?[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i;
 const maxScrollPosition = 100_000_000;
 
 /** Store only viewport geometry and fixed-format internal row identifiers. */
@@ -34,14 +24,6 @@ export function parseChatPosition(value: unknown): ChatPosition | undefined {
   return { top };
 }
 
-const roleLabel: Record<ChatRow['role'], string> = {
-  user: 'You', assistant: 'Assistant', tool: 'Tool', notice: 'Notice', error: 'Error',
-};
-
-const deliveryLabel: Record<NonNullable<ChatRow['state']>, string> = {
-  pending: 'Awaiting confirmation', failed: 'Send failed', uncertain: 'Delivery uncertain',
-};
-
 const followThreshold = 48;
 
 /** A conversation's mounted transcript and composer. Leaving Chat parks the reader's place and focus. */
@@ -55,12 +37,11 @@ export class ChatPane {
   }, this.empty, this.list);
   private readonly updates = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
   private readonly commandStatus = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
-  private readonly announcements = new Map<string, string>();
   private readonly jump = button('Jump to latest', () => {
     this.scroller.focus({ preventScroll: true });
     this.followLatest();
   }, { cls: 'chat-jump', attrs: { hidden: true } });
-  private readonly rows = new Map<string, TranscriptRow>();
+  private readonly transcript: ChatTranscript;
   private readonly scrollerResize: ResizeObserver;
   private key?: string;
   private following = true;
@@ -73,12 +54,15 @@ export class ChatPane {
   private focusedControl?: HTMLElement;
 
   constructor(
-    private readonly post: (request: PanelRequest) => void,
+    post: (request: PanelRequest) => void,
     private readonly onPositionChange?: (position: ChatPosition | undefined) => void,
     initialPosition?: ChatPosition,
-    private readonly openTab?: (tab: 'map' | 'files') => void,
+    openTab?: (tab: 'map' | 'files') => void,
   ) {
     this.composer = new Composer(post);
+    this.transcript = new ChatTranscript(this.list, { post, openTab, announce: message => {
+      if (!this.hidden) this.commandStatus.textContent = message;
+    } });
     this.startupPosition = this.savedPosition = parseChatPosition(initialPosition);
     this.element = el('section', { cls: 'chat-pane', attrs: { 'aria-label': 'Conversation' } },
       el('div', { cls: 'chat-reading-pane' }, this.scroller,
@@ -104,10 +88,8 @@ export class ChatPane {
       this.anchor = this.startupPosition;
       this.startupPosition = undefined;
       this.key = chat.key;
-      this.rows.clear();
-      this.announcements.clear();
+      this.transcript.clear();
       this.commandStatus.textContent = '';
-      this.list.replaceChildren();
       this.focusedControl = undefined;
       this.following = !this.anchor;
       this.unread = 0;
@@ -119,11 +101,11 @@ export class ChatPane {
       this.anchor = this.following ? undefined : this.readAnchor();
     }
 
-    const fresh = this.renderRows(chat);
+    const fresh = this.transcript.update(chat.rows, chat.provider, chat.privateMode);
     const empty = chat.privateMode ? 'No messages to display.' : chat.state === 'view-only' ? 'No recorded messages.' : 'No messages yet.';
-    this.empty.hidden = this.rows.size > 0;
+    this.empty.hidden = this.transcript.size > 0;
     if (this.empty.textContent !== empty) this.empty.textContent = empty;
-    this.list.hidden = !this.rows.size;
+    this.list.hidden = !this.transcript.size;
     this.composer.update(chat, first);
     if (this.following) {
       if (visible) this.followLatest();
@@ -185,93 +167,6 @@ export class ChatPane {
     if (!this.composer.focus()) this.scroller.focus({ preventScroll: true });
   }
 
-  private renderRows(chat: ChatView): number {
-    const present = new Set(chat.rows.map(row => row.id));
-    for (const [id, row] of this.rows) {
-      if (present.has(id)) continue;
-      row.element.remove();
-      this.rows.delete(id);
-      this.announcements.delete(id);
-    }
-    let fresh = 0;
-    let before = this.list.firstElementChild;
-    for (const row of chat.rows) {
-      let rendered = this.rows.get(row.id);
-      if (!rendered) {
-        const label = el('span', { cls: 'chat-row-label' });
-        const status = el('span', { cls: 'chat-row-status' });
-        const content = document.createTextNode('');
-        const body = el('p', { cls: 'chat-row-body' }, content);
-        const element = el('li', { cls: 'chat-row', attrs: { 'data-id': row.id } },
-          el('div', { cls: 'chat-row-meta' }, label, status), body);
-        rendered = { element, label, status, body, content };
-        this.rows.set(row.id, rendered);
-        fresh++;
-      }
-      if (rendered.element === before) before = before.nextElementSibling;
-      else this.list.insertBefore(rendered.element, before);
-
-      const author = row.role === 'assistant' && chat.provider ? clean(chat.provider) : roleLabel[row.role];
-      const label = row.card ? 'Agent Lens' : author;
-      if (rendered.label.textContent !== label) rendered.label.textContent = label;
-      this.updateCard(rendered, chat.privateMode ? undefined : row.card);
-      const announcement = chat.privateMode ? undefined : row.card?.announcement ?? (row.role === 'error' ? row.text : undefined);
-      if (announcement && this.announcements.get(row.id) !== announcement) {
-        this.announcements.set(row.id, announcement);
-        if (!this.hidden) this.commandStatus.textContent = clean(announcement);
-      }
-      if (rendered.element.dataset.role !== row.role) rendered.element.dataset.role = row.role;
-      const status = row.state ? deliveryLabel[row.state] : '';
-      if (rendered.status.textContent !== status) rendered.status.textContent = status;
-      rendered.status.hidden = !status;
-      if (rendered.element.dataset.delivery !== (row.state ?? '')) rendered.element.dataset.delivery = row.state ?? '';
-
-      const text = chat.privateMode ? '' : row.text;
-      if (rendered.text !== text) {
-        const current = rendered.content.data;
-        const next = clean(text);
-        if (next.startsWith(current)) rendered.content.appendData(next.slice(current.length));
-        else rendered.content.data = next;
-        rendered.text = text;
-        rendered.body.hidden = !next;
-      }
-    }
-    return fresh;
-  }
-
-  private updateCard(row: TranscriptRow, card: ChatRow['card']): void {
-    if (!card) {
-      row.card?.element.remove();
-      row.card = undefined;
-      return;
-    }
-    const signature = JSON.stringify(card);
-    if (row.card?.signature === signature) return;
-    const active = document.activeElement;
-    const element = renderChatCard(card, this.post, this.openTab);
-    if (row.card) {
-      const previous = row.card.element;
-      if (previous instanceof HTMLDetailsElement && element instanceof HTMLDetailsElement) element.open = previous.open;
-      const key = active instanceof HTMLElement && previous.contains(active) ? active.dataset.key : undefined;
-      for (const input of previous.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input[data-key], textarea[data-key]')) {
-        const next = element.querySelector<HTMLInputElement | HTMLTextAreaElement>('[data-key="' + CSS.escape(input.dataset.key!) + '"]');
-        if (next && next.defaultValue === input.defaultValue) {
-          next.value = input.value;
-          next.setSelectionRange(input.selectionStart, input.selectionEnd);
-        }
-      }
-      previous.replaceWith(element);
-      if (key) {
-        const focus = element.querySelector<HTMLElement>('[data-key="' + CSS.escape(key) + '"]') ?? element;
-        if (focus === element) focus.tabIndex = -1;
-        focus.focus({ preventScroll: true });
-      }
-    } else {
-      row.element.append(element);
-    }
-    row.card = { signature, element };
-  }
-
   private nearBottom(): boolean {
     return this.scroller.scrollHeight - this.scroller.scrollTop - this.scroller.clientHeight <= followThreshold;
   }
@@ -290,7 +185,7 @@ export class ChatPane {
   private restoreAnchor(): void {
     const anchor = this.anchor;
     if (!anchor) return;
-    const row = anchor.row === undefined ? undefined : this.rows.get(anchor.row)?.element;
+    const row = anchor.row === undefined ? undefined : this.transcript.get(anchor.row);
     if (row && anchor.offset !== undefined) {
       const offset = row.getBoundingClientRect().top - this.scroller.getBoundingClientRect().top;
       this.scroller.scrollTop += offset - anchor.offset;

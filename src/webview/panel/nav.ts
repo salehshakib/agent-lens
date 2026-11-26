@@ -1,4 +1,4 @@
-import type { ParentInfo, RowTarget } from '../../shared/protocol';
+import type { PanelRequest, ParentInfo, RowTarget } from '../../shared/protocol';
 import { api, button, el } from '../dom';
 import { historyLimit, saveUi } from './state';
 import type { Place, Ui } from './state';
@@ -38,8 +38,8 @@ export function takeLanding(): Landing | undefined {
 /** The row at the top of the viewport, below the sticky tab bar. */
 export function topAnchor(): string {
   const offset = (document.querySelector<HTMLElement>('.tabs')?.getBoundingClientRect().bottom ?? 0) + 1;
-  for (const node of document.querySelectorAll<HTMLElement>('.trow[data-id]')) {
-    if (node.getBoundingClientRect().bottom > offset) return node.dataset.id ?? '';
+  for (const node of document.querySelectorAll<HTMLElement>('.trow[data-id], .trow[data-anchor]')) {
+    if (node.getBoundingClientRect().bottom > offset) return node.dataset.id ?? node.dataset.anchor ?? '';
   }
   return '';
 }
@@ -75,7 +75,7 @@ export function applyRestore(ui: Ui, place: Place): void {
   ui.tab = place.tab;
   ui.lane = place.lane;
   ui.kind = place.kind;
-  landing = place.tab === 'timeline' && place.anchor ? { row: place.anchor, highlight: false } : undefined;
+  landing = place.tab === 'timeline' ? { row: place.anchor, highlight: false } : undefined;
 }
 
 /**
@@ -114,6 +114,22 @@ export function goTo(ui: Ui, target: RowTarget, rerender: () => void): void {
   const from = snapshot(ui);
   if (from) sent = { session: target.sessionId, from };
   api.postMessage({ type: 'goto', session: target.sessionId, lane: target.laneId, row: target.rowId });
+}
+
+/** Transcript evidence uses local history for same-session links and the existing editor Back for peer sessions. */
+export function goToChatLink(ui: Ui, request: PanelRequest, rerender: () => void): boolean {
+  if (request.type !== 'goto') return false;
+  if (request.session !== ui.session) {
+    api.postMessage(request);
+  } else if (!request.tab) {
+    goTo(ui, { sessionId: request.session, laneId: request.lane, rowId: request.row }, rerender);
+  } else {
+    push(ui, snapshot(ui));
+    ui.tab = request.tab;
+    saveUi(ui);
+    rerender();
+  }
+  return true;
 }
 
 export function canGoBack(ui: Ui): boolean {

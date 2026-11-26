@@ -57,13 +57,26 @@ export interface ChatSend {
 
 export type ChatOutcome = 'completed' | 'interrupted' | 'failed';
 
+/** Native identity components from an attributed turn. Missing components are never guessed. */
+export type ChatRowIdentity =
+  | { kind: 'user' | 'call' | 'result'; id: string }
+  | { kind: 'response'; id: string; block?: number; record?: string; recordIndex?: number }
+  | { kind: 'task'; id: string; state: string };
+
+export interface ChatTurnUsage {
+  id: string;
+  tokens: Tokens;
+}
+
 type ChatUpdate =
   | { kind: 'ready'; nativeId: string; capabilities: ChatCapabilities; model?: string }
   | { kind: 'ack'; turnId: string; messageId: string }
   | { kind: 'model'; turnId: string; model: string }
-  | { kind: 'text'; turnId: string; messageId: string; blockId: string; mode: 'append' | 'replace'; text: string }
+  | { kind: 'text'; turnId: string; messageId: string; blockId: string; mode: 'append' | 'replace'; text: string;
+    rowIdentity?: Extract<ChatRowIdentity, { kind: 'response' }>; aliases?: readonly ChatRowIdentity[] }
   | { kind: 'tool'; turnId: string; callId: string; name: string }
-  | { kind: 'toolResult'; turnId: string; callId: string; outcome: 'completed' | 'failed' | 'needs-approval' }
+  | { kind: 'toolResult'; turnId: string; callId: string; outcome: 'completed' | 'failed' | 'needs-approval';
+    output?: string; durationMs?: number; unpaired?: boolean }
   | { kind: 'interruptReceipt'; turnId: string; requestId: string; accepted: boolean }
   | { kind: 'result'; turnId: string; outcome: ChatOutcome; usage?: Tokens; reason?: string;
     compact?: CompactMeasurement; commandText?: string; effortAcknowledged?: boolean; errorKind?: 'limit' }

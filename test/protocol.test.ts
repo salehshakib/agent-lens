@@ -56,6 +56,10 @@ test('panel navigation requests carry opaque session, lane and row ids only', ()
   const row = 'c'.repeat(32);
   deepEqual(parsePanelRequest({ type: 'goto', session, lane: session, row }), { type: 'goto', session, lane: session, row });
   deepEqual(parsePanelRequest({ type: 'goto', session, lane: '', row: '' }), { type: 'goto', session, lane: '', row: '' });
+  deepEqual(parsePanelRequest({ type: 'goto', session, lane: '', row: '', tab: 'files' }),
+    { type: 'goto', session, lane: '', row: '', tab: 'files' });
+  equal(parsePanelRequest({ type: 'goto', session, lane: session, row, tab: 'map' }), undefined);
+  equal(parsePanelRequest({ type: 'goto', session, lane: '', row: '', tab: 'usage' }), undefined);
   equal(parsePanelRequest({ type: 'goto', session, lane: '../x', row }), undefined);
   equal(parsePanelRequest({ type: 'goto', session, lane: '', row: 'C:/x.jsonl' }), undefined);
   equal(parsePanelRequest({ type: 'goto', session, lane: '' }), undefined);

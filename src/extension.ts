@@ -577,7 +577,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
       } else if (inspectionCommands.has(command.name)) {
         const diff = command.diffId ? files.get(command.diffId) : undefined;
         card = projectChatCard(command.name as InspectionCommand, {
-          scope: label, argument: command.argument, detail, loading: Boolean(id && !detail && session),
+          scope: label, argument: command.argument, detail, usage: view.usage, loading: Boolean(id && !detail && session),
           privateMode: view.privateMode, now: Date.now(), gauges,
           context: session && detail ? data.chatContext(session, detail, scope, command.contextLane, state.compact)
             : state.compact && !command.contextLane ? compactContextEvidence('Main lane', state.compact) : undefined,
@@ -834,7 +834,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
   }
 
   const panel = new PanelView(context.extensionUri, data, {
-    chat: async (key, id) => {
+    chat: async (key, id, focus) => {
       if (id && !chat.scope(key) && exactSources(id, chatProvider).length === 1 && !chat.identity(key)) {
         await resolveSessionEditor(id);
       }
@@ -844,7 +844,7 @@ export async function activate(context: ExtensionContext): Promise<SessionStore>
         : !workspaceChoices().length ? 'Open a local workspace folder to start a chat.'
           : !chatProfiles().length ? 'Enable a local chat profile to start a chat.' : 'Choose the workspace and profile for this chat.'
         : !workspace.isTrusted ? 'Trust this workspace to use chat.' : undefined;
-      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation), reason);
+      const model = await data.chat(key, id, scope, presentation => chat.view(key, presentation), reason, focus);
       if (model.mode !== 'chat') return model;
       const { cards, grants } = await commandCards(key, id, model.chat, model.session);
       if (grants.size) cardGrants.set(key, grants);

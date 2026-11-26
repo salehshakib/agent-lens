@@ -1,9 +1,6 @@
-import type { Tokens } from '../adapters/types';
-import { identityKey, sourceSessionId } from '../sessions/evidence';
-import type { Source } from '../adapters/types';
-import type { ChatIdentity } from './types';
-
-export type { Tokens };
+import { identityKey, key, sourceSessionId } from '../sessions/evidence';
+import type { Turn } from '../sessions/types';
+import type { ChatIdentity, ChatRowIdentity, ChatTurnUsage } from './types';
 
 /** A row from the recorded session. `keys` are exact provider identity hashes. */
 export interface RecordedRow {
@@ -14,8 +11,8 @@ export interface RecordedRow {
 /** A provisional row from the live stream with the exact provider identity it was observed under. */
 export interface ProvisionalRow {
   id: string;
-  /** Local prompt uuid, API response id or tool call id. Absent when the stream did not report one. */
-  identity?: { kind: 'user' | 'response' | 'call'; id: string };
+  identity?: ChatRowIdentity;
+  aliases?: readonly ChatRowIdentity[];
 }
 
 export interface Reconciled<P extends ProvisionalRow> {
@@ -29,7 +26,7 @@ export interface Reconciled<P extends ProvisionalRow> {
 
 /** The session id the recorded store derives for this conversation. Equality is the verified-scope check. */
 export function scopeSessionId(identity: ChatIdentity): string {
-  return sourceSessionId({ provider: identity.provider, home: identity.home } as Source, identity.nativeId);
+  return sourceSessionId({ provider: identity.provider, home: identity.home, sessionId: identity.nativeId });
 }
 
 /**
@@ -39,36 +36,65 @@ export function scopeSessionId(identity: ChatIdentity): string {
 export function reconcileRows<P extends ProvisionalRow>(
   recorded: readonly RecordedRow[], provisional: readonly P[], scopeVerified: boolean,
 ): Reconciled<P> {
-  const byKey = new Map<string, string>();
-  if (scopeVerified) for (const row of recorded) for (const key of row.keys ?? []) if (!byKey.has(key)) byKey.set(key, row.id);
+  const byKey = new Map<string, string | null>();
+  if (scopeVerified) {
+    for (const row of recorded) for (const nativeKey of row.keys ?? []) {
+      const current = byKey.get(nativeKey);
+      byKey.set(nativeKey, current === undefined || current === row.id ? row.id : null);
+    }
+  }
   const live: P[] = [];
   const unresolved: P[] = [];
   const resolved = new Map<string, string>();
   for (const row of provisional) {
-    const match = scopeVerified && row.identity ? byKey.get(identityKey(row.identity.kind, row.identity.id)) : undefined;
-    if (match) resolved.set(row.id, match);
-    else {
-      live.push(row);
-      if (!row.identity || !scopeVerified) unresolved.push(row);
+    const identities = row.identity ? [row.identity, ...row.aliases ?? []] : row.aliases ?? [];
+    const keys = identities.flatMap(identity => identityKey(identity) ?? []);
+    const matches = new Set(keys.flatMap(nativeKey => {
+      const match = byKey.get(nativeKey);
+      return match === undefined ? [] : [match];
+    }));
+    const candidates = [...matches].filter(match => match !== null);
+    if (candidates.length === 1) {
+      resolved.set(row.id, candidates[0]!);
+      continue;
     }
+    live.push(row);
+    if (!keys.length || !scopeVerified || matches.size > 0) unresolved.push(row);
   }
   return { live, resolved, unresolved };
 }
 
-/** An observed turn's usage. `id` is the exact response or turn identity the usage belongs to. */
-export interface UsageObservation {
-  id: string;
-  tokens: Tokens;
-}
-
 /** Live usage that recorded evidence has not counted yet. Each observed id counts once. */
-export function reconcileUsage(recordedIds: ReadonlySet<string>, live: readonly UsageObservation[]): UsageObservation[] {
+export function reconcileUsage(recordedIds: ReadonlySet<string>, live: readonly ChatTurnUsage[]): ChatTurnUsage[] {
   const seen = new Set(recordedIds);
-  const out: UsageObservation[] = [];
+  const out: ChatTurnUsage[] = [];
   for (const item of live) {
     if (seen.has(item.id)) continue;
     seen.add(item.id);
     out.push(item);
   }
   return out;
+}
+
+export function recordedTurnId(laneId: string, nativeId: string): string {
+  return key(laneId, 'turn', nativeId);
+}
+
+const terminal = new Set<Turn['state']>(['Completed', 'Failed', 'Aborted', 'Interrupted', 'Stopped']);
+
+/** A stdout result is a turn total. Never combine it with responses from that same turn. */
+export function reconcileTurnUsage(turns: readonly Turn[], laneId: string, observed: readonly ChatTurnUsage[]): {
+  live: ChatTurnUsage[]; replacedTurnIds: Set<string>;
+} {
+  const byId = new Map(turns.map(turn => [turn.id, turn]));
+  const live: ChatTurnUsage[] = [];
+  const replacedTurnIds = new Set<string>();
+  for (const sample of reconcileUsage(new Set(), observed)) {
+    const id = recordedTurnId(laneId, sample.id);
+    const turn = byId.get(id);
+    if (turn?.usage && terminal.has(turn.state)) continue;
+    if (turn?.usage) replacedTurnIds.add(id);
+    live.push(sample);
+  }
+  return { live, replacedTurnIds };
 }

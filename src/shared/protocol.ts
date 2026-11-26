@@ -380,7 +380,7 @@ export interface ChatCardAction {
 /** A transcript link that reuses an existing panel route. Without a `request` or `tab` it is shown as an unavailable reason. */
 export interface CardLink {
   label: string;
-  request?: Extract<PanelRequest, { type: 'openDiff' | 'openTranscript' | 'goto' }>;
+  request?: Extract<PanelRequest, { type: 'openDiff' | 'openFile' | 'openTranscript' | 'openParent' | 'goto' }>;
   tab?: 'map' | 'files';
   reason?: string;
 }
@@ -388,12 +388,17 @@ export interface CardLink {
 export interface ChatCardEntry {
   title: string;
   detail?: string;
+  output?: string;
+  durationMs?: number;
+  /** Opaque key for aligning a recorded call with its live result. */
+  evidence?: string;
   links?: readonly CardLink[];
   actions?: readonly ChatCardAction[];
 }
 
 export interface ChatCard {
   title: string;
+  outcome?: string;
   /** Render as a collapsed block with the title as its summary. Used for folded tool activity and agent groups. */
   folded?: boolean;
   scope: string;
@@ -403,9 +408,12 @@ export interface ChatCard {
   announcement?: string;
   entries?: readonly ChatCardEntry[];
   actions?: readonly ChatCardAction[];
+  links?: readonly CardLink[];
   gauges?: readonly GaugeView[];
   usage?: UsageView;
   diff?: readonly { heading: string; lines: readonly { text: string; before?: number; after?: number }[] }[];
+  /** Recorded child evidence displayed in source order inside a folded delegation. */
+  children?: readonly ChatRow[];
 }
 
 export interface ChatRow {
@@ -413,6 +421,9 @@ export interface ChatRow {
   role: 'user' | 'assistant' | 'tool' | 'notice' | 'error';
   text: string;
   state?: 'pending' | 'failed' | 'uncertain';
+  identityUnresolved?: boolean;
+  /** Previous visible row ids that now refer to this row after reconciliation. */
+  anchors?: readonly string[];
   card?: ChatCard;
 }
 
@@ -425,6 +436,7 @@ export interface ChatView {
   state: 'draft' | 'view-only' | 'starting' | 'idle' | 'working' | 'interrupting' | 'blocked';
   reason?: string;
   rows: readonly ChatRow[];
+  usage?: UsageView;
   draft: string;
   /** Latest edit received by the host. Preserves edits newer than a model update. */
   revision: number;
@@ -452,7 +464,7 @@ export type PanelTab = 'chat' | 'timeline' | 'map' | 'files' | 'usage' | 'tasks'
 export type HostMessage =
   | { type: 'sidebar'; model: SidebarModel }
   /** `tab` is set only when the host opens the panel on a specific tab. `focus` is set when Open parent targets a row. */
-  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean;
+  | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean; peerArrival?: boolean;
     files?: { search: string; kind: 'all' | 'changed' | 'read' | 'mentioned' } };
 
 export type SidebarRequest =
@@ -482,8 +494,8 @@ export type PanelRequest =
   | { type: 'openDiff'; id: string }
   | { type: 'openTranscript'; session: string; lane: string }
   | { type: 'openSession'; id: string }
-  /** Open a session at a row. `lane` and `row` are empty to open the session without a target. */
-  | { type: 'goto'; session: string; lane: string; row: string }
+  /** Open a Timeline row or a secondary view of the target session. */
+  | { type: 'goto'; session: string; lane: string; row: string; tab?: 'files' | 'map' }
   /** Open the parent of the current session or lane. `lane` is empty for the main lane. */
   | { type: 'openParent'; session: string; lane: string }
   | { type: 'openSettings' }
@@ -572,9 +584,13 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   if (type === 'openSession' && shape(message, ['type', 'id']) && typeof message.id === 'string'
     && sessionId.test(message.id)) return { type, id: message.id };
   if (type === 'openSettings' && shape(message, ['type'])) return { type };
-  if (type === 'goto' && shape(message, ['type', 'session', 'lane', 'row']) && typeof message.session === 'string'
+  if (type === 'goto' && (shape(message, ['type', 'session', 'lane', 'row']) || shape(message, ['type', 'session', 'lane', 'row', 'tab']))
+    && typeof message.session === 'string'
     && sessionId.test(message.session) && optionalId(message.lane) && optionalId(message.row)) {
-    return { type, session: message.session, lane: message.lane, row: message.row };
+    if (!('tab' in message)) return { type, session: message.session, lane: message.lane, row: message.row };
+    if ((message.tab === 'map' || message.tab === 'files') && !message.lane && !message.row) {
+      return { type, session: message.session, lane: '', row: '', tab: message.tab };
+    }
   }
   if (type === 'openParent' && shape(message, ['type', 'session', 'lane']) && typeof message.session === 'string'
     && sessionId.test(message.session) && optionalId(message.lane)) {

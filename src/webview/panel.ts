@@ -1,14 +1,14 @@
 import { isHostMessage } from '../shared/protocol';
-import type { ChatView, PanelModel, PanelTab } from '../shared/protocol';
+import type { ChatView, PanelModel, PanelRequest, PanelTab } from '../shared/protocol';
 import { formatDuration } from '../shared/format';
 import { api, badge, button, el, preserve, signalBadge } from './dom';
 import { mapTab } from './panel/agents';
 import { ChatPane } from './panel/chat';
 import { filesTab } from './panel/files';
-import { applyFocus, applyRestore, arrive, canGoBack, departed, goBack, goTo, parentAction } from './panel/nav';
+import { applyFocus, applyRestore, arrive, canGoBack, departed, goBack, goTo, goToChatLink, parentAction } from './panel/nav';
 import type { Arrival } from './panel/nav';
 import { loadUi, saveUi } from './panel/state';
-import type { SessionModel } from './panel/state';
+import type { Place, SessionModel } from './panel/state';
 import { taskList, tasksPage } from './panel/tasks';
 import { timelineTab } from './panel/timeline';
 import { sessionUsageTab, usagePage } from './panel/usage';
@@ -17,12 +17,25 @@ const root = document.getElementById('root');
 if (!root) throw new Error('Missing root');
 const ui = loadUi();
 let model: PanelModel | undefined;
-const chatPane = new ChatPane(request => api.postMessage(request), position => {
+function postChatRequest(request: PanelRequest): void {
+  if (request.type === 'goto' && request.row && request.session === ui.session
+    && model?.mode === 'chat' && !model.session?.rows.some(row => row.id === request.row)) {
+    api.postMessage(request);
+    return;
+  }
+  if (!goToChatLink(ui, request, draw)) api.postMessage(request);
+}
+
+const chatPane = new ChatPane(postChatRequest, position => {
   ui.chatPosition = position;
   saveUi(ui);
-}, ui.chatPosition, tab => select(tab));
+}, ui.chatPosition, tab => {
+  if (ui.session) postChatRequest({ type: 'goto', session: ui.session, lane: '', row: '', tab });
+});
 let peerBack = false;
-let inspectionScroll = 0;
+let peerBaseline: Place | undefined;
+let activeInspection: PanelTab | undefined;
+const inspectionScroll = new Map<PanelTab, number>();
 
 const tabs: readonly (readonly [PanelTab, string])[] = [
   ['chat', 'Chat'], ['timeline', 'Timeline'], ['map', 'Agent map'], ['files', 'Files'], ['usage', 'Usage'], ['tasks', 'Background tasks'],
@@ -34,7 +47,8 @@ let arrival: Arrival | undefined;
 function backButton(): HTMLElement | undefined {
   if (!peerBack && !canGoBack(ui)) return undefined;
   return button('Back', () => {
-    if (peerBack) api.postMessage({ type: 'panelBack' });
+    const local = ui.history.at(-1);
+    if (peerBack && (!local || local === peerBaseline)) api.postMessage({ type: 'panelBack' });
     else goBack(ui, draw);
   }, { attrs: { 'data-key': 'back', title: 'Back to the previous place' } });
 }
@@ -88,7 +102,6 @@ function drawChat(chat: ChatView, session?: SessionModel): void {
   const headerKey = JSON.stringify([chat.title, chat.provider, chat.project, chat.profile, session?.id, session?.parent, peerBack, ui.history.length]);
   const entering = !chatPane.element.isConnected;
   if (entering) {
-    inspectionScroll = document.scrollingElement?.scrollTop ?? 0;
     document.body.classList.add('chat-open');
     root.replaceChildren(chatHeader, chatPane.element);
   }
@@ -160,6 +173,11 @@ function draw(): void {
     arrival = undefined;
     saveUi(ui);
   }
+  const inspection = session && ui.tab !== 'chat' ? ui.tab : undefined;
+  const viewChanged = inspection !== activeInspection;
+  const scroller = document.scrollingElement;
+  if (activeInspection && viewChanged && scroller) inspectionScroll.set(activeInspection, scroller.scrollTop);
+  activeInspection = inspection;
   if (current.mode === 'chat' && (ui.tab === 'chat' || !session)) {
     drawChat(current.chat, session);
     return;
@@ -185,19 +203,21 @@ function draw(): void {
       case 'empty': root.replaceChildren(el('p', { cls: 'empty', text: current.message })); break;
     }
   });
-  if (wasChat && document.scrollingElement) document.scrollingElement.scrollTop = inspectionScroll;
+  if (viewChanged && inspection && scroller) scroller.scrollTop = inspectionScroll.get(inspection) ?? 0;
 }
 
 window.addEventListener('message', event => {
   const message: unknown = event.data;
   if (!isHostMessage(message) || message.type !== 'panel') return;
   const next = message.model;
+  if (message.peerArrival || (message.back && !peerBack)) peerBaseline = ui.history.at(-1);
   peerBack = message.back === true;
   if (next.mode === 'chat' || next.mode === 'session') {
     const id = next.mode === 'chat' ? next.id : next.session.id;
     const focus = message.focus;
     if (id && (next.mode === 'session' || next.session)) {
-      arrival = focus && peerBack ? { focus } : arrive(ui, id, focus, model?.mode === 'chat' || model?.mode === 'session');
+      arrival = message.peerArrival ? (focus ? { focus } : undefined)
+        : arrive(ui, id, focus, model?.mode === 'chat' || model?.mode === 'session');
     }
     if (id !== ui.session) {
       ui.session = id;

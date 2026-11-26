@@ -14,7 +14,7 @@ export type PanelTarget =
   | { kind: 'tasks' };
 
 export interface PanelActions {
-  chat(key: string, id?: string): Promise<PanelModel>;
+  chat(key: string, id?: string, focus?: Focus): Promise<PanelModel>;
   chatRequest(key: string, request: ChatPanelRequest, id?: string): void;
   sessionId(key: string): string | undefined;
   openSession(id: string, tab: PanelTab, focus?: Focus, from?: string): void;
@@ -38,6 +38,7 @@ interface Editor {
   focus?: Focus;
   files?: FilesFocus;
   back?: string;
+  peerArrival?: boolean;
   usageFilters: UsageFilters;
 }
 
@@ -64,7 +65,10 @@ export class PanelView {
         existing.tab = target.tab;
         existing.focus = target.focus;
         existing.files = target.files;
-        if (target.from && target.from !== key) existing.back = target.from;
+        if (target.from && target.from !== key) {
+          existing.back = target.from;
+          existing.peerArrival = true;
+        }
       }
       this.reveal(existing);
       return;
@@ -97,7 +101,10 @@ export class PanelView {
       editor.tab = target.tab;
       editor.focus = target.focus;
       editor.files = target.files;
-      if (target.from !== key) editor.back = target.from;
+      if (target.from && target.from !== key) {
+        editor.back = target.from;
+        editor.peerArrival = true;
+      }
     }
     this.editors.set(key, editor);
     this.visibility();
@@ -153,7 +160,7 @@ export class PanelView {
       case 'openDiff': this.actions.openDiff(request.id); break;
       case 'openTranscript': this.actions.openTranscript(request.session, request.lane); break;
       case 'openSession': this.actions.openSession(request.id, 'chat', undefined, editor.key); break;
-      case 'goto': this.actions.openSession(request.session, 'timeline',
+      case 'goto': this.actions.openSession(request.session, request.tab ?? 'timeline',
         request.lane || request.row ? { lane: request.lane, row: request.row } : undefined, editor.key); break;
       case 'openParent': this.actions.openParent(request.session, request.lane, editor.key); break;
       case 'panelBack': {
@@ -193,7 +200,7 @@ export class PanelView {
     switch (editor.target.kind) {
       case 'usage': return this.data.usage(editor.usageFilters);
       case 'tasks': return this.data.tasks();
-      case 'chat': return this.actions.chat(editor.key, this.sessionId(editor));
+      case 'chat': return this.actions.chat(editor.key, this.sessionId(editor), editor.target.focus);
     }
   }
 
@@ -203,11 +210,13 @@ export class PanelView {
     void this.model(editor).then(model => {
       if (sequence !== editor.sequence || this.editors.get(editor.key) !== editor) return;
       if (model.mode === 'chat') editor.panel.title = 'Agent Lens: ' + model.chat.title;
+      const back = Boolean(editor.back && this.editors.has(editor.back));
       const message: HostMessage = { type: 'panel', model, tab: editor.tab, focus: editor.focus, files: editor.files,
-        back: Boolean(editor.back && this.editors.has(editor.back)) };
+        back, peerArrival: back && editor.peerArrival };
       editor.tab = undefined;
       editor.focus = undefined;
       editor.files = undefined;
+      editor.peerArrival = undefined;
       return editor.panel.webview.postMessage(message);
     }).catch(() => undefined);
   }

@@ -54,6 +54,7 @@ function attachScroll(): void {
   if (attached) return;
   attached = true;
   window.addEventListener('scroll', () => {
+    if (!jump?.isConnected) return;
     followed = nearBottom();
     if (followed) pending = 0;
     updateJump();
@@ -84,7 +85,8 @@ function rowBody(row: RowView, open: boolean): HTMLElement | undefined {
 function markerNode(row: RowView, ui: Ui, many: boolean, rerender: () => void): HTMLElement {
   const view = row.signals?.[0];
   const { edit, check } = row.links ?? {};
-  return el('li', { cls: 'trow kind-signal', attrs: { 'data-id': row.id } },
+  const focused = highlighted === row.id;
+  return el('li', { cls: 'trow kind-signal' + (focused ? ' focus-target' : ''), attrs: rowAttrs(row.id, focused) },
     el('div', { cls: 'thead' },
       el('time', { cls: 'muted', text: formatClock(row.at) }),
       el('span', { cls: 'kind', text: 'End of turn' }),
@@ -92,6 +94,10 @@ function markerNode(row: RowView, ui: Ui, many: boolean, rerender: () => void): 
       many ? el('span', { cls: 'lane', text: row.lane }) : undefined,
       edit ? button('Go to last edit', () => goTo(ui, edit, rerender), { cls: 'link', attrs: { 'data-nav': true, 'data-key': 'edit-' + row.id } }) : undefined,
       check ? button('Go to last check', () => goTo(ui, check, rerender), { cls: 'link', attrs: { 'data-nav': true, 'data-key': 'check-' + row.id } }) : undefined));
+}
+
+function rowAttrs(id: string, focused: boolean): Record<string, string | number | undefined> {
+  return { 'data-id': id, 'data-key': focused ? 'timeline-target-' + id : undefined, tabindex: focused ? -1 : undefined };
 }
 
 function rowNode(row: RowView, ui: Ui, many: boolean, rerender: () => void): HTMLElement {
@@ -112,7 +118,7 @@ function rowNode(row: RowView, ui: Ui, many: boolean, rerender: () => void): HTM
   }, { cls: 'link', attrs: { 'data-nav': true, 'data-key': 'row-' + row.id, 'aria-expanded': open,
     'aria-label': (open ? 'Hide ' : 'Show ') + name } }) : undefined;
   const focused = highlighted === row.id;
-  return el('li', { cls: 'trow kind-' + row.kind + (focused ? ' focus-target' : ''), attrs: { 'data-id': row.id, tabindex: focused ? -1 : undefined } },
+  return el('li', { cls: 'trow kind-' + row.kind + (focused ? ' focus-target' : ''), attrs: rowAttrs(row.id, focused) },
     el('div', { cls: 'thead' },
       el('time', { cls: 'muted', text: formatClock(row.at) }),
       el('span', { cls: 'kind', text: kindLabels[row.kind] ?? row.kind }),
@@ -133,7 +139,7 @@ function groupNode(rows: RowView[], ui: Ui, many: boolean, rerender: () => void)
   const view = head.signals?.[0];
   const target = head.file ?? head.command?.split('\n')[0];
   const name = loop.tool + (target ? ' ' + target : '') + ' · repeated ' + loop.count + '×';
-  return el('li', { cls: 'trow loop-group', attrs: { 'data-group': key } },
+  return el('li', { cls: 'trow loop-group', attrs: { 'data-group': key, 'data-anchor': open ? undefined : head.id } },
     el('div', { cls: 'thead' },
       el('time', { cls: 'muted', text: formatClock(head.at) }),
       el('span', { cls: 'kind', text: 'Repeated calls' }),
@@ -166,7 +172,9 @@ function land(target: Landing): void {
     window.scrollTo(0, 0);
     return;
   }
-  const node = [...document.querySelectorAll<HTMLElement>('.trow[data-id]')].find(item => item.dataset.id === target.row);
+  const selector = target.highlight ? '.trow[data-id]' : '.trow[data-id], .trow[data-anchor]';
+  const node = [...document.querySelectorAll<HTMLElement>(selector)]
+    .find(item => (item.dataset.id ?? item.dataset.anchor) === target.row);
   if (!node) {
     announce('That row is not in the loaded part of the timeline.');
     return;
@@ -207,13 +215,15 @@ export function timelineTab(session: SessionModel, ui: Ui, rerender: () => void)
   const rows = session.rows.filter(row => (!ui.lane || row.laneId === ui.lane)
     && (signalsOnly ? Boolean(row.signals?.length) : !allowed || allowed.includes(row.kind)));
   const incoming = peekLanding();
+  if (incoming) highlighted = incoming.highlight ? incoming.row : undefined;
+  const grouped = items(rows);
   if (incoming?.row) {
     gap = session.rows.some(row => row.id === incoming.row) ? undefined
       : 'That row is not shown. It is older than the events loaded here, so Agent Lens cannot scroll to it.';
     // A collapsed streak that holds the row opens so the row can be reached.
-    const holder = items(rows).find((item): item is RowView[] => Array.isArray(item) && item.some(row => row.id === incoming.row));
+    const holder = grouped.find((item): item is RowView[] => Array.isArray(item) && item.some(row => row.id === incoming.row));
     const holderKey = holder && 'loop:' + holder[0]!.loop!.id + ':' + holder[0]!.id;
-    if (holderKey && !ui.expanded.includes(holderKey)) {
+    if (holderKey && (incoming.highlight || holder[0]!.id !== incoming.row) && !ui.expanded.includes(holderKey)) {
       ui.expanded = [...ui.expanded, holderKey].slice(-200);
       saveUi(ui);
     }
@@ -227,23 +237,27 @@ export function timelineTab(session: SessionModel, ui: Ui, rerender: () => void)
     select('Filter by event type', ui.kind, [['', 'All events'], ['conversation', 'Conversation'], ['tools', 'Tools and results'],
       ['reasoning', 'Reasoning'], ['agents', 'Agents and tasks'], ['signals', 'Signals']],
       value => { ui.kind = value; highlighted = undefined; gap = undefined; saveUi(ui); manual = true; rerender(); }));
-  const selected = ui.lane ? session.lanes.find(lane => lane.id === ui.lane) : undefined;
-  const laneHeader = selected ? parentAction(session.id, selected.id, selected.parent, 'lane-' + selected.id.slice(0, 16)) : undefined;
+  const selected = ui.lane ? session.lanes.find(lane => lane.id === ui.lane)
+    : session.lanes.length === 1 ? session.lanes[0] : undefined;
+  const openParent = selected ? parentAction(session.id, selected.id, selected.parent, 'lane-' + selected.id) : undefined;
+  const laneHeader = selected && (ui.lane || openParent)
+    ? el('div', { cls: 'lane-header' }, el('strong', { text: selected.label }), openParent) : undefined;
   const list = el('ol', { cls: 'timeline', attrs: { 'aria-label': 'Session timeline' } },
-    ...items(rows).map(item => Array.isArray(item) ? groupNode(item, ui, session.lanes.length > 1, rerender)
+    ...grouped.map(item => Array.isArray(item) ? groupNode(item, ui, session.lanes.length > 1, rerender)
       : rowNode(item, ui, session.lanes.length > 1, rerender)));
   list.addEventListener('keydown', event => navigate(list, event));
   jump = el('button', { cls: 'jump', attrs: { type: 'button', hidden: true }, text: 'Jump to latest',
     on: { click: () => { toBottom(); followed = true; pending = 0; updateJump(); } } });
   const section = el('section', { cls: 'timeline-tab' },
     toolbar,
-    laneHeader ? el('div', { cls: 'lane-header' }, el('strong', { text: selected!.label }), laneHeader) : undefined,
+    laneHeader,
     gap ? el('p', { cls: 'notice', attrs: { role: 'status' }, text: gap }) : undefined,
     session.rowsOmitted ? el('p', { cls: 'muted', text: session.rowsOmitted + ' older events are not shown.' }) : undefined,
     rows.length ? list : el('p', { cls: 'empty', text: session.rows.length ? 'No events match these filters.' : 'No events recorded yet.' }),
     jump);
   for (const row of rows) seen.add(row.id);
   queueMicrotask(() => {
+    if (!section.isConnected) return;
     const landing = takeLanding();
     if (landing) {
       manual = false;

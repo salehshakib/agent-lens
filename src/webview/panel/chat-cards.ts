@@ -1,5 +1,5 @@
-import { formatAge, formatReset, formatTokens } from '../../shared/format';
-import type { CardLink, ChatCard, ChatCardAction, GaugeView, PanelRequest, TokenRow, UsageView } from '../../shared/protocol';
+import { formatAge, formatDuration, formatReset, formatTokens } from '../../shared/format';
+import type { CardLink, ChatCard, ChatCardAction, ChatCardEntry, GaugeView, PanelRequest, TokenRow, UsageView } from '../../shared/protocol';
 import { button, clean, el, gaugeBlock, visuallyHidden } from '../dom';
 
 type Post = (request: PanelRequest) => void;
@@ -66,7 +66,8 @@ function renderUsage(usage: UsageView): HTMLElement {
 }
 
 function renderDiff(hunks: NonNullable<ChatCard['diff']>): HTMLElement {
-  return el('div', { cls: 'chat-card-diff', attrs: { role: 'region', tabindex: 0, 'aria-label': 'Recorded diff preview' } },
+  return el('div', { cls: 'chat-card-diff', attrs: { role: 'region', tabindex: 0, 'aria-label': 'Recorded diff preview',
+    'data-key': 'recorded-diff' } },
     ...hunks.map(hunk => el('section', {},
       el('p', { cls: 'chat-card-diff-heading', text: hunk.heading }),
       el('pre', {}, ...hunk.lines.map(line => {
@@ -91,9 +92,9 @@ const stateLabels: Record<ChatCard['state'], string> = {
   changed: 'The target has changed.',
 };
 
-let openTab: ((tab: 'map' | 'files') => void) | undefined;
+type OpenTab = (tab: 'map' | 'files') => void;
 
-function renderLinks(links: readonly CardLink[] | undefined, post: Post): HTMLElement | undefined {
+function renderLinks(links: readonly CardLink[] | undefined, post: Post, openTab?: OpenTab): HTMLElement | undefined {
   if (!links?.length) return undefined;
   return el('div', { cls: 'chat-card-actions' }, ...links.map(link => {
     if (!link.request && !link.tab) {
@@ -102,33 +103,36 @@ function renderLinks(links: readonly CardLink[] | undefined, post: Post): HTMLEl
     return button(link.label, () => {
       if (link.request) post(link.request);
       else if (link.tab) openTab?.(link.tab);
-    });
+    }, { attrs: { 'data-key': 'evidence-' + JSON.stringify(link.request ?? link.tab) } });
   }));
 }
 
-export function renderChatCard(card: ChatCard, post: Post, tabOpener?: (tab: 'map' | 'files') => void): HTMLElement {
-  openTab = tabOpener;
-  if (!card.folded) return renderCardBody(card, post);
-  const block = el('details', { cls: 'chat-card-fold' }, el('summary', { text: card.title }), renderCardBody({ ...card, title: '' }, post));
-  return block;
+function renderEntry(entry: ChatCardEntry, index: number, post: Post, openTab?: OpenTab): HTMLElement {
+  const duration = entry.durationMs === undefined ? undefined : formatDuration(entry.durationMs);
+  return el('li', { cls: 'chat-card-entry' },
+    el('strong', { text: entry.title }),
+    duration ? el('span', { cls: 'muted', text: ' · ' + duration }) : undefined,
+    entry.detail ? el('p', { cls: 'chat-card-detail', text: entry.detail }) : undefined,
+    entry.output ? el('pre', { cls: 'chat-card-output', text: entry.output, attrs: { tabindex: 0,
+      'aria-label': clean(entry.title) + ' output', 'data-key': 'output-' + (entry.evidence ?? index) } }) : undefined,
+    renderActions(entry.actions, post, entry.title), renderLinks(entry.links, post, openTab));
 }
 
-function renderCardBody(card: ChatCard, post: Post): HTMLElement {
+export function renderCardBody(card: ChatCard, post: Post, openTab?: OpenTab): HTMLElement {
   const now = Date.now();
   const message = card.message ?? stateLabels[card.state];
   return el('section', { cls: 'chat-card', attrs: {
     'aria-label': clean(card.title), 'aria-busy': card.state === 'loading' ? 'true' : undefined, 'data-state': card.state,
   } },
-    card.title ? el('h3', { cls: 'chat-card-title', text: card.title }) : undefined,
+    card.title && !card.folded ? el('h3', { cls: 'chat-card-title', text: card.title }) : undefined,
     card.scope ? el('p', { cls: 'chat-card-scope', text: card.scope }) : undefined,
     message ? el('p', { cls: 'chat-card-message', text: message }) : undefined,
     renderActions(card.actions, post),
+    renderLinks(card.links, post, openTab),
     card.gauges?.length ? el('div', { cls: 'chat-card-gauges', attrs: { role: 'group', 'aria-label': 'Scoped limits' } },
       ...card.gauges.map(gauge => renderGauge(gauge, now))) : undefined,
     card.usage ? renderUsage(card.usage) : undefined,
-    card.entries?.length ? el('ul', { cls: 'chat-card-entries' }, ...card.entries.map(entry => el('li', { cls: 'chat-card-entry' },
-      el('strong', { text: entry.title }),
-      entry.detail ? el('p', { cls: 'chat-card-detail', text: entry.detail }) : undefined,
-      renderActions(entry.actions, post, entry.title), renderLinks(entry.links, post)))) : undefined,
+    card.entries?.length ? el('ul', { cls: 'chat-card-entries' },
+      ...card.entries.map((entry, index) => renderEntry(entry, index, post, openTab))) : undefined,
     card.diff?.length ? renderDiff(card.diff) : undefined);
 }

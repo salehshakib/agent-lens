@@ -1,16 +1,20 @@
-import { reconcileRows, scopeSessionId } from './reconcile';
+import { reconcileRows, reconcileTurnUsage, scopeSessionId } from './reconcile';
 import type { ProvisionalRow } from './reconcile';
 import { randomUUID } from 'node:crypto';
 import { maxChatDraft } from '../../shared/protocol';
-import type { ChatRow, ChatView } from '../../shared/protocol';
+import type { ChatCard, ChatRow, ChatView, UsageView } from '../../shared/protocol';
 import type { Provider } from '../adapters/types';
+import { localPath, pathKey } from '../discovery/local-path';
 import { safeText } from '../privacy/projection';
+import { identityKey, key as evidenceKey } from '../sessions/evidence';
+import type { Session, TokenCounts } from '../sessions/types';
+import { addCounts } from '../usage/reduce';
 import { parseChatInput, slashCatalog } from './commands';
 import { canCheckFast, isVerifiedClaudeChat, normalizeEffortChoice, normalizeModelChoice } from '../adapters/claude-code/chat-settings';
 import { chatWriterKey, ChatOwnership, sameChatIdentity } from './ownership';
 import { ChatLaunchError } from './types';
 import type { ChatAdapter, ChatAttempt, ChatCapabilities, ChatConnection, ChatEvent, ChatIdentity, ChatLaunch, ChatScope,
-  ChatSend, ChatSettings, CompactMeasurement } from './types';
+  ChatSend, ChatSettings, ChatTurnUsage, CompactMeasurement } from './types';
 
 export interface ChatSessionDeps {
   adapter(provider: Provider): ChatAdapter | undefined;
@@ -30,20 +34,19 @@ export interface ChatPresentation {
   privateMode: boolean;
   reason?: string;
   history?: readonly (ChatRow & { keys?: readonly string[] })[];
-  /** Recorded session id the history came from. Live rows merge into it only when the conversation's verified scope derives it. */
-  sessionId?: string;
+  recorded?: Session;
 }
 
 export type ChatRequest =
   | { type: 'chatDraft' | 'chatSend'; revision: number; text: string }
   | { type: 'chatContinue' | 'chatInterrupt' | 'chatRetry' };
 
-interface LiveRow extends ChatRow {
+interface LiveRow extends ChatRow, ProvisionalRow {
   truncated?: boolean;
   toolName?: string;
+  toolResult?: boolean;
   projected?: string;
   local?: LocalChatRow;
-  identity?: ProvisionalRow['identity'];
 }
 
 export interface LocalChatRow {
@@ -107,8 +110,7 @@ interface Conversation {
   armed: boolean;
   rows: Map<string, LiveRow>;
   retryRow?: string;
-  history: readonly string[];
-  frozenHistory?: ReadonlySet<string>;
+  usage: Map<string, ChatTurnUsage>;
   worker?: Worker;
   turn?: Turn;
   checking: boolean;
@@ -135,7 +137,7 @@ const approvalsLater = 'Needs approval. In-chat approval is planned for a later 
 
 function makeConversation(key: string, scope: ChatScope | undefined, armed: boolean): Conversation {
   return {
-    key, scope, armed, draft: '', revision: 0, rows: new Map(), history: [], checking: false, recoveryQueue: [],
+    key, scope, armed, draft: '', revision: 0, rows: new Map(), usage: new Map(), checking: false, recoveryQueue: [],
   };
 }
 
@@ -143,7 +145,82 @@ function displayRow(row: LiveRow, privateMode: boolean): ChatRow {
   const hidden = privateMode && (row.role === 'user' || row.role === 'assistant');
   const text = hidden ? 'Hidden in private mode.'
     : (row.projected ??= (safeText(row.text.replace(/[\uD800-\uDBFF]$/, ''), maxBlock) ?? '') + (row.truncated ? '…' : ''));
-  return { id: row.id, role: row.role, text, state: row.state };
+  const card = row.card && privateMode ? {
+    title: row.card.title, outcome: row.card.outcome, scope: '', state: row.card.state, folded: row.card.folded,
+  } : row.card;
+  return { id: row.id, role: row.role, text, state: row.state, card };
+}
+
+function matchesRecorded(identity: ChatIdentity | undefined, recorded: Session | undefined): boolean {
+  const cwd = localPath(recorded?.cwd);
+  return Boolean(identity && recorded && cwd && recorded.provider === identity.provider && recorded.profile === identity.profile
+    && recorded.nativeId === identity.nativeId && recorded.id === scopeSessionId(identity) && pathKey(cwd) === pathKey(identity.cwd));
+}
+
+function observedUsage(live: readonly ChatTurnUsage[], recorded: Session | undefined): UsageView | undefined {
+  if (!live.length) return undefined;
+  const main = recorded?.lanes[0];
+  const observed = main ? reconcileTurnUsage(main.turns, main.id, live) : { live, replacedTurnIds: new Set<string>() };
+  if (!observed.live.length) return undefined;
+  const counts: TokenCounts = {};
+  let partial = !recorded || recorded.coverage === 'partial' || recorded.usagePartial === true;
+  for (const item of recorded?.usageObservations ?? []) {
+    if (item.scope !== 'response' || item.laneId !== main?.id) continue;
+    // Unattributed main-lane evidence could overlap an aggregate live turn.
+    if (item.turnId === undefined) return undefined;
+    if (observed.replacedTurnIds.has(item.turnId)) continue;
+    partial = addCounts(counts, item.counts) || partial;
+  }
+  for (const { tokens } of observed.live) {
+    const fields = [tokens.input, tokens.cacheRead, tokens.cacheWrite, tokens.output];
+    const sum = fields.reduce<number>((total, value) => total + (value ?? 0), 0);
+    const total = tokens.total ?? (fields.every(value => value !== undefined) && Number.isSafeInteger(sum) ? sum : undefined);
+    partial = addCounts(counts, { ...tokens, total }) || partial || total === undefined;
+  }
+  return { tokens: [{ label: 'Observed conversation', ...counts }], scope: 'Main-lane recorded responses and whole-turn live samples.', partial };
+}
+
+function transcriptRows(history: NonNullable<ChatPresentation['history']>, live: readonly LiveRow[],
+  verified: boolean, privateMode: boolean): ChatRow[] {
+  const { resolved, unresolved } = reconcileRows(history, live, verified);
+  const uncertain = new Set(unresolved.map(row => row.id));
+  const pending: ChatRow[] = [];
+  const insertBefore = new Map<string, ChatRow[]>();
+  const matches = new Map<string, LiveRow[]>();
+  for (const row of live) {
+    const match = resolved.get(row.id);
+    if (match) {
+      if (pending.length) {
+        const before = insertBefore.get(match) ?? [];
+        insertBefore.set(match, before.concat(pending.splice(0)));
+      }
+      const covered = matches.get(match) ?? [];
+      covered.push(row);
+      matches.set(match, covered);
+    } else {
+      pending.push({ ...displayRow(row, privateMode),
+        identityUnresolved: row.identityUnresolved || (uncertain.has(row.id) && (row.role === 'assistant' || row.role === 'tool')) || undefined });
+    }
+  }
+  const rows: ChatRow[] = [];
+  for (const { keys, ...row } of history) {
+    const before = insertBefore.get(row.id);
+    if (before) rows.push(...before);
+    const covered = matches.get(row.id);
+    if (!covered) {
+      rows.push(row);
+      continue;
+    }
+    const pendingResult = covered.findLast(liveRow => liveRow.toolResult && liveRow.identity?.kind === 'call'
+      && !keys?.includes(identityKey({ kind: 'result', id: liveRow.identity.id })!));
+    const resultEntry = pendingResult?.card?.entries?.[0];
+    const card = row.card && !privateMode && resultEntry ? {
+      ...row.card, outcome: pendingResult.card?.outcome,
+      entries: [...row.card.entries?.filter(entry => entry.evidence !== resultEntry.evidence) ?? [], resultEntry],
+    } : row.card;
+    rows.push({ ...row, card, anchors: [...row.anchors ?? [], ...covered.map(item => item.id)] });
+  }
+  return rows.concat(pending);
 }
 
 /** Owns conversations across editor lifetimes. Each worker gets a fresh owner token. */
@@ -402,17 +479,14 @@ export class ChatSessions {
     const reason = conversation.reason ?? blockingReason ?? (identity && !conversation.armed ? readOnly : undefined)
       ?? (!scope ? scopeRequired : undefined);
     const state = this.state(conversation, Boolean(blockingReason));
-    const history = presentation.history ?? [];
-    const frozen = conversation.frozenHistory;
-    if (!frozen) conversation.history = history.map(row => row.id);
-    const recorded = frozen ? history.filter(row => frozen.has(row.id)) : history;
-    const verified = Boolean(identity && presentation.sessionId && presentation.sessionId === scopeSessionId(identity));
-    const live = reconcileRows(recorded, [...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local), verified).live;
-    const rows = recorded.map(({ keys: _keys, ...row }) => row as ChatRow)
-      .concat(live.map(row => displayRow(row, presentation.privateMode)));
+    const verified = !conversation.conflict && matchesRecorded(identity, presentation.recorded);
+    const live = [...conversation.rows.values()].filter(row => !presentation.privateMode || !row.local);
+    const rows = transcriptRows(presentation.history ?? [], live, verified || !presentation.recorded, presentation.privateMode);
+    const usage = !presentation.privateMode && (verified || !presentation.recorded)
+      ? observedUsage([...conversation.usage.values()], presentation.recorded) : undefined;
     return {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider,
-      profile: presentation.profile, state, reason, rows,
+      profile: presentation.profile, state, reason, rows, usage,
       draft: presentation.privateMode ? '' : conversation.draft, revision: conversation.revision,
       canSend: Boolean(!presentation.privateMode && scope && conversation.armed && !busy && !blockingReason && (!worker || ready)),
       canContinue: Boolean(!presentation.privateMode && identity && !conversation.armed && !busy && !blockingReason),
@@ -615,8 +689,6 @@ export class ChatSessions {
       return;
     }
     if (!this.current(conversation, worker, turn)) return;
-    conversation.frozenHistory ??= new Set(conversation.history);
-    conversation.history = [];
     turn.written = true;
     try {
       await worker.connection.send({ id, text, command });
@@ -708,6 +780,10 @@ export class ChatSessions {
           void this.disconnect(conversation, worker, 'The turn ended before message delivery was confirmed.');
           return;
         }
+        if (event.usage && (turn.command === undefined || turn.command === 'native')) {
+          conversation.usage.set(event.turnId, { id: event.turnId, tokens: event.usage });
+          if (conversation.usage.size > maxLiveRows) conversation.usage.delete(conversation.usage.keys().next().value!);
+        }
         if (turn.command === 'compact' || turn.command === 'effort' || turn.command === 'fast') {
           if (event.compact) conversation.compact = event.compact;
           if (turn.effort && event.effortAcknowledged) conversation.settings = { ...conversation.settings, effort: turn.effort };
@@ -745,24 +821,38 @@ export class ChatSessions {
   }
 
   private text(conversation: Conversation, event: Extract<ChatEvent, { kind: 'text' }>, turn: Turn): void {
-    const id = JSON.stringify([event.turnId, event.messageId, event.blockId]);
+    const id = evidenceKey(event.turnId, event.messageId, event.blockId);
     const previous = conversation.rows.get(id);
-    if (event.mode === 'append' && previous?.truncated) return;
+    if (event.mode === 'append' && previous?.truncated) {
+      if (event.rowIdentity) previous.identity = event.rowIdentity;
+      if (event.aliases) previous.aliases = event.aliases;
+      this.changed(conversation);
+      return;
+    }
     const base = event.mode === 'append' ? previous?.text ?? '' : '';
     const text = base + event.text.slice(0, maxBlock - base.length);
     this.addRow(conversation, { id, role: 'assistant', text, truncated: base.length + event.text.length > maxBlock,
-      identity: { kind: 'response', id: event.messageId } });
+      identity: event.rowIdentity ?? previous?.identity, aliases: event.aliases ?? previous?.aliases });
     (turn.textRows ??= new Set()).add(id);
     this.changed(conversation);
   }
 
   private tool(conversation: Conversation, event: Extract<ChatEvent, { kind: 'tool' | 'toolResult' }>): void {
-    const id = JSON.stringify([event.turnId, event.callId, 'tool']);
+    const id = evidenceKey(event.turnId, event.callId, 'tool');
     const previous = conversation.rows.get(id);
-    const toolName = event.kind === 'tool' ? safeText(event.name, 80) ?? 'Tool' : previous?.toolName ?? 'Tool';
-    const text = event.kind === 'tool' ? toolName
-      : toolName + ' · ' + (event.outcome === 'needs-approval' ? approvalsLater : event.outcome === 'completed' ? 'Completed' : 'Failed');
-    this.addRow(conversation, { id, role: 'tool', text, toolName, identity: { kind: 'call', id: event.callId } });
+    const toolName = event.kind === 'tool' ? safeText(event.name, 80) ?? 'Tool' : previous?.toolName ?? 'Tool result';
+    const outcome = event.kind === 'tool' ? 'Requested' : event.outcome === 'needs-approval' ? approvalsLater
+      : event.outcome === 'completed' ? 'Completed' : 'Failed';
+    const result = event.kind === 'toolResult';
+    const unpaired = result && event.unpaired === true;
+    const identity = { kind: unpaired ? 'result' : 'call', id: event.callId } as const;
+    const card: ChatCard = { title: toolName, outcome, scope: '', state: 'ready', folded: true,
+      entries: [{ title: result && event.output ? 'Output' : result ? 'Output unavailable' : 'Awaiting result',
+        evidence: identityKey(identity),
+        output: result ? safeText(event.output, 500) : undefined,
+        durationMs: result ? event.durationMs : undefined }] };
+    this.addRow(conversation, { id, role: 'tool', text: '', toolName, card, toolResult: result,
+      identity, identityUnresolved: unpaired });
     this.changed(conversation);
   }
 

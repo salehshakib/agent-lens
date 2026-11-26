@@ -7,6 +7,10 @@ import { ChatSessions } from '../src/host/chat/session';
 import type { ChatEvent, ChatLaunch } from '../src/host/chat/types';
 import { localPath } from '../src/host/discovery/local-path';
 import { compactChatCard, compactContextEvidence } from '../src/host/views/chat-cards';
+import { projectTranscript } from '../src/host/views/chat-transcript';
+import { buildDetail } from '../src/host/views/models';
+import { reduceSession } from '../src/host/sessions/reduce';
+import { call, claudeSource, fixtureEvidence, instant, prompt, response, result } from './fixtures/session';
 
 const cwd = localPath(resolve('test'))!;
 const sessionId = '4f414d32-0000-4000-8000-000000000383';
@@ -200,5 +204,76 @@ test('official resume types only a quoted executable and exact recorded UUID', (
   assert.equal(officialResumeText('claude.exe', sessionId), undefined);
   assert.equal(officialResumeText(executable + '\nnext', sessionId), undefined);
   assert.equal(officialResumeText(executable, sessionId + ' --other'), undefined);
+});
+
+test('chat replaces live prompt, tool result and reply with scoped recorded rows while retaining anchors and usage', async () => {
+  const source = claudeSource();
+  const scope = { provider: source.provider, profile: source.profileId, home: source.home, cwd };
+  const tool = call('Bash', 'fixture-call', { command: 'echo fixture' });
+  const reply = [{ type: 'text', text: 'Done' }];
+  const usage = { input_tokens: 20, output_tokens: 8, cache_read_input_tokens: 4, cache_creation_input_tokens: 0 };
+  let sent = '';
+  const chat = new ChatSessions({
+    adapter: () => ({
+      async open(opened, emit) {
+        const stream = new ClaudeChatStream(opened, emit, assert.fail, '2.1.330');
+        const frame = feed(stream, opened.identity.nativeId);
+        return {
+          async send(message) {
+            sent = message.id;
+            stream.begin(sent);
+            frame(init);
+            frame(lifecycle(sent, 'started'));
+            frame({ ...prompt(sent, 'Check fixture', 0), cwd, isReplay: true });
+            frame(response(first, sent, 10, [tool], 'tool_use', 0));
+            frame(result(control, tool.id, 15, undefined, first));
+            frame(response(second, first, 20, reply, 'end_turn', 0));
+            frame({ type: 'result', subtype: 'success', user_message_uuid: sent, usage });
+          },
+          async interrupt() { return control; },
+          async close() {},
+        };
+      },
+    }),
+    async validate() { return undefined; },
+    changed() {},
+    async persist() {},
+    async checkDelivery() { return 'unknown'; },
+  });
+  const key = chat.create(scope);
+  const presentation = { title: 'Fixture', privateMode: false };
+  try {
+    await chat.handle(key, { type: 'chatSend', text: 'Check fixture', revision: 1 });
+    const live = chat.view(key, presentation)!;
+    assert.deepEqual(live.rows.map(row => row.role), ['user', 'tool', 'assistant']);
+    assert.equal(live.rows[1]?.card?.outcome, 'Completed');
+    assert.equal(live.usage?.tokens[0]?.total, 32);
+
+    const observed = { ...source, sessionId: chat.identity(key)!.nativeId, laneId: chat.identity(key)!.nativeId };
+    const records = [{ ...prompt(sent, 'Check fixture', 0), cwd }, response(first, sent, 10, [tool], 'tool_use', 0)];
+    const snapshot = (entries: unknown[], profile = observed.profileId) => {
+      const recorded = reduceSession([fixtureEvidence({ ...observed, profileId: profile }, entries)], instant + 100)!.session;
+      const detail = buildDetail(recorded, [recorded], { now: instant + 100, privateMode: false });
+      return { ...presentation, recorded, history: projectTranscript(detail, recorded.files, false), detail };
+    };
+    const partial = chat.view(key, snapshot(records))!;
+    assert.deepEqual(partial.rows.map(row => row.role), ['user', 'tool', 'assistant']);
+    assert.equal(partial.rows[1]?.card?.outcome, 'Completed');
+    assert.equal(partial.rows[1]?.card?.entries?.filter(entry => entry.title === 'Output').length, 1);
+    assert.ok(partial.rows[1]?.anchors?.includes(live.rows[1]!.id));
+    assert.equal(partial.usage?.tokens[0]?.total, 32);
+
+    const completeInput = snapshot([...records, result(control, tool.id, 15, undefined, first), response(second, first, 20, reply, 'end_turn', 0)]);
+    const complete = chat.view(key, completeInput)!;
+    assert.deepEqual(complete.rows.map(row => row.role), ['user', 'tool', 'assistant']);
+    assert.ok(complete.rows[2]?.anchors?.includes(live.rows[2]!.id));
+    assert.equal(complete.usage, undefined);
+    assert.equal(completeInput.detail.usage.tokens.find(row => row.label === 'Session')?.total, 32);
+    const mismatch = chat.view(key, snapshot(records, 'another-profile'))!;
+    assert.equal(mismatch.rows.length, 5);
+    assert.equal(mismatch.usage, undefined);
+  } finally {
+    await chat.dispose();
+  }
 });
 

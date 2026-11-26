@@ -166,40 +166,47 @@ export class LensData {
     const sessions = await this.deps.sessions();
     const session = sessions.find(item => item.id === id);
     if (!session) return { mode: 'empty', message: 'This session is no longer available. It may have been removed or its source is disabled.' };
+    return { mode: 'session', session: this.sessionDetail(session, sessions) };
+  }
+
+  private sessionDetail(session: Session, sessions: readonly Session[], focus?: { lane: string; row: string }): SessionDetail {
     const profiles = this.deps.profiles();
     const profile = profiles.find(item => item.provider === 'claude-code' && item.id === session.profile);
     const named = profiles.find(item => item.provider === session.provider && item.id === session.profile);
     const several = profiles.filter(item => item.provider === session.provider).length > 1;
     const snapshots = profile ? this.deps.relay(profile.id).snapshots : [];
     const context = session.provider === 'claude-code' ? relayContext(snapshots, session.nativeId, this.deps.now()) : undefined;
-    return { mode: 'session', session: buildDetail(session, sessions, {
+    return buildDetail(session, sessions, {
       now: this.deps.now(), privateMode: this.deps.privateMode(), relayContext: context?.percent,
-      thresholds: this.deps.thresholds?.(),
+      thresholds: this.deps.thresholds?.(), focus,
       profileLabel: named && (several || named.id !== 'default') ? named.label : undefined,
-    }) };
+    });
   }
 
   async chat(
     key: string, id: string | undefined, scope: ChatScope | undefined,
-    view: (presentation: ChatPresentation) => ChatView | undefined, reason?: string,
+    view: (presentation: ChatPresentation) => ChatView | undefined, reason?: string, focus?: { lane: string; row: string },
   ): Promise<PanelModel> {
-    const detail = id ? await this.detail(id) : undefined;
-    const session = detail?.mode === 'session' ? detail.session : undefined;
+    const sessions = id ? await this.deps.sessions() : [];
+    const raw = id ? sessions.find(item => item.id === id) : undefined;
+    const session = raw ? this.sessionDetail(raw, sessions, focus) : undefined;
     const privateMode = this.deps.privateMode();
-    const raw = id ? (await this.deps.sessions()).find(item => item.id === id) : undefined;
-    const history: TranscriptRow[] = session ? projectTranscript(session, raw?.files ?? [], privateMode) : [];
-    const profile = scope && this.deps.profiles().find(item => item.provider === scope.provider && item.id === scope.profile);
+    const profiles = this.deps.profiles();
+    const profileLabel = (item: Session) => profiles.find(profile => profile.provider === item.provider && profile.id === item.profile)?.label;
+    const history: TranscriptRow[] = session && raw ? projectTranscript(session, raw.files, privateMode, { session: raw, sessions, profileLabel }) : [];
+    const profile = scope && profiles.find(item => item.provider === scope.provider && item.id === scope.profile);
     const presentation: ChatPresentation = {
       title: session?.title ?? (id ? 'Session' : 'New chat'),
       project: session?.project ?? (scope ? safeText(basename(scope.cwd), 100) : undefined),
       provider: session?.provider ?? (scope ? providerLabels[scope.provider] : undefined),
       profile: profile?.label ?? session?.profile,
-      privateMode, history, reason, sessionId: id,
+      privateMode, history, reason, recorded: raw,
     };
     const chat = view(presentation) ?? {
       key, title: presentation.title, project: presentation.project, provider: presentation.provider, profile: presentation.profile,
       privateMode, rows: history.map(({ keys: _keys, ...row }) => row), draft: '', revision: 0, state: 'view-only',
-      reason: reason ?? (detail?.mode === 'empty' ? detail.message : 'This recorded session is available for inspection.'),
+      reason: reason ?? (id && !session ? 'This session is no longer available. It may have been removed or its source is disabled.'
+        : 'This recorded session is available for inspection.'),
       canSend: false, canContinue: false, canInterrupt: false, canRetry: false, canChooseScope: false,
     };
     return { mode: 'chat', chat, id, session };
