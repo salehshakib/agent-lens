@@ -1,5 +1,7 @@
 import { deepEqual, equal } from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { build } from 'esbuild';
 import { clean } from '../src/shared/clean';
 import { isHostMessage, parsePanelRequest, parseSidebarRequest } from '../src/shared/protocol';
 
@@ -66,4 +68,61 @@ test('panel navigation requests carry opaque session, lane and row ids only', ()
   equal(parsePanelRequest({ type: 'openParent', session }), undefined);
   deepEqual(parsePanelRequest({ type: 'openSettings' }), { type: 'openSettings' });
   equal(parsePanelRequest({ type: 'openSettings', section: 'signals' }), undefined);
+});
+
+test('agent reader requests validate a revision and opaque offered reference', () => {
+  for (const type of ['agentEnter', 'agentJump', 'agentOutput']) {
+    const request = { type, revision: 2, ref: action };
+    deepEqual(parsePanelRequest(request), request);
+    equal(parsePanelRequest({ ...request, ref: session }), undefined);
+    equal(parsePanelRequest({ ...request, ref: '../provider-log.jsonl' }), undefined);
+    equal(parsePanelRequest({ ...request, row: session }), undefined);
+    equal(parsePanelRequest({ ...request, revision: -1 }), undefined);
+  }
+  for (const type of ['agentBack', 'agentClose', 'agentEarlier']) {
+    const request = { type, revision: 0 };
+    deepEqual(parsePanelRequest(request), request);
+    equal(parsePanelRequest({ ...request, revision: 1.5 }), undefined);
+    equal(parsePanelRequest({ ...request, limit: 100_000 }), undefined);
+  }
+  deepEqual(parsePanelRequest({ type: 'openSessionView', session, tab: 'files' }), { type: 'openSessionView', session, tab: 'files' });
+  equal(parsePanelRequest({ type: 'openSessionView', session, tab: 'chat' }), undefined);
+  equal(isHostMessage({ type: 'agentReader', reader: { revision: 5, privateMode: true, invalidate: true } }), true);
+  equal(isHostMessage({ type: 'agentReader', reader: { revision: '5', privateMode: true } }), false);
+});
+
+interface BrowserReplay {
+  chromium: { launch(options: { channel?: string; timeout: number; args: string[] }): Promise<{
+    newPage(options: { viewport: { width: number; height: number } }): Promise<{
+      setContent(html: string): Promise<void>;
+      addStyleTag(options: { content: string }): Promise<unknown>;
+      addScriptTag(options: { content: string }): Promise<unknown>;
+      locator(selector: string): { textContent(options: { timeout: number }): Promise<string | null> };
+    }>;
+    close(): Promise<void>;
+  }> };
+}
+
+// Use an existing local browser installation without adding a runtime or dev dependency to Agent Lens.
+const browserModule = process.env.AGENT_LENS_PLAYWRIGHT;
+test('bundled webview preserves modal navigation, live anchors, and access invalidation in Chromium', {
+  skip: !browserModule && 'Set AGENT_LENS_PLAYWRIGHT to an installed Playwright module for the offline DOM replay',
+}, async () => {
+  const { chromium } = require(browserModule!) as BrowserReplay;
+  const replay = await build({ entryPoints: ['test/fixtures/agent-popup-replay.ts'], bundle: true,
+    platform: 'browser', format: 'iife', target: 'es2023', write: false });
+  const browser = await chromium.launch({ channel: process.env.AGENT_LENS_PLAYWRIGHT_CHANNEL, timeout: 15_000,
+    args: ['--in-process-gpu', '--disable-gpu', '--disable-software-rasterizer', '--disable-background-networking'] });
+  try {
+    const page = await browser.newPage({ viewport: { width: 375, height: 800 } });
+    await page.setContent('<div id="root"></div><div id="live" class="visually-hidden" role="status" aria-live="polite"></div>');
+    for (const css of ['media/lens.css', 'media/panel.css', 'media/chat.css']) {
+      await page.addStyleTag({ content: await readFile(css, 'utf8') });
+    }
+    await page.addStyleTag({ content: 'body { --vscode-font-family: sans-serif; --vscode-font-size: 13px; }' });
+    await page.addScriptTag({ content: replay.outputFiles[0]!.text });
+    equal(await page.locator('#replay-result').textContent({ timeout: 10_000 }), 'passed');
+  } finally {
+    await browser.close();
+  }
 });

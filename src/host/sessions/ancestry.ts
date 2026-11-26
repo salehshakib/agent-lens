@@ -1,4 +1,5 @@
 import { relative, sep } from 'node:path';
+import { delegatedPromptCandidate } from '../adapters/types';
 import { fresh, key, sourceSessionId, stateByOutcome } from './evidence';
 import type { Kind, Positioned } from './evidence';
 import type { PairedCall } from './items';
@@ -22,10 +23,23 @@ function childState(call: PairedCall, now: number): State {
   return fresh(result?.at ?? call.event.at, now) ? 'Live' : 'Outcome unknown';
 }
 
+function terminalParentResult(call: PairedCall, childId: string | undefined): string | undefined {
+  const result = call.result?.event;
+  return childId && result?.agentId === childId && result.childOutcome && result.childOutcome !== 'running' &&
+    result.status !== 'scheduled' && !result.launcher && !result.taskOutputPath && !result.readerBodyRestricted ? result.text : undefined;
+}
+
 export function claudeChildren(session: Session, lanes: LaneWork[], calls: PairedCall[], now: number): void {
   const root = lanes.find(work => work.lane.nativeId === session.nativeId);
   const spawns = calls.filter(call => call.event.spawn && !call.event.restricted && !call.ambiguous);
   const children = lanes.filter(work => work !== root);
+  const resultClaims = new Map<string, number>();
+  for (const call of spawns) {
+    const childId = call.result?.event.agentId;
+    if (!childId) continue;
+    const claim = key(bucket(call.source), childId);
+    resultClaims.set(claim, (resultClaims.get(claim) ?? 0) + 1);
+  }
   const edges = new Map<LaneWork, PairedCall>();
   const parents = new Map(lanes.map(work => [work.lane.id, work]));
   const claimed = new Map<PairedCall, number>();
@@ -65,6 +79,8 @@ export function claudeChildren(session: Session, lanes: LaneWork[], calls: Paire
       continue;
     }
     child.lane.parent = target(session, spawn, 'agent');
+    child.lane.delegatedPrompt = spawn.event[delegatedPromptCandidate];
+    child.lane.parentResult = terminalParentResult(spawn, child.lane.nativeId);
     if (!child.metadata?.outcome) {
       const observed = childState(spawn, now);
       if (child.lane.status === 'Recorded' || ['Completed', 'Failed', 'Interrupted', 'Aborted'].includes(observed)) {
@@ -75,13 +91,16 @@ export function claudeChildren(session: Session, lanes: LaneWork[], calls: Paire
   for (const spawn of spawns) {
     if (claimed.has(spawn) || spawn.event.name === 'Task') continue;
     const nativeId = spawn.result?.event.agentId;
-    if (nativeId && children.some(work => work.lane.nativeId === nativeId)) continue;
+    if (nativeId && (resultClaims.get(key(bucket(spawn.source), nativeId)) !== 1 ||
+        children.some(work => work.lane.nativeId === nativeId))) continue;
     const pending: Lane = {
       id: nativeId ? key(session.id, 'lane', nativeId) : key(session.id, 'pending', spawn.event.id),
       nativeId: nativeId ?? spawn.event.callId,
       title: spawn.event.text ?? 'Claude agent',
-      rows: [], turns: [], signals: [], pending: true, transcriptAvailable: false,
+      rows: [], turns: [], signals: [], pending: true, pendingIdentity: !nativeId || undefined, transcriptAvailable: false,
       status: childState(spawn, now), parent: target(session, spawn, 'agent'),
+      delegatedPrompt: spawn.event[delegatedPromptCandidate],
+      parentResult: terminalParentResult(spawn, nativeId),
       updatedAt: spawn.result?.event.at ?? spawn.event.at,
     };
     session.lanes.push(pending);
@@ -137,6 +156,23 @@ export interface CodexAncestry {
 function completedChild(parent: CodexAncestry, childId: string): boolean {
   return parent.spawns.findLast(spawn => spawn.event.childThreadId === childId && spawn.event.state)
     ?.event.state === 'completed';
+}
+
+function observeChildStatus(lane: Lane, parent: CodexAncestry, spawn: Positioned<Kind<'spawn'>>, now: number): void {
+  const complete = parent.spawns.findLast(item => item.event.childThreadId === spawn.event.childThreadId &&
+    item.event.state && item.order >= spawn.order);
+  lane.parentStatus = complete?.event.state === 'completed' ? 'Completed'
+    : fresh(spawn.event.at, now) ? 'Live' : 'Outcome unknown';
+  lane.parentEndedAt = complete?.event.state === 'completed' ? complete.event.at : undefined;
+}
+
+function attributeChildActivity(lane: Lane, parent: CodexAncestry, spawn: Positioned<Kind<'spawn'>>): void {
+  const parentTurn = parent.session.lanes.find(item => item.id === spawn.laneId)?.turns.find(turn => turn.id === spawn.turnId)?.nativeId;
+  if (!parentTurn) return;
+  const localTurns = new Set(lane.turns.filter(turn => turn.parentNativeId === parentTurn).map(turn => turn.id));
+  if (!localTurns.size) return;
+  lane.rows = lane.rows.map(row => row.agentHistory !== 'owned' && row.explicitTurn && row.turnId && localTurns.has(row.turnId)
+    ? { ...row, agentHistory: 'owned' } : row);
 }
 
 export function codexChildren(models: readonly CodexAncestry[], now: number): void {
@@ -197,6 +233,8 @@ export function codexChildren(models: readonly CodexAncestry[], now: number): vo
       continue;
     }
     lane.parent = target(parent.session, record, 'child');
+    attributeChildActivity(lane, parent, record);
+    observeChildStatus(lane, parent, record, now);
     session.parents.push(lane.parent);
     parent.session.children.push({ ...lane.parent, sessionId: session.id, laneId: lane.id });
   }
@@ -205,10 +243,12 @@ export function codexChildren(models: readonly CodexAncestry[], now: number): vo
     if (catalog.has(id) || candidates.length !== 1) continue;
     const { parent, spawn } = candidates[0]!;
     const at = spawn.event.at;
-    parent.session.lanes.push({ id: key(id, 'lane', spawn.event.childThreadId), nativeId: spawn.event.childThreadId, title: 'Codex child',
-      pending: true, transcriptAvailable: false, rows: [], turns: [], signals: [],
-      model: spawn.event.model, effort: spawn.event.effort, updatedAt: at,
-      status: completedChild(parent, spawn.event.childThreadId) ? 'Completed' : fresh(at, now) ? 'Live' : 'Outcome unknown',
-      parent: target(parent.session, spawn, 'child') });
+    const pending: Lane = { id: key(id, 'lane', spawn.event.childThreadId), nativeId: spawn.event.childThreadId, title: 'Codex child',
+      pending: true, pendingSessionId: id, transcriptAvailable: false, rows: [], turns: [], signals: [],
+      model: spawn.event.model, effort: spawn.event.effort, updatedAt: at, status: 'Outcome unknown',
+      parent: target(parent.session, spawn, 'child') };
+    observeChildStatus(pending, parent, spawn, now);
+    pending.status = pending.parentStatus ?? pending.status;
+    parent.session.lanes.push(pending);
   }
 }

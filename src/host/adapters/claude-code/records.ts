@@ -73,7 +73,7 @@ function metadataFor(row: JsonObject, base: EventBase): Metadata | undefined {
     effort: identifier(row.perTurnEffort) ?? identifier(row.effort),
     version: emitterVersion(row.version),
     branch: safeText(row.gitBranch, 160),
-    stopReason: row.isApiErrorMessage !== true ? identifier(message?.stop_reason) : undefined,
+    stopReason: row.isApiErrorMessage !== true && row.isAbortedMidStream !== true ? identifier(message?.stop_reason) : undefined,
     outcome: message && row.isAbortedMidStream === true ? "aborted" : undefined,
   };
   return base.cwd || metadata.model || metadata.effort || metadata.version ||

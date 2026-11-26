@@ -1,4 +1,6 @@
+import { delegatedPromptCandidate } from '../adapters/types';
 import type { Adapter, Event, Source } from '../adapters/types';
+import { openLocalFile, within } from '../discovery/local-path';
 import { SourceReader } from '../discovery/reader';
 import type { SourceBatch } from '../discovery/reader';
 import type { LimitSample } from '../limits/model';
@@ -30,15 +32,41 @@ type Buffered = Omit<SourceEvidence, 'events'> & {
 };
 type CatalogRoot = { adapter: Adapter; sources: ReadonlyMap<string, Source> };
 
+export interface AgentHistoryScope {
+  sessionId: string;
+  laneId: string;
+  turnId?: string;
+}
+
 const globalBudget = 32 * 1024 * 1024;
 const sourceBudget = 8 * 1024 * 1024;
 const lazyCycles = 128;
 const projectCacheLimit = 1024;
 
+function sameSourceScope(first: Source, second: Source): boolean {
+  return first.key === second.key && first.home === second.home && first.root === second.root &&
+    first.path === second.path && first.profileId === second.profileId && first.kind === second.kind &&
+    first.provider === second.provider && first.sessionId === second.sessionId && first.laneId === second.laneId;
+}
+
+async function checkReadAccess(source: Source): Promise<boolean> {
+  if (!within(source.home, source.root) || !within(source.root, source.path)) return false;
+  try {
+    const { handle } = await openLocalFile(source.path);
+    await handle.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function eventBytes(event: Event): number {
   const files = 'files' in event ? event.files : undefined;
   return 384 + 2 * ((('text' in event && event.text?.length) || 0) +
     (('command' in event && event.command?.length) || 0) +
+    (event.kind === 'call' ? (event.input !== event.command ? event.input?.length ?? 0 : 0) + (event[delegatedPromptCandidate]?.length ?? 0) : 0) +
+    (event.kind === 'result' ? (event.stdout !== event.text ? event.stdout?.length ?? 0 : 0) +
+      (event.stderr !== event.text ? event.stderr?.length ?? 0 : 0) : 0) +
     (files?.reduce((size, file) => size + file.path.length + (file.patch?.length ?? 0) +
       (file.before?.length ?? 0) + (file.after?.length ?? 0), 0) ?? 0));
 }
@@ -84,8 +112,10 @@ function summarize(event: Event): Event | undefined {
   }
   if (event.kind === 'result' || event.kind === 'call' || event.kind === 'file') {
     const files = event.files?.map(file => ({ ...file, patch: undefined, before: undefined, after: undefined }));
-    return event.kind === 'file' ? { ...event, files: files ?? [] }
-      : { ...event, files, text: undefined };
+    if (event.kind === 'file') return { ...event, files: files ?? [] };
+    if (event.kind === 'call') return { ...event, files, text: undefined, input: undefined, [delegatedPromptCandidate]: undefined };
+    return { ...event, files, text: undefined, stdout: undefined, stderr: undefined,
+      outputTruncated: Boolean(event.text || event.stdout || event.stderr) || event.outputTruncated };
   }
   return event;
 }
@@ -97,6 +127,8 @@ export class SessionStore {
   private readonly sources = new Map<string, Source>();
   private readonly groups = new Map<string, Set<string>>();
   private readonly observed = new Map<string, Buffered>();
+  private readonly inaccessible = new Map<string, Source>();
+  private readonly readerScopes = new Map<string, Set<string>>();
   private readonly projects = new Map<string, ProjectIdentity>();
   private readonly dirty = new Set<string>();
   private readonly models = new Map<string, ReducedSession>();
@@ -109,6 +141,7 @@ export class SessionStore {
   private running?: Promise<readonly Session[]>;
   private evidenceChanged = true;
   private selectedId?: string;
+  private readingScopes?: Set<string>;
   private historyRequest = 0;
   private nextAgingCheck = 0;
 
@@ -132,6 +165,7 @@ export class SessionStore {
     this.roots.clear();
     this.updateCatalog();
     this.selectedId = undefined;
+    this.readerScopes.clear();
     this.historyRequest++;
   }
 
@@ -141,12 +175,19 @@ export class SessionStore {
     for (const [key, previous] of this.sources) {
       if (current.has(key)) continue;
       this.sources.delete(key);
+      this.inaccessible.delete(key);
       this.forget(key);
       this.mark(previous);
     }
     for (const [key, source] of current) {
       const old = this.sources.get(key);
-      if (old && source.updatedAt === old.updatedAt && source.writerPresent === old.writerPresent) continue;
+      if (old && sameSourceScope(old, source)) {
+        if (source.updatedAt === old.updatedAt && source.writerPresent === old.writerPresent) continue;
+        if (this.inaccessible.get(key) === old) this.inaccessible.set(key, source);
+      } else if (old) {
+        this.forget(key);
+        this.inaccessible.delete(key);
+      }
       this.sources.set(key, source);
       this.mark(source);
     }
@@ -176,8 +217,17 @@ export class SessionStore {
 
   private trim(): void {
     if (this.totalBytes <= globalBudget) return;
+    const pinned = new Set([...this.readerScopes.values()].flatMap(scopes => [...scopes]));
+    for (const scope of this.readingScopes ?? []) pinned.add(scope);
     for (const [key, state] of this.observed) {
-      if (sourceSessionId(state.source) === this.selectedId) continue;
+      const id = sourceSessionId(state.source);
+      if (id === this.selectedId || pinned.has(evidenceKey(id, 'lane', state.source.laneId))) continue;
+      this.forget(key);
+      if (this.totalBytes <= globalBudget) return;
+    }
+    for (const [key, state] of this.observed) {
+      const id = sourceSessionId(state.source);
+      if (pinned.has(evidenceKey(id, 'lane', state.source.laneId))) continue;
       this.forget(key);
       if (this.totalBytes <= globalBudget) return;
     }
@@ -189,7 +239,7 @@ export class SessionStore {
 
   ingest(batch: ObservedBatch): void {
     const known = this.sources.get(batch.source.key);
-    if (!known) return;
+    if (!known || !sameSourceScope(known, batch.source) || this.inaccessible.get(known.key) === known) return;
     let state = this.observed.get(batch.source.key);
     if (state && (batch.readerEpoch < state.epoch || (batch.readerEpoch === state.epoch && batch.generation < state.generation))) return;
     if (state && state.epoch === batch.readerEpoch && state.generation === batch.generation && batch.committed < state.committed) return;
@@ -198,6 +248,7 @@ export class SessionStore {
       state = buffer(batch, batch.readerEpoch);
     }
     this.totalBytes += append(state, batch);
+    this.inaccessible.delete(known.key);
     this.observed.delete(batch.source.key);
     this.observed.set(batch.source.key, state);
     this.mark(known);
@@ -234,18 +285,73 @@ export class SessionStore {
     return request === this.historyRequest ? sessions.find(session => session.id === id) : undefined;
   }
 
-  private async readHistory(id: string, request: number, budget: number): Promise<number> {
+  /** Keep the displayed root and path preferentially within the existing global history budget. */
+  keepAgentHistory(key: string, scopes: readonly AgentHistoryScope[]): void {
+    if (scopes.length) this.readerScopes.set(key, new Set(scopes.map(scope => scope.laneId)));
+    else this.readerScopes.delete(key);
+  }
+
+  /** Recheck physical read access to a unique source under the active approved catalog. */
+  async agentSource(scope: AgentHistoryScope): Promise<'readable' | 'missing' | 'unavailable'> {
+    const sources = this.historySources(scope.sessionId, scope.laneId).filter(source => source.kind === 'transcript');
+    const source = sources[0];
+    if (!source) return 'missing';
+    if (sources.length !== 1) {
+      for (const candidate of sources) this.unavailable(candidate);
+      return 'unavailable';
+    }
+    const readable = await checkReadAccess(source);
+    const active = this.sources.get(source.key);
+    if (!active || !sameSourceScope(active, source)) return 'unavailable';
+    if (!readable) {
+      this.unavailable(active);
+      return 'unavailable';
+    }
+    if (this.inaccessible.delete(active.key)) this.mark(active);
+    return 'readable';
+  }
+
+  /** Read one catalog lane offered by a validated agent edge, never a webview-supplied path. */
+  async materializeAgent(target: AgentHistoryScope, ancestors: readonly AgentHistoryScope[], current: () => boolean): Promise<void> {
+    if (!current() || !this.groups.has(target.sessionId)) return;
+    const request = ++this.historyRequest;
+    const valid = (): boolean => request === this.historyRequest && current();
+    const pins = new Set([target, ...ancestors].map(scope => scope.laneId));
+    this.readingScopes = pins;
+    try {
+      await this.readHistory(target.sessionId, request, lazyCycles, target.laneId, valid);
+      if (valid()) await this.sessions();
+    } finally {
+      if (this.readingScopes === pins) this.readingScopes = undefined;
+    }
+  }
+
+  private async readHistory(id: string, request: number, budget: number, laneId?: string,
+    valid = (): boolean => request === this.historyRequest): Promise<number> {
+    const sources = this.historySources(id, laneId);
+    if (laneId && sources.filter(source => source.kind === 'transcript').length > 1) return budget;
     for (const root of this.roots.values()) {
-      for (const sourceKey of this.groups.get(id) ?? []) {
-        const source = root.sources.get(sourceKey);
-        if (!source) continue;
-        if (request !== this.historyRequest || budget <= 0) return 0;
+      for (const source of sources) {
+        const sourceKey = source.key;
+        if (!root.sources.has(sourceKey)) continue;
+        if (!valid() || budget <= 0) return 0;
         const existing = this.observed.get(sourceKey);
         const committed = existing?.committed;
+        const stillCurrent = (): boolean => this.sources.get(sourceKey) === source &&
+          this.observed.get(sourceKey) === existing && existing?.committed === committed;
+        if (laneId) {
+          if (!await checkReadAccess(source)) {
+            if (valid() && stillCurrent()) this.unavailable(source);
+            continue;
+          }
+          if (!valid()) return 0;
+          if (!stillCurrent()) continue;
+        }
         if (existing && !existing.partial) continue;
         const reader = new SourceReader(root.adapter, source);
         let state: Buffered | undefined;
-        while (budget > 0 && request === this.historyRequest) {
+        let inaccessible = false;
+        while (budget > 0 && valid() && (!laneId || stillCurrent())) {
           budget--;
           try {
             const batch = await reader.read(source);
@@ -253,22 +359,42 @@ export class SessionStore {
             append(state, batch);
             if (!batch.more) break;
           } catch {
+            inaccessible = true;
             if (state) state.partial = true;
             break;
           }
         }
-        if (request !== this.historyRequest) return 0;
+        if (!valid()) return 0;
         // Live observation owns any generation that changed during the on-demand read.
-        if (!state || this.sources.get(sourceKey)?.updatedAt !== source.updatedAt ||
-            this.observed.get(sourceKey) !== existing || existing?.committed !== committed) continue;
+        if (!stillCurrent()) continue;
+        if (inaccessible && laneId) {
+          this.unavailable(source);
+          continue;
+        }
+        if (!state) continue;
         this.forget(sourceKey);
         this.observed.set(sourceKey, state);
+        this.inaccessible.delete(sourceKey);
         this.totalBytes += state.bytes;
         this.mark(source);
         this.trim();
       }
     }
     return budget;
+  }
+
+  private historySources(id: string, laneId?: string): Source[] {
+    return [...(this.groups.get(id) ?? [])].flatMap(key => {
+      const source = this.sources.get(key);
+      return source && (!laneId || evidenceKey(id, 'lane', source.laneId) === laneId) ? [source] : [];
+    });
+  }
+
+  private unavailable(source: Source): void {
+    const wasUnavailable = this.inaccessible.get(source.key) === source;
+    this.inaccessible.set(source.key, source);
+    if (this.observed.has(source.key)) this.forget(source.key);
+    else if (!wasUnavailable) this.mark(source);
   }
 
   /** Account-window observations recorded by provider limit events, keyed by profile namespace. */
@@ -378,6 +504,22 @@ export class SessionStore {
       const model = reduceSession(evidence, this.now(), cwd => this.projects.get(cwd), titles.get(id)?.title, presence.get(id),
         this.settings);
       if (!model) continue;
+      const historyByLane = new Map<string, Source[]>();
+      for (const { source } of evidence) {
+        if (source.kind !== 'transcript') continue;
+        const matches = historyByLane.get(source.laneId) ?? [];
+        matches.push(source);
+        historyByLane.set(source.laneId, matches);
+      }
+      for (const lane of model.session.lanes) {
+        const candidates = historyByLane.get(lane.nativeId);
+        if (!candidates) continue;
+        const source = candidates[0]!;
+        const state = this.observed.get(source.key);
+        lane.historyUnavailable = candidates.length !== 1 || this.inaccessible.get(source.key) === source || undefined;
+        lane.historyPending = !lane.historyUnavailable && !state || undefined;
+        lane.historyPartial = lane.historyUnavailable ? undefined : state?.partial;
+      }
       if (evidence.some(entry => this.observed.has(entry.source.key))) {
         this.models.set(id, model);
         this.catalogOnly.delete(id);

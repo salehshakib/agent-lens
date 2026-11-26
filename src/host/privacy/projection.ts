@@ -36,6 +36,15 @@ export function safeText(value: unknown, maxLength = maxText): string | undefine
   return value.length > maxText || clean.length > maxLength ? clean.slice(0, maxLength) + '…' : clean;
 }
 
+const auxiliaryPath = /(?:^|[\\/\s"'`=])(?:\.claude[\\/](?:projects|tasks)|\.codex[\\/]sessions|tasks[\\/][\w-]+\.output|subagents[\\/]agent-[\w-]+\.(?:jsonl|meta\.json))\b/i;
+
+/** Reader content excludes references to internal transcript and auxiliary output files. */
+export function agentActivityText(value: unknown, maxLength?: number): string | undefined {
+  const clean = safeText(value);
+  if (clean === undefined || auxiliaryPath.test(clean)) return undefined;
+  return maxLength !== undefined && clean.length > maxLength ? clean.slice(0, maxLength) + '…' : clean;
+}
+
 export function safePath(value: unknown): string | undefined {
   if (typeof value !== 'string' || !value.trim() || value.length > 4096 || containsSensitivePath(value)) {
     return undefined;

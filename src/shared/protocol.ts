@@ -380,7 +380,7 @@ export interface ChatCardAction {
 /** A transcript link that reuses an existing panel route. Without a `request` or `tab` it is shown as an unavailable reason. */
 export interface CardLink {
   label: string;
-  request?: Extract<PanelRequest, { type: 'openDiff' | 'openTranscript' | 'goto' }>;
+  request?: Extract<PanelRequest, { type: 'openDiff' | 'openTranscript' | 'goto' | 'openSessionView' }>;
   tab?: 'map' | 'files';
   reason?: string;
 }
@@ -428,6 +428,83 @@ export interface ChatRow {
   state?: 'pending' | 'failed' | 'uncertain';
   card?: ChatCard;
   approval?: ChatApproval;
+  delegation?: AgentDelegation;
+}
+
+export interface AgentIdentity {
+  label: string;
+  provider: string;
+  status: 'Running' | 'Completed' | 'Failed' | 'Stopped' | 'Outcome unknown';
+  tone: StatusTone;
+  elapsedMs?: number;
+}
+
+export interface AgentDelegation extends AgentIdentity {
+  /** Stable opaque row identity for restoring focus, including when a transcript arrives late. */
+  id: string;
+  /** Opaque offer issued for this editor, parent scope and spawning row. */
+  ref?: string;
+  recent?: string;
+  reason?: string;
+  links?: readonly CardLink[];
+}
+
+export interface AgentToolActivity {
+  input?: string;
+  output?: string;
+  stdout?: string;
+  stderr?: string;
+  outputRef?: string;
+  outputTruncated?: boolean;
+  durationMs?: number;
+  exitCode?: number;
+  status?: string;
+  diff?: ChatCard['diff'];
+}
+
+export interface AgentActivityRow {
+  id: string;
+  /** An evidence summary outside the ordered activity feed. */
+  synthetic?: boolean;
+  kind: 'prompt' | 'delegatedPrompt' | 'commentary' | 'message' | 'tool' | 'result' | 'final' | 'parentResult' | 'notice';
+  label: string;
+  text?: string;
+  tool?: AgentToolActivity;
+  children?: readonly AgentDelegation[];
+}
+
+export interface AgentBreadcrumb {
+  id: string;
+  label: string;
+  /** Opaque ancestor reference. The current location has no reference. */
+  ref?: string;
+}
+
+export interface AgentActivity {
+  state: 'ready' | 'loading' | 'waiting' | 'transcriptUnavailable' | 'sourceUnavailable' | 'emptyActive' | 'empty' | 'private';
+  rows: readonly AgentActivityRow[];
+  historyPartial?: boolean;
+  earlier?: boolean;
+  finalMissing?: boolean;
+  links?: readonly CardLink[];
+}
+
+export interface AgentPopup extends AgentActivity {
+  id: string;
+  agent: AgentIdentity;
+  breadcrumbs: readonly AgentBreadcrumb[];
+}
+
+/** Changes to selection, privacy or paging advance the revision. Live updates keep it. */
+export interface AgentReader {
+  revision: number;
+  privateMode: boolean;
+  popup?: AgentPopup;
+  /** Delegation block to focus after stepping up or closing. */
+  returnTo?: string;
+  earlier?: boolean;
+  /** Discard previously rendered and parked activity after an access change. */
+  invalidate?: boolean;
 }
 
 /** Live, owner-bound facts a chat worker reported. Absent fields are unknown, never guessed. */
@@ -498,9 +575,10 @@ export type PanelTab = 'chat' | 'timeline' | 'map' | 'files' | 'usage' | 'tasks'
 
 export type HostMessage =
   | { type: 'sidebar'; model: SidebarModel }
+  | { type: 'agentReader'; reader: AgentReader }
   /** `tab` is set only when the host opens the panel on a specific tab. `focus` is set when Open parent targets a row. */
   | { type: 'panel'; model: PanelModel; tab?: PanelTab; focus?: { lane: string; row: string }; back?: boolean;
-    files?: { search: string; kind: 'all' | 'changed' | 'read' | 'mentioned' } };
+    files?: { search: string; kind: 'all' | 'changed' | 'read' | 'mentioned' }; reader?: AgentReader };
 
 export type SidebarRequest =
   | { type: 'ready' }
@@ -531,6 +609,9 @@ export type PanelRequest =
   | { type: 'openDiff'; id: string }
   | { type: 'openTranscript'; session: string; lane: string }
   | { type: 'openSession'; id: string }
+  | { type: 'openSessionView'; session: string; tab: 'map' | 'files' }
+  | { type: 'agentEnter' | 'agentJump' | 'agentOutput'; revision: number; ref: string }
+  | { type: 'agentBack' | 'agentClose' | 'agentEarlier'; revision: number }
   /** Open a session at a row. `lane` and `row` are empty to open the session without a target. */
   | { type: 'goto'; session: string; lane: string; row: string }
   /** Open the parent of the current session or lane. `lane` is empty for the main lane. */
@@ -596,12 +677,21 @@ function optionalId(value: unknown): value is string {
   return typeof value === 'string' && (value === '' || sessionId.test(value));
 }
 
+function readerRevision(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
 /** Validate a message from the session panel webview. */
 export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   if (typeof message !== 'object' || message === null) return undefined;
   const type = (message as { type?: unknown }).type;
   if (type === 'ready' && shape(message, ['type'])) return { type };
   if (type === 'panelBack' && shape(message, ['type'])) return { type };
+  if ((type === 'agentEnter' || type === 'agentJump' || type === 'agentOutput')
+    && shape(message, ['type', 'revision', 'ref']) && readerRevision(message.revision)
+    && typeof message.ref === 'string' && actionId.test(message.ref)) return { type, revision: message.revision, ref: message.ref };
+  if ((type === 'agentBack' || type === 'agentClose' || type === 'agentEarlier')
+    && shape(message, ['type', 'revision']) && readerRevision(message.revision)) return { type, revision: message.revision };
   if ((type === 'chatContinue' || type === 'chatInterrupt' || type === 'chatRetry' || type === 'chatChooseScope' || type === 'chatCycleMode')
     && shape(message, ['type'])) return { type };
   if ((type === 'chatDraft' || type === 'chatSend') && shape(message, ['type', 'revision', 'text'])
@@ -624,6 +714,10 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
   }
   if (type === 'openSession' && shape(message, ['type', 'id']) && typeof message.id === 'string'
     && sessionId.test(message.id)) return { type, id: message.id };
+  if (type === 'openSessionView' && shape(message, ['type', 'session', 'tab']) && typeof message.session === 'string'
+    && sessionId.test(message.session) && (message.tab === 'map' || message.tab === 'files')) {
+    return { type, session: message.session, tab: message.tab };
+  }
   if (type === 'openSettings' && shape(message, ['type'])) return { type };
   if (type === 'goto' && shape(message, ['type', 'session', 'lane', 'row']) && typeof message.session === 'string'
     && sessionId.test(message.session) && optionalId(message.lane) && optionalId(message.row)) {
@@ -646,6 +740,10 @@ export function parsePanelRequest(message: unknown): PanelRequest | undefined {
 export function isHostMessage(value: unknown): value is HostMessage {
   if (typeof value !== 'object' || value === null) return false;
   const type = (value as { type?: unknown }).type;
+  if (type === 'agentReader') {
+    const reader = (value as { reader?: Partial<AgentReader> }).reader;
+    return !!reader && readerRevision(reader.revision) && typeof reader.privateMode === 'boolean';
+  }
   return (type === 'sidebar' || type === 'panel') && typeof (value as { model?: unknown }).model === 'object'
     && (value as { model?: unknown }).model !== null;
 }

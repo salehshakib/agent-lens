@@ -87,16 +87,20 @@ function parentOf(session: Session): string | undefined {
     ?? session.lanes[0]?.parentSessionId;
 }
 
-function agentRows(session: Session): AgentRow[] {
+function visibleLaneTitle(lane: Lane | undefined, privateMode: boolean, limit = 100): string {
+  return privateMode ? 'Agent' : safeText(lane?.title, limit) ?? 'Agent';
+}
+
+function agentRows(session: Session, privateMode: boolean): AgentRow[] {
   return session.lanes.slice(1, 1 + maxAgentRows).map(lane => ({
-    title: safeText(lane.title, 80) ?? 'Agent',
+    title: visibleLaneTitle(lane, privateMode, 80),
     status: lane.pending ? 'Pending' : lane.status,
     tone: lane.pending ? 'neutral' : toneFor(lane.status),
   }));
 }
 
 export function namesFor(privateMode: boolean): Names {
-  return { session: session => title(session, privateMode), project: projectLabel };
+  return { session: session => title(session, privateMode), project: projectLabel, privateMode };
 }
 
 function sessionWarnings(session: Session, options: Pick<TreeOptions, 'relayContexts' | 'thresholds' | 'privateMode'>): SignalView[] {
@@ -111,7 +115,7 @@ function sessionRow(session: Session, privateMode: boolean, children: SessionRow
   const parent = main ? parentInfo(session, main, byId, namesFor(privateMode)) : { state: 'root' as const, targets: [] };
   return {
     id: session.id, provider: providerLabels[session.provider], title: title(session, privateMode), status: session.status,
-    tone: toneFor(session.status), updatedAt: session.updatedAt, project, profile, agents: agentRows(session), children, warnings,
+    tone: toneFor(session.status), updatedAt: session.updatedAt, project, profile, agents: agentRows(session, privateMode), children, warnings,
     parent: { state: parent.state, reason: parent.reason },
   };
 }
@@ -205,15 +209,17 @@ function clip(value: string | undefined): { text?: string; truncated: boolean } 
   return { text: clean, truncated: clean.length > maxText };
 }
 
-function rowView(row: TimelineRow, lanes: ReadonlyMap<string, Lane>, privateMode: boolean): RowView {
+export function rowView(row: TimelineRow, lanes: ReadonlyMap<string, Lane>, privateMode: boolean): RowView {
   const text = privateMode ? { truncated: false } : clip(row.text);
   const output = privateMode ? { truncated: false } : clip(row.output);
+  const label = privateMode && row.kind === 'task' ? 'Background task'
+    : privateMode && row.kind === 'tool' ? 'Tool' : safeText(row.label, 80) ?? 'Event';
   return {
-    id: row.id, laneId: row.laneId, turnId: row.turnId, lane: lanes.get(row.laneId)?.title ?? 'Agent', at: row.at, kind: row.kind,
-    label: safeText(row.label, 80) ?? 'Event', text: text.text, textTruncated: text.truncated || undefined,
-    output: output.text, outputTruncated: output.truncated || undefined, status: row.status,
+    id: row.id, laneId: row.laneId, turnId: row.turnId, lane: visibleLaneTitle(lanes.get(row.laneId), privateMode), at: row.at, kind: row.kind,
+    label, text: text.text, textTruncated: text.truncated || undefined,
+    output: output.text, outputTruncated: !privateMode && (output.truncated || row.outputTruncated) || undefined, status: row.status,
     command: privateMode ? undefined : safeText(row.command, 2000), exitCode: row.exitCode,
-    durationMs: row.durationMs, file: row.file, nativeKeys: row.nativeKeys,
+    durationMs: row.durationMs, file: privateMode ? undefined : row.file, nativeKeys: row.nativeKeys,
   };
 }
 
@@ -240,9 +246,9 @@ function laneTools(session: Session, lane: Lane, privateMode: boolean): ToolView
   return lane.rows.filter(row => row.kind === 'tool').slice(-maxTools).map(row => {
     const range = ranges.get(row.id);
     return {
-      name: safeText(row.label, 60) ?? 'Tool',
-      target: row.file ?? (privateMode ? undefined : safeText(row.command, 120)?.split('\n')[0]),
-      line: range ? 'lines ' + range.start + (range.count ? '-' + (range.start + range.count - 1) : '') : undefined,
+      name: privateMode ? 'Tool' : safeText(row.label, 60) ?? 'Tool',
+      target: privateMode ? undefined : row.file ?? safeText(row.command, 120)?.split('\n')[0],
+      line: !privateMode && range ? 'lines ' + range.start + (range.count ? '-' + (range.start + range.count - 1) : '') : undefined,
     };
   });
 }
@@ -254,14 +260,14 @@ function agentNode(session: Session, lane: Lane, opts: { now: number; privateMod
   const status = lane.pending ? 'Pending' : lane.status;
   const context = lane.context;
   return {
-    id: opts.id, laneId: lane.id, parent: opts.parent, title: safeText(lane.title, 100) ?? 'Agent', kind: opts.kind,
+    id: opts.id, laneId: lane.id, parent: opts.parent, title: visibleLaneTitle(lane, opts.privateMode), kind: opts.kind,
     status, tone: lane.pending ? 'neutral' : toneFor(lane.status), model: lane.model ?? session.model, effort: lane.effort,
     elapsedMs: elapsed(lane, opts.now), tokens,
     tokenLabel: tokens === undefined ? 'tokens unavailable'
       : 'tokens used' + (lane.usageScope ? ' (' + scopeText[lane.usageScope] + ')' : ''),
     contextPercent: opts.contextPercent ?? context?.percent, contextApproximate: opts.contextPercent === undefined ? context?.approximate : false,
     contextLevel: opts.level.level, signals: laneSignals(lane, opts.level, opts.privateMode), parentInfo: opts.parentInfo,
-    parentTitle: opts.parentTitle, transcript: lane.transcriptAvailable === true, sessionId: session.id,
+    parentTitle: opts.parentTitle, transcript: !opts.privateMode && lane.transcriptAvailable === true, sessionId: session.id,
     tools: laneTools(session, lane, opts.privateMode), note: opts.note ?? lane.parentReason,
   };
 }
@@ -269,6 +275,8 @@ function agentNode(session: Session, lane: Lane, opts: { now: number; privateMod
 export interface DetailOptions {
   now: number;
   privateMode: boolean;
+  /** Retain the exact recorded row when Timeline opens through a verified row target. */
+  focus?: { lane: string; row: string };
   /** Relay context fill for the Claude main session, when fresh. */
   relayContext?: number;
   thresholds?: Thresholds;
@@ -281,8 +289,8 @@ function countsRow(label: string, counts: TokenCounts | undefined): TokenRow {
     output: counts?.output, reasoning: counts?.reasoning, total: counts?.total };
 }
 
-function usageView(session: Session): UsageView {
-  const tokens = session.lanes.filter(lane => lane.usage).map(lane => countsRow(safeText(lane.title, 60) ?? 'Agent', lane.usage));
+function usageView(session: Session, privateMode: boolean): UsageView {
+  const tokens = session.lanes.filter(lane => lane.usage).map(lane => countsRow(visibleLaneTitle(lane, privateMode, 60), lane.usage));
   if (session.usage) tokens.push(countsRow('Session', session.usage));
   return {
     tokens, partial: session.usagePartial === true || session.coverage === 'partial',
@@ -298,7 +306,7 @@ function fileGroups(files: readonly FileAction[], lanes: ReadonlyMap<string, Lan
     if (action.kind === 'read') group.read++;
     else if (action.kind === 'mention' || action.kind === 'checkpoint') group.mentioned++;
     else group.changed++;
-    const lane = safeText(lanes.get(action.laneId)?.title, 60) ?? 'Agent';
+    const lane = visibleLaneTitle(lanes.get(action.laneId), privateMode, 60);
     if (!group.agents.includes(lane)) group.agents.push(lane);
     const hasDiff = !privateMode && action.diff !== undefined;
     group.openId = action.id;
@@ -329,7 +337,7 @@ function taskView(session: Session, task: BackgroundTask, lanes: ReadonlyMap<str
   return {
     id: task.id, sessionId: session.id, title: privateMode ? 'Background task' : safeText(task.title, 120) ?? 'Background task',
     status: task.status, tone: toneFor(task.status), provider: providerLabels[session.provider], project: projectLabel(session),
-    lane: safeText(lanes.get(task.laneId)?.title, 60) ?? 'Agent', at: task.at,
+    lane: visibleLaneTitle(lanes.get(task.laneId), privateMode, 60), at: task.at,
   };
 }
 
@@ -381,10 +389,18 @@ function decorateRows(session: Session, rows: RowView[], privateMode: boolean): 
 }
 
 export function buildDetail(session: Session, sessions: readonly Session[], options: DetailOptions): SessionDetail {
-  const { now, privateMode } = options;
+  const { now, privateMode, focus } = options;
   const lanes = new Map(session.lanes.map(lane => [lane.id, lane]));
   const merged = mergeTimeline(session.lanes);
-  const rows = decorateRows(session, merged.slice(-maxRows).map(row => rowView(row, lanes, privateMode)), privateMode);
+  const latestStart = Math.max(0, merged.length - maxRows);
+  const focusAt = focus?.row && (!focus.lane || lanes.has(focus.lane))
+    ? merged.findIndex(row => row.id === focus.row && (!focus.lane || row.laneId === focus.lane)) : -1;
+  const start = focusAt >= 0 && focusAt < latestStart ? Math.max(0, focusAt - Math.floor(maxRows / 2)) : latestStart;
+  const window = merged.slice(start, start + maxRows);
+  const rows = decorateRows(session, window.map(row => rowView(row, lanes, privateMode)), privateMode);
+  const newer = merged.length - start - window.length;
+  const notes = [session.coverage === 'partial' ? 'Some evidence for this session is partial or still loading.' : undefined,
+    newer > 0 ? 'Showing the selected part of the Timeline. Newer events are outside this window.' : undefined];
   const main = session.lanes[0];
   const byId = new Map(sessions.map(item => [item.id, item]));
   const names = namesFor(privateMode);
@@ -398,7 +414,7 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     const parent = lane.parent && lanes.has(lane.parent.laneId) ? lane.parent.laneId : main?.id;
     const unresolved = !lane.parent;
     agents.push(agentNode(session, lane, { now, privateMode, kind: 'agent', id: lane.id, parent,
-      parentTitle: parent ? lanes.get(parent)?.title : undefined,
+      parentTitle: parent ? visibleLaneTitle(lanes.get(parent), privateMode) : undefined,
       note: unresolved ? (lane.parentReason ?? 'Parent not resolved yet') : undefined,
       level: levelOf(session, lane), parentInfo: parentInfo(session, lane, byId, names) }));
   }
@@ -407,7 +423,7 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     const childMain = child?.lanes[0];
     if (!child || !childMain || agents.some(agent => agent.id === child.id)) continue;
     agents.push(agentNode(child, childMain, { now, privateMode, kind: 'codex-run', id: child.id,
-      parent: lanes.has(edge.laneId) ? edge.laneId : main?.id, parentTitle: lanes.get(edge.laneId)?.title ?? main?.title,
+      parent: lanes.has(edge.laneId) ? edge.laneId : main?.id, parentTitle: visibleLaneTitle(lanes.get(edge.laneId) ?? main, privateMode),
       level: levelOf(child, childMain), parentInfo: parentInfo(child, childMain, byId, names) }));
   }
   const level = main ? levelOf(session, main) : { approximate: false };
@@ -425,13 +441,13 @@ export function buildDetail(session: Session, sessions: readonly Session[], opti
     parent: main ? parentInfo(session, main, byId, names) : { state: 'root', targets: [] },
     breadcrumb: breadcrumb(session, byId, names),
     usageText: total === undefined ? 'Usage unavailable' : total + ' tokens' + (session.usagePartial ? ' (partial)' : ''),
-    rows, rowsOmitted: Math.max(0, merged.length - rows.length), agents,
-    files: fileGroups(session.files, lanes, privateMode), usage: usageView(session),
+    rows, rowsOmitted: start, agents,
+    files: fileGroups(session.files, lanes, privateMode), usage: usageView(session, privateMode),
     tasks: buildTasks([session], privateMode),
-    lanes: session.lanes.map(lane => ({ id: lane.id, label: safeText(lane.title, 60) ?? 'Agent',
+    lanes: session.lanes.map(lane => ({ id: lane.id, label: visibleLaneTitle(lane, privateMode, 60),
       parent: parentInfo(session, lane, byId, names) })),
     privateMode, partial: session.coverage === 'partial',
-    note: session.coverage === 'partial' ? 'Some evidence for this session is partial or still loading.' : undefined,
+    note: notes.filter(Boolean).join(' ') || undefined,
   };
 }
 

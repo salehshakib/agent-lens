@@ -60,10 +60,11 @@ function toolPair(
   ];
 }
 
-function commandArguments(raw: string | undefined, cwd: string | undefined, argv?: string[]) {
+function commandArguments(raw: string | undefined, cwd: string | undefined, argv?: string[], reader = true) {
   const command = redacted(raw);
   return {
     command,
+    input: reader ? command : undefined,
     argv: command === raw ? argv : undefined,
     argumentKey: command && command === raw
       ? toolArgumentKey("shell", argv ? { argv, cwd } : { command, cwd }, cwd)
@@ -71,13 +72,14 @@ function commandArguments(raw: string | undefined, cwd: string | undefined, argv
   };
 }
 
-function commandOutput(item: Record<string, unknown>): string | undefined {
+function commandOutput(item: Record<string, unknown>): { text?: string; stdout?: string; stderr?: string } {
   const fields = [item.stdout, item.stderr, item.aggregated_output, item.formatted_output];
-  if (fields.some(isRestricted)) return undefined;
+  if (fields.some(isRestricted)) return {};
   const stdout = safeText(item.stdout);
   const stderr = safeText(item.stderr);
-  if (stdout && stderr) return `${stdout}\nStderr\n${stderr}`;
-  return stdout ?? stderr ?? safeText(item.aggregated_output) ?? safeText(item.formatted_output);
+  const text = stdout && stderr ? `${stdout}\nStderr\n${stderr}`
+    : stdout ?? stderr ?? safeText(item.aggregated_output) ?? safeText(item.formatted_output);
+  return { text, stdout, stderr };
 }
 
 function commandFiles(value: unknown, succeeded: boolean): FileEvidence[] {
@@ -109,11 +111,10 @@ export function completedTool(base: EventBase, callId: string, item: Record<stri
     const exitCode = Number.isSafeInteger(item.exit_code) ? item.exit_code as number : undefined;
     const status = resultStatus(item.status, exitCode);
     return toolPair({ ...base, cwd }, callId, {
-      name: "Command",
+      name: "Command", readerOutput: Boolean(raw) || undefined,
       ...(restricted ? { restricted } : { ...commandArguments(raw, cwd, argv), files: commandFiles(item.parsed_cmd, status === "success") }),
     }, {
-      text: restricted ? undefined : commandOutput(item), exitCode, durationMs,
-      status,
+      ...(restricted ? {} : commandOutput(item)), exitCode, durationMs, status,
     });
   }
   if (item.type === "FileChange") {
@@ -122,7 +123,7 @@ export function completedTool(base: EventBase, callId: string, item: Record<stri
     const files = recordedFiles(item.changes, fileStatus);
     const restricted = Object.entries(record(item.changes) ?? {}).some(([path, value]) =>
       isRestricted(path) || isRestricted(record(value)?.move_path));
-    return toolPair(base, callId, { name: "File change", restricted }, { status, files });
+    return toolPair(base, callId, { name: "File change", restricted, readerOutput: true }, { status, files });
   }
   const result = record(item.result);
   return toolPair(base, callId, { name: toolName(item.tool) ?? "MCP tool" }, {
@@ -150,10 +151,11 @@ export function responseTool(base: EventBase, payload: Record<string, unknown>):
     }];
   }
   const name = toolName(payload.name) ?? "Tool";
+  const reader = payload.namespace === undefined;
   if (name === "apply_patch" && payload.type === "custom_tool_call" && typeof payload.input === "string") {
     const files = proposedFiles(payload.input);
     return [{
-      ...base, kind: "call", callId, name, files, restricted: isRestricted(payload.input),
+      ...base, kind: "call", callId, name, files, restricted: isRestricted(payload.input), readerOutput: reader || undefined,
       argumentKey: files.length && safeText(payload.input) === payload.input
         ? toolArgumentKey(name, { patch: payload.input }) : undefined,
     }];
@@ -164,15 +166,15 @@ export function responseTool(base: EventBase, payload: Record<string, unknown>):
     const restricted = isRestricted(raw) || isRestricted(args.workdir);
     const cwd = safePath(args.workdir);
     return [{
-      ...base, kind: "call", callId, name, cwd, restricted,
-      ...(restricted ? {} : commandArguments(raw, cwd)),
+      ...base, kind: "call", callId, name, cwd, restricted, readerOutput: reader && Boolean(raw) || undefined,
+      ...(restricted ? {} : commandArguments(raw, cwd, undefined, reader)),
     }];
   }
   if (name === "write_stdin" && args) {
     const sessionId = typeof args.session_id === "number" ? count(args.session_id) : identifier(args.session_id);
     const polling = args.chars === "";
     return [{
-      ...base, kind: "call", callId, name, polling,
+      ...base, kind: "call", callId, name, polling, readerOutput: reader && sessionId !== undefined || undefined,
       argumentKey: sessionId !== undefined && polling ? toolArgumentKey(name, { sessionId }) : undefined,
     }];
   }
@@ -199,7 +201,8 @@ export function searchTool(base: EventBase, callId: string, item: Record<string,
   const argumentKey = subject && subject === target && pattern === action?.pattern
     ? toolArgumentKey(name, { action: toolName(action?.type), target: subject, pattern })
     : undefined;
-  const call = { name, text, argumentKey, restricted };
+  const call = { name, text, input: item.type === "Extension" ? undefined : text, argumentKey, restricted,
+    readerOutput: item.type !== "Extension" || undefined };
   if (base.variant === "provisional") return [{ ...base, ...call, kind: "call", callId }];
   const resultCount = Array.isArray(item.results) ? item.results.length : undefined;
   return toolPair(base, callId, call, {

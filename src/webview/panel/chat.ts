@@ -1,7 +1,7 @@
 import type { ChatRow, ChatView, PanelRequest } from '../../shared/protocol';
 import { button, clean, el } from '../dom';
 import { Composer } from './composer';
-import { renderChatCard } from './chat-cards';
+import { AgentDelegationBlock, renderChatCard } from './chat-cards';
 import { renderApproval } from './chat-approvals';
 
 interface TranscriptRow {
@@ -13,6 +13,7 @@ interface TranscriptRow {
   text?: string;
   card?: { signature: string; element: HTMLElement };
   approval?: { signature: string; element: HTMLElement };
+  delegation?: AgentDelegationBlock;
 }
 
 export interface ChatPosition {
@@ -51,10 +52,13 @@ export class ChatPane {
   readonly element: HTMLElement;
   private readonly composer: Composer;
   private readonly empty = el('p', { cls: 'chat-empty' });
+  private readonly earlier = button('Load earlier activity', () => this.loadEarlier?.(), {
+    attrs: { 'data-key': 'chat-earlier', hidden: true },
+  });
   private readonly list = el('ol', { cls: 'chat-transcript', attrs: { role: 'list' } });
   private readonly scroller = el('div', {
     cls: 'chat-scroll', attrs: { role: 'region', 'aria-label': 'Conversation transcript', tabindex: 0 },
-  }, this.empty, this.list);
+  }, el('div', { cls: 'chat-earlier' }, this.earlier), this.empty, this.list);
   private readonly updates = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
   private readonly commandStatus = el('div', { cls: 'visually-hidden', attrs: { role: 'status', 'aria-atomic': 'true' } });
   private readonly announcements = new Map<string, string>();
@@ -67,6 +71,7 @@ export class ChatPane {
   private key?: string;
   private following = true;
   private hidden = true;
+  private inspecting = false;
   private unread = 0;
   private anchor?: ChatPosition;
   private startupPosition?: ChatPosition;
@@ -79,6 +84,8 @@ export class ChatPane {
     private readonly onPositionChange?: (position: ChatPosition | undefined) => void,
     initialPosition?: ChatPosition,
     private readonly openTab?: (tab: 'map' | 'files') => void,
+    private readonly enterAgent?: (ref: string, id: string) => void,
+    private readonly loadEarlier?: () => void,
   ) {
     this.composer = new Composer(post);
     this.startupPosition = this.savedPosition = parseChatPosition(initialPosition);
@@ -95,7 +102,7 @@ export class ChatPane {
     });
     this.scroller.addEventListener('scroll', () => {
       if (this.hidden) return;
-      this.following = this.nearBottom();
+      this.following = !this.inspecting && this.nearBottom();
       if (this.following) this.unread = 0;
       this.updateJump();
       if (this.onPositionChange) {
@@ -104,7 +111,7 @@ export class ChatPane {
       }
     }, { passive: true });
     this.scrollerResize = new ResizeObserver(() => {
-      if (!this.hidden && this.following) this.followLatest();
+      if (!this.hidden && !this.inspecting && this.following) this.followLatest();
     });
   }
 
@@ -124,7 +131,7 @@ export class ChatPane {
     }
     const visible = !this.hidden && this.element.isConnected;
     if (visible && !first) {
-      this.following = this.nearBottom();
+      this.following = !this.inspecting && this.nearBottom();
       if (this.following) this.unread = 0;
       this.anchor = this.following ? undefined : this.readAnchor();
     }
@@ -135,14 +142,65 @@ export class ChatPane {
     if (this.empty.textContent !== empty) this.empty.textContent = empty;
     this.list.hidden = !this.rows.size;
     this.composer.update(chat, first);
-    if (this.following) {
+    if (this.following && !this.inspecting) {
       if (visible) this.followLatest();
     } else {
-      if (!first) this.unread += fresh;
+      if (!first && !this.inspecting) this.unread += fresh;
       if (visible) this.restoreAnchor();
     }
     this.updateJump();
     if (first && visible) this.focusInitial();
+  }
+
+  setEarlier(available: boolean): void {
+    const wasVisible = !this.earlier.hidden;
+    if (wasVisible === available) return;
+    const anchor = this.readAnchor();
+    this.earlier.hidden = !available;
+    if (!available && document.activeElement === this.earlier) this.scroller.focus({ preventScroll: true });
+    if (this.inspecting || wasVisible || !this.following) {
+      this.anchor = anchor;
+      this.restoreAnchor();
+    }
+  }
+
+  setInspecting(inspecting: boolean): void {
+    if (this.inspecting === inspecting) return;
+    this.inspecting = inspecting;
+    if (inspecting) {
+      this.anchor = this.readAnchor();
+      this.following = false;
+    } else {
+      this.following = this.nearBottom();
+      if (this.following) this.unread = 0;
+    }
+    this.updateJump();
+  }
+
+  clearDelegations(): void {
+    const anchor = this.readAnchor();
+    for (const row of this.rows.values()) {
+      row.delegation?.element.remove();
+      row.delegation = undefined;
+    }
+    this.anchor = anchor;
+    this.restoreAnchor();
+  }
+
+  focusLaunch(id: string): boolean {
+    const control = [...this.rows.values()].find(row => row.delegation?.primary.dataset.agent === id)?.delegation?.primary;
+    (control ?? this.scroller).focus({ preventScroll: true });
+    return !!control;
+  }
+
+  focusApproval(): boolean {
+    const approval = this.list.querySelector<HTMLElement>('.chat-approval[data-state="pending"]');
+    if (!approval) return false;
+    const control = approval.querySelector<HTMLElement>('button:not(:disabled)') ?? approval;
+    if (control === approval) control.tabIndex = -1;
+    control.scrollIntoView({ block: 'nearest' });
+    control.focus({ preventScroll: true });
+    return true;
   }
 
   hide(): void {
@@ -232,7 +290,9 @@ export class ChatPane {
       const author = row.role === 'assistant' && chat.provider ? clean(chat.provider) : roleLabel[row.role];
       const label = row.card ? 'Agent Lens' : author;
       if (rendered.label.textContent !== label) rendered.label.textContent = label;
+      rendered.label.parentElement!.hidden = !!row.delegation && !row.text && !row.card && !row.approval;
       this.updateCard(rendered, chat.privateMode ? undefined : row.card);
+      this.updateDelegation(rendered, row.delegation);
       this.updateApproval(rendered, row.approval);
       const announcement = chat.privateMode ? undefined : row.card?.announcement ?? (row.role === 'error' ? row.text : undefined);
       if (announcement && this.announcements.get(row.id) !== announcement) {
@@ -256,6 +316,19 @@ export class ChatPane {
       }
     }
     return fresh;
+  }
+
+  private updateDelegation(row: TranscriptRow, agent: ChatRow['delegation']): void {
+    if (!agent) {
+      row.delegation?.element.remove();
+      row.delegation = undefined;
+      return;
+    }
+    if (!row.delegation) {
+      row.delegation = new AgentDelegationBlock((ref, id) => this.enterAgent?.(ref, id), this.post, this.openTab);
+      row.element.insertBefore(row.delegation.element, row.approval?.element ?? null);
+    }
+    row.delegation.update(agent);
   }
 
   private updateApproval(row: TranscriptRow, approval: ChatRow['approval']): void {
@@ -312,7 +385,7 @@ export class ChatPane {
         focus.focus({ preventScroll: true });
       }
     } else {
-      row.element.append(element);
+      row.element.insertBefore(element, row.delegation?.element ?? row.approval?.element ?? null);
     }
     row.card = { signature, element };
   }
@@ -364,7 +437,7 @@ export class ChatPane {
 
   private updateJump(): void {
     if (this.following && document.activeElement === this.jump) this.scroller.focus({ preventScroll: true });
-    this.jump.hidden = this.following;
+    this.jump.hidden = this.following || this.inspecting;
     const label = this.unread ? `Jump to latest (${this.unread} new)` : 'Jump to latest';
     if (this.jump.textContent !== label) this.jump.textContent = label;
     const announcement = this.unread ? `${this.unread} new ${this.unread === 1 ? 'entry' : 'entries'} in the transcript.` : '';
